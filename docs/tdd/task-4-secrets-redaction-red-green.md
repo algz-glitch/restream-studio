@@ -35,16 +35,19 @@ No credential values are reproduced in this evidence record.
 
 The string redactor was minimally extended for those two forms.
 
-Observed result for both Task 4 test files: exit code `0`; `11 passed in 0.03s`.
+The original GREEN 2 run completed with `11 passed in 0.03s`. After the two review
+regressions below were added and fixed, the current result for both Task 4 test files is
+exit code `0`; `13 passed in 0.03s`.
 
 ## RED 3 — multi-segment stream key and Cookie header review
 
 Regression tests were added for an RTMP stream key containing multiple path segments and a
 Cookie header supplied in a command argument.
 
-Observed result: exit code `1`; `2 failed, 7 passed in 0.15s`. The failures confirmed that
-the intermediate stream-key path segments and Cookie header value were still visible. No
-credential values are reproduced in this evidence record.
+For the changes later committed as `1df5dd2`, the required RED run occurred before the
+implementation change. Observed result: exit code `1`; `2 failed, 7 passed in 0.15s`. The
+failures confirmed that the intermediate stream-key path segments and Cookie header value
+were still visible. No credential values are reproduced in this evidence record.
 
 ## GREEN 3 — reviewed Task 4 behavior
 
@@ -52,4 +55,5 @@ RTMP redaction now preserves only the scheme, authority, and first application p
 then replaces the complete remaining stream-key path with one mask. Cookie header values are
 also replaced in full.
 
-Observed result for both Task 4 test files: exit code `0`; `13 passed in 0.03s`.
+For commit `1df5dd2`, the GREEN run used both Task 4 test files. Observed result: exit code
+`0`; `13 passed in 0.03s`.

@@ -83,7 +83,7 @@ network test was selected.
 
 The default factory now imports `DouyinLiveStream`, calls
 `fetch_web_stream_data(normalized_url)`, then calls `fetch_stream_url(data, quality_code)`.
-The explicit mapping is `origin -> OD`, `blue -> OD`, `ultra -> UHD`, `high -> HD`,
+The explicit mapping is `origin -> OD`, `blue -> BD`, `ultra -> UHD`, `high -> HD`,
 `standard -> SD`, and `smooth -> LD`. Both `StreamData` objects and equivalent dictionaries
 are normalized at the adapter boundary; injected fixture components remain supported.
 
@@ -107,3 +107,29 @@ the installed package only; they did not resolve a room or access Douyin.
 After dictionary-result and default-boundary exception regressions were added, final Task 5
 verification reported `19 passed, 1 deselected in 0.07s`. The complete default suite reported
 `87 passed, 1 deselected in 0.14s`; the deselected test was `live_network`.
+
+## RED — preferred quality availability and actual fallback
+
+Review found that `origin` and `blue` were incorrectly mapped to the same StreamGet code and
+that the adapter trusted the requested quality when StreamGet returned another URL. Tests
+were added for distinct `OD`/`BD` codes, preferred-quality presence, missing-preference
+fallback, and actual returned-URL identification.
+
+The first focused RED run reported exit code `1`; `2 failed, 19 passed, 1 deselected in
+0.19s`. The two failures showed `blue -> OD` and a `blue` request sending `OD` rather than
+`BD`. After the first implementation edit exposed an ordering defect, the next RED run
+reported `4 failed, 17 passed, 1 deselected in 0.22s` with an `UnboundLocalError` before the
+raw StreamGet data was fetched. Both are command observations from the same uncommitted
+working-tree cycle.
+
+## GREEN — availability-aware selection
+
+The adapter now derives available qualities from StreamGet's raw FLV/HLS maps, selects the
+preferred quality only when present, otherwise applies the documented internal order, and
+matches returned media URLs back to the raw maps to identify StreamGet fallback accurately.
+The focused GREEN run reported exit code `0`; `21 passed, 1 deselected in 0.04s`.
+
+Inspection of installed StreamGet 4.0.10 confirmed its public `StreamData` documentation
+mentions `OD`, `BD`, `UHD`, and `HD`. Its current Douyin `get_quality_index` implementation
+omits `BD` from its local index table, so the adapter deliberately does not trust the echoed
+quality label when a returned URL can be matched to raw quality data.

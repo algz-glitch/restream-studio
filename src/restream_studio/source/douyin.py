@@ -15,13 +15,37 @@ from restream_studio.source.url_normalizer import DouyinUrlValidationError, norm
 QUALITY_ORDER = ("origin", "blue", "ultra", "high", "standard", "smooth")
 QUALITY_CODE_BY_NAME = {
     "origin": "OD",
-    "blue": "OD",
+    "blue": "BD",
     "ultra": "UHD",
     "high": "HD",
     "standard": "SD",
     "smooth": "LD",
 }
-QUALITY_NAME_BY_CODE = {"OD": "origin", "BD": "blue", "UHD": "ultra", "HD": "high", "SD": "standard", "LD": "smooth"}
+QUALITY_NAME_BY_CODE = {
+    "OD": "origin",
+    "BD": "blue",
+    "UHD": "ultra",
+    "HD": "high",
+    "SD": "standard",
+    "LD": "smooth",
+}
+QUALITY_NAME_BY_SOURCE_KEY = {
+    "ORIGIN": "origin",
+    "OD": "origin",
+    "BLUE": "blue",
+    "BLUE_RAY": "blue",
+    "BD": "blue",
+    "ULTRA": "ultra",
+    "UHD": "ultra",
+    "FULL_HD": "ultra",
+    "FULL_HD1": "ultra",
+    "HIGH": "high",
+    "HD": "high",
+    "STANDARD": "standard",
+    "SD": "standard",
+    "SMOOTH": "smooth",
+    "LD": "smooth",
+}
 ComponentResult = Mapping[str, object]
 SyncComponent = Callable[[str], ComponentResult]
 AsyncComponent = Callable[[str], Awaitable[ComponentResult]]
@@ -67,17 +91,21 @@ async def _resolve_with_streamget(
     fetch_url = getattr(client, "fetch_stream_url", None)
     if not callable(fetch_data) or not callable(fetch_url):
         raise ResolverProtocolError("StreamGet Douyin component has an invalid API")
-    quality_name = preferred_quality if preferred_quality in QUALITY_CODE_BY_NAME else "origin"
-    quality_code = QUALITY_CODE_BY_NAME[quality_name]
     web_data = await cast(Callable[[str], Awaitable[object]], fetch_data)(normalized_url)
+    available_qualities = _streamget_quality_urls(web_data)
+    quality_name = _select_streamget_quality(available_qualities, preferred_quality)
+    quality_code = QUALITY_CODE_BY_NAME[quality_name]
     stream_data = await cast(Callable[[object, str], Awaitable[object]], fetch_url)(
         web_data, quality_code
     )
-    return _map_streamget(stream_data, normalized_url, quality_name)
+    return _map_streamget(stream_data, normalized_url, quality_name, available_qualities)
 
 
 def _map_streamget(
-    stream_data: object, normalized_url: str, requested_quality: str
+    stream_data: object,
+    normalized_url: str,
+    requested_quality: str,
+    available_qualities: Mapping[str, tuple[str, ...]],
 ) -> ResolvedStream:
     acquired_at = datetime.now(UTC)
     is_live = _streamget_field(stream_data, "is_live")
@@ -103,13 +131,9 @@ def _map_streamget(
     )
     if not flv_urls and not hls_urls:
         raise ResolverProtocolError("StreamGet live result has no media URL")
-    actual_code = _streamget_field(stream_data, "quality")
-    if actual_code == QUALITY_CODE_BY_NAME[requested_quality]:
-        selected_quality = requested_quality
-    elif isinstance(actual_code, str):
-        selected_quality = QUALITY_NAME_BY_CODE.get(actual_code, requested_quality)
-    else:
-        selected_quality = requested_quality
+    selected_quality = _actual_streamget_quality(
+        stream_data, flv_urls + hls_urls, requested_quality, available_qualities
+    )
     return ResolvedStream(
         url=(flv_urls or hls_urls)[0],
         acquired_at=acquired_at,
@@ -121,6 +145,57 @@ def _map_streamget(
         flv_urls=flv_urls,
         hls_urls=hls_urls,
     )
+
+
+def _streamget_quality_urls(web_data: object) -> dict[str, tuple[str, ...]]:
+    if not isinstance(web_data, Mapping):
+        return {}
+    stream_url = web_data.get("stream_url", web_data.get("streamUrl"))
+    if not isinstance(stream_url, Mapping):
+        return {}
+    result: dict[str, list[str]] = {}
+    for map_name in ("flv_pull_url", "flvPullUrl", "hls_pull_url_map", "hlsPullUrlMap"):
+        url_map = stream_url.get(map_name)
+        if not isinstance(url_map, Mapping):
+            continue
+        for source_key, url in url_map.items():
+            if not isinstance(source_key, str) or not isinstance(url, str) or not url:
+                continue
+            normalized_key = source_key.strip().upper().replace("-", "_").replace(" ", "_")
+            quality_name = QUALITY_NAME_BY_SOURCE_KEY.get(normalized_key)
+            if quality_name is not None:
+                result.setdefault(quality_name, []).append(url)
+    return {quality: tuple(urls) for quality, urls in result.items()}
+
+
+def _select_streamget_quality(
+    available_qualities: Mapping[str, tuple[str, ...]], preferred_quality: str | None
+) -> str:
+    if not available_qualities:
+        return preferred_quality if preferred_quality in QUALITY_CODE_BY_NAME else "origin"
+    if preferred_quality in available_qualities:
+        return cast(str, preferred_quality)
+    for quality in QUALITY_ORDER:
+        if quality in available_qualities:
+            return quality
+    raise ResolverProtocolError("StreamGet data has no supported stream quality")
+
+
+def _actual_streamget_quality(
+    stream_data: object,
+    returned_urls: tuple[str, ...],
+    requested_quality: str,
+    available_qualities: Mapping[str, tuple[str, ...]],
+) -> str:
+    for quality in QUALITY_ORDER:
+        if any(url in available_qualities.get(quality, ()) for url in returned_urls):
+            return quality
+    actual_code = _streamget_field(stream_data, "quality")
+    if isinstance(actual_code, str):
+        reported = QUALITY_NAME_BY_CODE.get(actual_code.upper())
+        if reported in available_qualities or not available_qualities:
+            return cast(str, reported)
+    return requested_quality
 
 
 def _streamget_field(stream_data: object, field: str) -> object:

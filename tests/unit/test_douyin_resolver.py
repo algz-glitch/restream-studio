@@ -168,7 +168,7 @@ def test_client_object_with_sync_resolve_is_supported() -> None:
 def test_streamget_quality_codes_match_the_supported_public_contract() -> None:
     assert QUALITY_CODE_BY_NAME == {
         "origin": "OD",
-        "blue": "OD",
+        "blue": "BD",
         "ultra": "UHD",
         "high": "HD",
         "standard": "SD",
@@ -178,7 +178,13 @@ def test_streamget_quality_codes_match_the_supported_public_contract() -> None:
 
 def test_default_adapter_uses_streamget_api_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[object, ...]] = []
-    web_data = {"opaque": "web-data"}
+    web_data = {
+        "status": 2,
+        "stream_url": {
+            "flv_pull_url": {"ORIGIN": "origin-flv", "UHD": "ultra-flv"},
+            "hls_pull_url_map": {"ORIGIN": "origin-hls", "UHD": "ultra-hls"},
+        },
+    }
 
     class StreamData:
         room_id = "7312345678901234567"
@@ -213,6 +219,85 @@ def test_default_adapter_uses_streamget_api_shape(monkeypatch: pytest.MonkeyPatc
     assert result.selected_quality == "ultra"
     assert result.flv_urls == ("https://media.example.test/streamget.flv",)
     assert result.hls_urls == ("https://media.example.test/streamget.m3u8",)
+
+
+def test_default_adapter_falls_back_and_reports_actual_returned_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    web_data = {
+        "status": 2,
+        "stream_url": {
+            "flv_pull_url": {
+                "ORIGIN": "https://media.example.test/origin.flv",
+                "UHD": "https://media.example.test/ultra.flv",
+                "HD": "https://media.example.test/high.flv",
+            },
+            "hls_pull_url_map": {},
+        },
+    }
+
+    class FakeDouyinLiveStream:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return web_data
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            calls.append(quality)
+            return {
+                "room_id": "731234",
+                "anchor_name": "fallback-anchor",
+                "is_live": True,
+                "quality": "HD",
+                "flv_url": "https://media.example.test/high.flv",
+                "m3u8_url": None,
+            }
+
+    monkeypatch.setattr(
+        "restream_studio.source.douyin._default_component_factory", FakeDouyinLiveStream
+    )
+    result = run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", "blue"))
+
+    assert calls == ["OD"]
+    assert result.selected_quality == "high"
+
+
+def test_default_adapter_selects_blue_only_when_bd_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    web_data = {
+        "status": 2,
+        "stream_url": {
+            "flv_pull_url": {
+                "ORIGIN": "https://media.example.test/origin.flv",
+                "BD": "https://media.example.test/blue.flv",
+            },
+            "hls_pull_url_map": {},
+        },
+    }
+
+    class FakeDouyinLiveStream:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return web_data
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            calls.append(quality)
+            return {
+                "room_id": "731234",
+                "anchor_name": "blue-anchor",
+                "is_live": True,
+                "quality": "BD",
+                "flv_url": "https://media.example.test/blue.flv",
+                "m3u8_url": None,
+            }
+
+    monkeypatch.setattr(
+        "restream_studio.source.douyin._default_component_factory", FakeDouyinLiveStream
+    )
+    result = run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", "blue"))
+
+    assert calls == ["BD"]
+    assert result.selected_quality == "blue"
 
 
 def test_default_adapter_maps_streamget_dictionary_result(monkeypatch: pytest.MonkeyPatch) -> None:

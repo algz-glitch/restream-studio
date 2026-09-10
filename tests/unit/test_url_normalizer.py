@@ -26,6 +26,7 @@ def test_normalizes_supported_douyin_urls(raw: str, expected: str) -> None:
         ("http://live.douyin.com/123", "HTTPS"),
         ("ftp://live.douyin.com/123", "HTTPS"),
         ("https://user@live.douyin.com/123", "userinfo"),
+        ("https://user:pass@live.douyin.com/123", "password"),
         ("https://live.douyin.com:444/123", "port"),
         ("https://douyin.com/123", "host"),
         ("https://evil-live.douyin.com/123", "host"),

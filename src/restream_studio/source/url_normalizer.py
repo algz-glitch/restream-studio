@@ -41,7 +41,9 @@ def normalize_douyin_url(raw: str) -> str:
 
     if parsed.scheme.lower() != "https":
         raise DouyinUrlValidationError("URL must use HTTPS")
-    if parsed.username is not None or parsed.password is not None:
+    if parsed.password is not None:
+        raise DouyinUrlValidationError("URL must not contain a password")
+    if parsed.username is not None:
         raise DouyinUrlValidationError("URL must not contain userinfo")
 
     try:

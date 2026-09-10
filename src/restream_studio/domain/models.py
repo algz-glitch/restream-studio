@@ -64,6 +64,9 @@ class MediaProbe:
     width: int
     height: int
     frame_rate: float
+    pixel_format: str = ""
+    audio_sample_rate: int = 0
+    audio_channels: int = 0
 
 
 @dataclass(frozen=True, slots=True)

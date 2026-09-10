@@ -57,3 +57,25 @@ also replaced in full.
 
 For commit `1df5dd2`, the GREEN run used both Task 4 test files. Observed result: exit code
 `0`; `13 passed in 0.03s`.
+
+## RED 4 — normalized keys and explicit WinAPI boundary
+
+Tests were added before implementation for recursively normalized sensitive mapping keys,
+canonical URL-safe Base64, empty and embedded-NUL strings, non-string rejection, immediate
+WinAPI error capture, configured function signatures, and exactly-once `LocalFree` behavior
+after successful allocation on both normal decoding and UTF-8 decoding failure.
+
+Observed result for both Task 4 test files: exit code `1`; `4 failed, 20 passed in 0.19s`.
+The failures identified the previous limited mapping-key set and the non-controllable legacy
+`ctypes.windll` loading path. No credential values are reproduced in this evidence record.
+
+## GREEN 4 — quality-review closure
+
+Sensitive mapping keys are now separator- and case-insensitive across snake_case,
+kebab-case, and camelCase forms. Production WinAPI loading uses `ctypes.WinDLL` with
+`use_last_error=True`; all three native functions have complete `argtypes` and `restype`
+declarations, and native failures capture the error code immediately. DPAPI output is freed
+exactly once after every successful allocation, including decode failure.
+
+Observed result for both Task 4 test files: exit code `0`; `24 passed in 0.05s`. The final
+verification suite completed with `68 passed in 0.11s`.

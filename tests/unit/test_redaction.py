@@ -30,6 +30,32 @@ def test_redact_recursively_masks_credentials_without_mutating_input() -> None:
     assert isinstance(result["tuple"], tuple)
 
 
+def test_redact_normalizes_common_sensitive_mapping_keys_recursively() -> None:
+    nested = [{"stream-key": "value-8", "diagnosticCode": "ok"}]
+    original: dict[str, object] = {
+        "TOKEN": "value-1",
+        "accessToken": "value-2",
+        "refresh-token": "value-3",
+        "Password": "value-4",
+        "client_secret": "value-5",
+        "apiKey": "value-6",
+        "SIGNATURE": "value-7",
+        "nested": nested,
+    }
+
+    assert redact(original) == {
+        "TOKEN": "***",
+        "accessToken": "***",
+        "refresh-token": "***",
+        "Password": "***",
+        "client_secret": "***",
+        "apiKey": "***",
+        "SIGNATURE": "***",
+        "nested": [{"stream-key": "***", "diagnosticCode": "ok"}],
+    }
+    assert nested[0]["stream-key"] == "value-8"
+
+
 def test_redact_masks_sensitive_url_queries_including_encoded_values() -> None:
     value = (
         "https://example.test/path?stream_key=key%2Fpart&cookie=session%3Dvalue"

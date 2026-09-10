@@ -7,7 +7,20 @@ from collections.abc import Mapping
 from typing import Final
 
 _MASK: Final = "***"
-_SENSITIVE_KEYS: Final = {"stream_key", "cookie", "authorization"}
+_SENSITIVE_KEYS: Final = {
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "clientsecret",
+    "cookie",
+    "password",
+    "passwd",
+    "refreshtoken",
+    "secret",
+    "signature",
+    "streamkey",
+    "token",
+}
 _SENSITIVE_QUERY_KEYS: Final = {
     "access_token",
     "auth",
@@ -34,6 +47,13 @@ _AUTH_VALUE = re.compile(r"(?i)^\s*(?:bearer|basic)\s+\S+\s*$")
 _INLINE_FLAG = re.compile(r"(?i)^(--stream-key|-stream_key|--cookie|--authorization)=(.*)$")
 _QUERY_VALUE = re.compile(r"([?&])([^=&]+)=([^&#]*)")
 _RTMP_URL = re.compile(r"(?i)\b(rtmps?://[^/?#]+)(/[^?#]*)?(\?[^#]*)?")
+
+
+def _is_sensitive_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in _SENSITIVE_KEYS
 
 
 def _redact_query(query: str) -> str:
@@ -89,7 +109,7 @@ def redact(value: object) -> object:
         return _redact_string(value)
     if isinstance(value, Mapping):
         return {
-            key: _MASK if isinstance(key, str) and key.lower() in _SENSITIVE_KEYS else redact(item)
+            key: _MASK if _is_sensitive_key(key) else redact(item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):

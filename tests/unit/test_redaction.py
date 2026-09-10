@@ -52,6 +52,12 @@ def test_redact_masks_rtmp_path_and_query_but_preserves_diagnostics() -> None:
     assert result == "rtmps://media.example/app/***?token=***&latency=low"
 
 
+def test_redact_masks_entire_multi_segment_rtmp_stream_key() -> None:
+    value = "rtmp://media.example/app/key/part/segment?latency=low"
+
+    assert redact(value) == "rtmp://media.example/app/***?latency=low"
+
+
 def test_redact_masks_command_argument_credentials() -> None:
     command = [
         "ffmpeg",
@@ -82,6 +88,12 @@ def test_redact_masks_command_stream_key_flags() -> None:
     command = ["publisher", "--stream-key=inline-key", "-stream_key", "separate-key"]
 
     assert redact(command) == ["publisher", "--stream-key=***", "-stream_key", "***"]
+
+
+def test_redact_masks_command_cookie_header() -> None:
+    command = ["ffmpeg", "-headers", "Cookie: session=credential", "-i", "input.mp4"]
+
+    assert redact(command) == ["ffmpeg", "-headers", "Cookie: ***", "-i", "input.mp4"]
 
 
 def test_redact_masks_standalone_authorization_values() -> None:

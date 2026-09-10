@@ -29,6 +29,7 @@ _SENSITIVE_FLAGS: Final = {
     "-stream_key",
 }
 _AUTH_HEADER = re.compile(r"(?i)(\bauthorization\s*:\s*)(?:bearer|basic)\s+\S+")
+_COOKIE_HEADER = re.compile(r"(?i)(\bcookie\s*:\s*)\S.*")
 _AUTH_VALUE = re.compile(r"(?i)^\s*(?:bearer|basic)\s+\S+\s*$")
 _INLINE_FLAG = re.compile(r"(?i)^(--stream-key|-stream_key|--cookie|--authorization)=(.*)$")
 _QUERY_VALUE = re.compile(r"([?&])([^=&]+)=([^&#]*)")
@@ -50,8 +51,8 @@ def _redact_rtmp(match: re.Match[str]) -> str:
     path = match.group(2) or ""
     query = match.group(3) or ""
     segments = path.split("/")
-    if len(segments) > 2 and segments[-1]:
-        segments[-1] = _MASK
+    if len(segments) > 2:
+        segments = segments[:2] + [_MASK]
     return authority + "/".join(segments) + _redact_query(query)
 
 
@@ -62,6 +63,7 @@ def _redact_string(value: str) -> str:
     if inline_flag:
         return inline_flag.group(1) + "=" + _MASK
     result = _AUTH_HEADER.sub(lambda match: match.group(1) + _MASK, value)
+    result = _COOKIE_HEADER.sub(lambda match: match.group(1) + _MASK, result)
     result = _RTMP_URL.sub(_redact_rtmp, result)
     return _redact_query(result)
 

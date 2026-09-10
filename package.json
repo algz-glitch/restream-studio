@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "python -m pip wheel . --no-deps --wheel-dir dist",
-    "lint": "python -m ruff check .",
-    "test": "python -m pytest",
-    "typecheck": "python -m mypy src tests",
+    "build": ".venv\\Scripts\\python.exe -m pip wheel . --no-deps --wheel-dir dist",
+    "lint": ".venv\\Scripts\\python.exe -m ruff check .",
+    "test": ".venv\\Scripts\\python.exe -m pytest",
+    "typecheck": ".venv\\Scripts\\python.exe -m mypy src tests",
     "verify": "npm run lint && npm run typecheck && npm test"
   }
 }

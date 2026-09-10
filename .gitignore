@@ -1,33 +1,34 @@
-.worktrees/
-.venv/
-node_modules/
-frontend/dist/
-dist/
-build/
+/.worktrees/
+/.venv/
+/node_modules/
+/frontend/dist/
+/dist/
+/build/
 *.db
 *.log
 .env
-.env.*
-runtime/
-artifacts/
+!.env.example
+/runtime/
+/artifacts/
 
 # Secrets and session data
-*stream-key*
-*stream_key*
-stream-keys/
-cookies/
-cookies*.json
+/stream-keys.json
+/stream_keys.json
+/stream-keys/
+/cookies.json
+/cookies/
 
 # User-supplied media
-media/uploads/
-uploads/
+/media/uploads/
+/uploads/
 
 # Runtime-managed third-party binaries
-bin/ffmpeg*
-bin/ffprobe*
-bin/mediamtx*
-ffmpeg/
-mediamtx/
+/bin/ffmpeg.exe
+/bin/ffprobe.exe
+/bin/mediamtx.exe
+/vendor/ffmpeg/ffmpeg.exe
+/vendor/ffmpeg/ffprobe.exe
+/vendor/mediamtx/mediamtx.exe
 
 # Python caches and packaging metadata
 __pycache__/

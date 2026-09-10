@@ -66,3 +66,60 @@ GREEN_EXIT=0
 ```
 
 Exit code: `0`.
+
+## Version consistency mutation check
+
+The smoke test was later extended to read `pyproject.toml` with `tomllib`, read `package.json` with
+`json`, and assert that both metadata versions and `restream_studio.__version__` equal `0.1.0`.
+This is also a post-implementation mutation check and does not alter the historical commit sequence.
+
+The repository's `package.json` was copied to an explicit temporary file inside the worktree, then
+its version was temporarily changed to `0.1.1`:
+
+```powershell
+New-Item -ItemType Directory -Force -Path .tdd-temp | Out-Null
+Copy-Item -LiteralPath package.json -Destination .tdd-temp\package.json
+(Get-FileHash -Algorithm SHA256 -LiteralPath package.json).Hash
+```
+
+The temporary mutation applied to `package.json` was exactly:
+
+```diff
+-  "version": "0.1.0",
++  "version": "0.1.1",
+```
+
+The RED command then run was:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\unit\test_smoke.py -q
+Write-Output "RED_EXIT=$LASTEXITCODE"
+```
+
+Relevant RED output:
+
+```text
+E       AssertionError: assert '0.1.0' == '0.1.1'
+FAILED tests/unit/test_smoke.py::test_package_exposes_version - AssertionErro...
+1 failed in 0.12s
+RED_EXIT=1
+```
+
+The exact metadata file was then restored and the same test was rerun:
+
+```powershell
+Copy-Item -LiteralPath .tdd-temp\package.json -Destination package.json -Force
+Remove-Item -LiteralPath .tdd-temp -Recurse
+(Get-FileHash -Algorithm SHA256 -LiteralPath package.json).Hash
+.\.venv\Scripts\python.exe -m pytest tests\unit\test_smoke.py -q
+Write-Output "GREEN_EXIT=$LASTEXITCODE"
+```
+
+Relevant restoration and GREEN output:
+
+```text
+RESTORED_PACKAGE_SHA256=D561EBBBBE56617206927A3905A3E930CDF1A82DBAE8897167B7D79216B1F9A8
+.                                                                        [100%]
+1 passed in 0.01s
+GREEN_EXIT=0
+```

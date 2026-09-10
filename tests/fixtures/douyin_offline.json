@@ -1,0 +1,8 @@
+{
+  "room": {
+    "id": "7312345678901234567",
+    "anchor": {"nickname": "fixture-anchor"},
+    "status": 4
+  },
+  "streams": {}
+}

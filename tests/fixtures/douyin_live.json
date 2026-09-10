@@ -1,0 +1,18 @@
+{
+  "room": {
+    "id": "7312345678901234567",
+    "anchor": {"nickname": "fixture-anchor"},
+    "status": 2
+  },
+  "streams": {
+    "blue": {
+      "flv": "https://media.example.test/live/blue.flv?signature=cleaned",
+      "hls": "https://media.example.test/live/blue.m3u8?signature=cleaned"
+    },
+    "high": {
+      "flv": "https://media.example.test/live/high.flv?signature=cleaned",
+      "hls": "https://media.example.test/live/high.m3u8?signature=cleaned"
+    }
+  },
+  "expires_at": "2030-01-01T00:05:00Z"
+}

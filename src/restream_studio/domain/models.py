@@ -39,6 +39,12 @@ class ResolvedStream:
     url: str
     acquired_at: datetime
     expires_at: datetime | None
+    room_id: str | None = None
+    anchor_name: str | None = None
+    is_live: bool = True
+    selected_quality: str | None = None
+    flv_urls: tuple[str, ...] = ()
+    hls_urls: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _is_timezone_aware(self.acquired_at):

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "restream-studio"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography",
+    "fastapi",
+    "httpx",
+    "psutil",
+    "pydantic",
+    "uvicorn[standard]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy",
+    "pyinstaller",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+strict = true
+
+[tool.setuptools.packages.find]
+where = ["src"]

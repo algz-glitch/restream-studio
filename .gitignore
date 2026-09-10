@@ -1,2 +1,41 @@
 .worktrees/
+.venv/
+node_modules/
+frontend/dist/
+dist/
+build/
+*.db
+*.log
+.env
+.env.*
+runtime/
+artifacts/
+
+# Secrets and session data
+*stream-key*
+*stream_key*
+stream-keys/
+cookies/
+cookies*.json
+
+# User-supplied media
+media/uploads/
+uploads/
+
+# Runtime-managed third-party binaries
+bin/ffmpeg*
+bin/ffprobe*
+bin/mediamtx*
+ffmpeg/
+mediamtx/
+
+# Python caches and packaging metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 

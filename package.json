@@ -1,0 +1,12 @@
+{
+  "name": "restream-studio",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "python -m pip wheel . --no-deps --wheel-dir dist",
+    "lint": "python -m ruff check .",
+    "test": "python -m pytest",
+    "typecheck": "python -m mypy src tests",
+    "verify": "npm run lint && npm run typecheck && npm test"
+  }
+}

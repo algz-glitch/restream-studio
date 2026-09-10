@@ -12,6 +12,7 @@ dependencies = [
     "httpx",
     "psutil",
     "pydantic",
+    "streamget==4.0.10",
     "uvicorn[standard]",
 ]
 

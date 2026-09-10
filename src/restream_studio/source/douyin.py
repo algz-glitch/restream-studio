@@ -1,8 +1,8 @@
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from importlib import import_module
 from typing import cast
+from urllib.parse import urlsplit
 
 from restream_studio.domain.models import ResolvedStream
 from restream_studio.source.base import (
@@ -13,6 +13,15 @@ from restream_studio.source.base import (
 from restream_studio.source.url_normalizer import DouyinUrlValidationError, normalize_douyin_url
 
 QUALITY_ORDER = ("origin", "blue", "ultra", "high", "standard", "smooth")
+QUALITY_CODE_BY_NAME = {
+    "origin": "OD",
+    "blue": "OD",
+    "ultra": "UHD",
+    "high": "HD",
+    "standard": "SD",
+    "smooth": "LD",
+}
+QUALITY_NAME_BY_CODE = {"OD": "origin", "BD": "blue", "UHD": "ultra", "HD": "high", "SD": "standard", "LD": "smooth"}
 ComponentResult = Mapping[str, object]
 SyncComponent = Callable[[str], ComponentResult]
 AsyncComponent = Callable[[str], Awaitable[ComponentResult]]
@@ -31,8 +40,9 @@ class DouyinResolver:
             raise ResolverProtocolError("Douyin URL is invalid") from exc
 
         try:
-            component = self._component if self._component is not None else _load_default_component()
-            payload = await _invoke(component, normalized_url)
+            if self._component is None:
+                return await _resolve_with_streamget(normalized_url, preferred_quality)
+            payload = await _invoke(self._component, normalized_url)
             return _map_payload(payload, preferred_quality)
         except ResolverError:
             raise
@@ -40,16 +50,102 @@ class DouyinResolver:
             raise ResolverProtocolError("Douyin component failed") from exc
 
 
-def _load_default_component() -> object:
-    """Load the selected optional ``douyin-live`` integration only at the boundary."""
+def _default_component_factory() -> object:
+    """Create StreamGet's supported Douyin client at the adapter boundary."""
     try:
-        module = import_module("douyin_live")
-        component = module.resolve
-    except (ImportError, AttributeError) as exc:
-        raise ResolverProtocolError("Douyin resolver component is unavailable") from exc
-    if not callable(component):
-        raise ResolverProtocolError("Douyin resolver component is unavailable")
-    return component
+        from streamget import DouyinLiveStream  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ResolverProtocolError("StreamGet Douyin component is unavailable") from exc
+    return DouyinLiveStream()
+
+
+async def _resolve_with_streamget(
+    normalized_url: str, preferred_quality: str | None
+) -> ResolvedStream:
+    client = _default_component_factory()
+    fetch_data = getattr(client, "fetch_web_stream_data", None)
+    fetch_url = getattr(client, "fetch_stream_url", None)
+    if not callable(fetch_data) or not callable(fetch_url):
+        raise ResolverProtocolError("StreamGet Douyin component has an invalid API")
+    quality_name = preferred_quality if preferred_quality in QUALITY_CODE_BY_NAME else "origin"
+    quality_code = QUALITY_CODE_BY_NAME[quality_name]
+    web_data = await cast(Callable[[str], Awaitable[object]], fetch_data)(normalized_url)
+    stream_data = await cast(Callable[[object, str], Awaitable[object]], fetch_url)(
+        web_data, quality_code
+    )
+    return _map_streamget(stream_data, normalized_url, quality_name)
+
+
+def _map_streamget(
+    stream_data: object, normalized_url: str, requested_quality: str
+) -> ResolvedStream:
+    acquired_at = datetime.now(UTC)
+    is_live = _streamget_field(stream_data, "is_live")
+    if not isinstance(is_live, bool):
+        raise ResolverProtocolError("StreamGet field is_live is malformed")
+    anchor_name = _nonempty_string(
+        _streamget_field(stream_data, "anchor_name"), "StreamGet.anchor_name"
+    )
+    room_id = _streamget_room_id(stream_data, normalized_url)
+    if not is_live:
+        return ResolvedStream(
+            url="",
+            acquired_at=acquired_at,
+            expires_at=None,
+            room_id=room_id,
+            anchor_name=anchor_name,
+            is_live=False,
+        )
+
+    flv_urls = _media_urls(_streamget_field(stream_data, "flv_url"), "StreamGet.flv_url")
+    hls_urls = _media_urls(
+        _streamget_field(stream_data, "m3u8_url"), "StreamGet.m3u8_url"
+    )
+    if not flv_urls and not hls_urls:
+        raise ResolverProtocolError("StreamGet live result has no media URL")
+    actual_code = _streamget_field(stream_data, "quality")
+    if actual_code == QUALITY_CODE_BY_NAME[requested_quality]:
+        selected_quality = requested_quality
+    elif isinstance(actual_code, str):
+        selected_quality = QUALITY_NAME_BY_CODE.get(actual_code, requested_quality)
+    else:
+        selected_quality = requested_quality
+    return ResolvedStream(
+        url=(flv_urls or hls_urls)[0],
+        acquired_at=acquired_at,
+        expires_at=None,
+        room_id=room_id,
+        anchor_name=anchor_name,
+        is_live=True,
+        selected_quality=selected_quality,
+        flv_urls=flv_urls,
+        hls_urls=hls_urls,
+    )
+
+
+def _streamget_field(stream_data: object, field: str) -> object:
+    if isinstance(stream_data, Mapping):
+        return stream_data.get(field)
+    return getattr(stream_data, field, None)
+
+
+def _streamget_room_id(stream_data: object, normalized_url: str) -> str:
+    for field in ("room_id", "web_rid"):
+        value = _streamget_field(stream_data, field)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value):
+            return str(value)
+    extra = _streamget_field(stream_data, "extra")
+    if isinstance(extra, Mapping):
+        for field in ("room_id", "web_rid"):
+            value = extra.get(field)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value):
+                return str(value)
+    live_url = _streamget_field(stream_data, "live_url")
+    candidate = live_url if isinstance(live_url, str) else normalized_url
+    segment = urlsplit(candidate).path.strip("/").split("/")[-1]
+    if segment:
+        return segment
+    raise ResolverProtocolError("StreamGet result has no room identifier")
 
 
 async def _invoke(component: object, url: str) -> ComponentResult:

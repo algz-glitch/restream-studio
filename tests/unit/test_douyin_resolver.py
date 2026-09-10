@@ -11,7 +11,7 @@ from restream_studio.source.base import (
     ResolverProtocolError,
     ResolverRateLimited,
 )
-from restream_studio.source.douyin import DouyinResolver
+from restream_studio.source.douyin import QUALITY_CODE_BY_NAME, DouyinResolver
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 
@@ -146,9 +146,12 @@ def test_arbitrary_third_party_exception_never_crosses_boundary() -> None:
 
 
 def test_default_component_unavailable_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("restream_studio.source.douyin.import_module", lambda _: (_ for _ in ()).throw(ImportError()))
+    def unavailable() -> object:
+        raise ResolverProtocolError("StreamGet Douyin component is unavailable")
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", unavailable)
     resolver = DouyinResolver()
-    with pytest.raises(ResolverProtocolError, match="component is unavailable"):
+    with pytest.raises(ResolverProtocolError, match="StreamGet Douyin component is unavailable"):
         run_immediate(resolver.resolve("https://live.douyin.com/731234", None))
 
 
@@ -160,6 +163,100 @@ def test_client_object_with_sync_resolve_is_supported() -> None:
 
     result = run_immediate(DouyinResolver(component=Client()).resolve("https://live.douyin.com/731234", None))
     assert result.is_live is False
+
+
+def test_streamget_quality_codes_match_the_supported_public_contract() -> None:
+    assert QUALITY_CODE_BY_NAME == {
+        "origin": "OD",
+        "blue": "OD",
+        "ultra": "UHD",
+        "high": "HD",
+        "standard": "SD",
+        "smooth": "LD",
+    }
+
+
+def test_default_adapter_uses_streamget_api_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, ...]] = []
+    web_data = {"opaque": "web-data"}
+
+    class StreamData:
+        room_id = "7312345678901234567"
+        anchor_name = "streamget-anchor"
+        is_live = True
+        quality = "UHD"
+        flv_url = "https://media.example.test/streamget.flv"
+        m3u8_url = "https://media.example.test/streamget.m3u8"
+
+    class FakeDouyinLiveStream:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            calls.append(("fetch_web_stream_data", url))
+            return web_data
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            calls.append(("fetch_stream_url", data, quality))
+            return StreamData()
+
+    monkeypatch.setattr(
+        "restream_studio.source.douyin._default_component_factory", FakeDouyinLiveStream
+    )
+    result = run_immediate(
+        DouyinResolver().resolve("https://LIVE.DOUYIN.COM/731234?from=copy", "ultra")
+    )
+
+    assert calls == [
+        ("fetch_web_stream_data", "https://live.douyin.com/731234"),
+        ("fetch_stream_url", web_data, "UHD"),
+    ]
+    assert result.room_id == "7312345678901234567"
+    assert result.anchor_name == "streamget-anchor"
+    assert result.selected_quality == "ultra"
+    assert result.flv_urls == ("https://media.example.test/streamget.flv",)
+    assert result.hls_urls == ("https://media.example.test/streamget.m3u8",)
+
+
+def test_default_adapter_maps_streamget_dictionary_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeDouyinLiveStream:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return {"source_url": url}
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            return {
+                "anchor_name": "dictionary-anchor",
+                "is_live": False,
+                "quality": quality,
+                "flv_url": None,
+                "m3u8_url": None,
+                "live_url": "https://live.douyin.com/998877",
+            }
+
+    monkeypatch.setattr(
+        "restream_studio.source.douyin._default_component_factory", FakeDouyinLiveStream
+    )
+    result = run_immediate(DouyinResolver().resolve("https://v.douyin.com/AbCd123/", None))
+    assert result.room_id == "998877"
+    assert result.anchor_name == "dictionary-anchor"
+    assert result.is_live is False
+    assert result.url == ""
+
+
+def test_default_streamget_exception_is_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    class VendorFailure(Exception):
+        pass
+
+    class FakeDouyinLiveStream:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            raise VendorFailure(url)
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            raise AssertionError("must not be called")
+
+    monkeypatch.setattr(
+        "restream_studio.source.douyin._default_component_factory", FakeDouyinLiveStream
+    )
+    with pytest.raises(ResolverProtocolError) as caught:
+        run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", None))
+    assert not isinstance(caught.value, VendorFailure)
 
 
 @pytest.mark.live_network

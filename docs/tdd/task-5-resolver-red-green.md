@@ -133,3 +133,30 @@ Inspection of installed StreamGet 4.0.10 confirmed its public `StreamData` docum
 mentions `OD`, `BD`, `UHD`, and `HD`. Its current Douyin `get_quality_index` implementation
 omits `BD` from its local index table, so the adapter deliberately does not trust the echoed
 quality label when a returned URL can be matched to raw quality data.
+
+## RED — StreamGet 4.0.10 BD implementation regression
+
+A focused regression reproduced the installed Douyin implementation's behavior: its
+`fetch_stream_url(data, "BD")` path can select index zero and return origin URLs. The test
+requires the adapter to avoid that path when mature parsed raw quality maps are available.
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -m "not live_network" tests/unit/test_douyin_resolver.py::test_default_adapter_bypasses_streamget_bd_fallback_and_selects_raw_blue_urls -q
+```
+
+Observed result: exit code `1`; `1 failed in 0.16s`. The assertion showed that
+`fetch_stream_url` was still called with `BD` instead of selecting the parsed raw BD URLs.
+This is command evidence from the same uncommitted RED/GREEN cycle, not a claim inferred from
+Git history.
+
+## GREEN — direct raw-quality URL selection
+
+When `fetch_web_stream_data` returns recognized per-quality FLV/HLS maps, the adapter now
+selects the preferred or ranked fallback itself and returns those exact raw URLs. It calls
+`fetch_stream_url` only when no recognized multi-quality map is available. This preserves
+StreamGet as the parser while avoiding its Douyin BD index defect.
+
+The first complete focused GREEN run reported exit code `0`;
+`21 passed, 1 deselected in 0.07s`.

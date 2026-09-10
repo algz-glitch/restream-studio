@@ -180,9 +180,17 @@ def test_default_adapter_uses_streamget_api_shape(monkeypatch: pytest.MonkeyPatc
     calls: list[tuple[object, ...]] = []
     web_data = {
         "status": 2,
+        "anchor_name": "streamget-anchor",
+        "live_url": "https://live.douyin.com/7312345678901234567",
         "stream_url": {
-            "flv_pull_url": {"ORIGIN": "origin-flv", "UHD": "ultra-flv"},
-            "hls_pull_url_map": {"ORIGIN": "origin-hls", "UHD": "ultra-hls"},
+            "flv_pull_url": {
+                "ORIGIN": "https://media.example.test/origin.flv",
+                "UHD": "https://media.example.test/streamget.flv",
+            },
+            "hls_pull_url_map": {
+                "ORIGIN": "https://media.example.test/origin.m3u8",
+                "UHD": "https://media.example.test/streamget.m3u8",
+            },
         },
     }
 
@@ -212,7 +220,6 @@ def test_default_adapter_uses_streamget_api_shape(monkeypatch: pytest.MonkeyPatc
 
     assert calls == [
         ("fetch_web_stream_data", "https://live.douyin.com/731234"),
-        ("fetch_stream_url", web_data, "UHD"),
     ]
     assert result.room_id == "7312345678901234567"
     assert result.anchor_name == "streamget-anchor"
@@ -227,6 +234,8 @@ def test_default_adapter_falls_back_and_reports_actual_returned_quality(
     calls: list[str] = []
     web_data = {
         "status": 2,
+        "anchor_name": "fallback-anchor",
+        "live_url": "https://live.douyin.com/731234",
         "stream_url": {
             "flv_pull_url": {
                 "ORIGIN": "https://media.example.test/origin.flv",
@@ -257,22 +266,28 @@ def test_default_adapter_falls_back_and_reports_actual_returned_quality(
     )
     result = run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", "blue"))
 
-    assert calls == ["OD"]
-    assert result.selected_quality == "high"
+    assert calls == []
+    assert result.selected_quality == "origin"
+    assert result.flv_urls == ("https://media.example.test/origin.flv",)
 
 
-def test_default_adapter_selects_blue_only_when_bd_is_available(
+def test_default_adapter_bypasses_streamget_bd_fallback_and_selects_raw_blue_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
     web_data = {
         "status": 2,
+        "anchor_name": "blue-anchor",
+        "live_url": "https://live.douyin.com/731234",
         "stream_url": {
             "flv_pull_url": {
                 "ORIGIN": "https://media.example.test/origin.flv",
                 "BD": "https://media.example.test/blue.flv",
             },
-            "hls_pull_url_map": {},
+            "hls_pull_url_map": {
+                "ORIGIN": "https://media.example.test/origin.m3u8",
+                "BD": "https://media.example.test/blue.m3u8",
+            },
         },
     }
 
@@ -287,8 +302,8 @@ def test_default_adapter_selects_blue_only_when_bd_is_available(
                 "anchor_name": "blue-anchor",
                 "is_live": True,
                 "quality": "BD",
-                "flv_url": "https://media.example.test/blue.flv",
-                "m3u8_url": None,
+                "flv_url": "https://media.example.test/origin.flv",
+                "m3u8_url": "https://media.example.test/origin.m3u8",
             }
 
     monkeypatch.setattr(
@@ -296,8 +311,10 @@ def test_default_adapter_selects_blue_only_when_bd_is_available(
     )
     result = run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", "blue"))
 
-    assert calls == ["BD"]
+    assert calls == []
     assert result.selected_quality == "blue"
+    assert result.flv_urls == ("https://media.example.test/blue.flv",)
+    assert result.hls_urls == ("https://media.example.test/blue.m3u8",)
 
 
 def test_default_adapter_maps_streamget_dictionary_result(monkeypatch: pytest.MonkeyPatch) -> None:

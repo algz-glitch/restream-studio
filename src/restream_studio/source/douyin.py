@@ -47,6 +47,7 @@ QUALITY_NAME_BY_SOURCE_KEY = {
     "LD": "smooth",
 }
 ComponentResult = Mapping[str, object]
+QualityCandidates = tuple[tuple[str, ...], tuple[str, ...]]
 SyncComponent = Callable[[str], ComponentResult]
 AsyncComponent = Callable[[str], Awaitable[ComponentResult]]
 
@@ -94,18 +95,51 @@ async def _resolve_with_streamget(
     web_data = await cast(Callable[[str], Awaitable[object]], fetch_data)(normalized_url)
     available_qualities = _streamget_quality_urls(web_data)
     quality_name = _select_streamget_quality(available_qualities, preferred_quality)
+    if available_qualities:
+        return _map_streamget_raw(
+            web_data, normalized_url, quality_name, available_qualities[quality_name]
+        )
     quality_code = QUALITY_CODE_BY_NAME[quality_name]
     stream_data = await cast(Callable[[object, str], Awaitable[object]], fetch_url)(
         web_data, quality_code
     )
-    return _map_streamget(stream_data, normalized_url, quality_name, available_qualities)
+    return _map_streamget(stream_data, normalized_url, quality_name, {})
+
+
+def _map_streamget_raw(
+    web_data: object,
+    normalized_url: str,
+    selected_quality: str,
+    candidates: QualityCandidates,
+) -> ResolvedStream:
+    if not isinstance(web_data, Mapping):
+        raise ResolverProtocolError("StreamGet web data is malformed")
+    status = web_data.get("status")
+    if status != 2:
+        raise ResolverProtocolError("StreamGet live data status is malformed")
+    anchor_name = _nonempty_string(web_data.get("anchor_name"), "StreamGet.anchor_name")
+    room_id = _streamget_room_id(web_data, normalized_url)
+    flv_urls, hls_urls = candidates
+    if not flv_urls and not hls_urls:
+        raise ResolverProtocolError("selected StreamGet quality has no media URL")
+    return ResolvedStream(
+        url=(flv_urls or hls_urls)[0],
+        acquired_at=datetime.now(UTC),
+        expires_at=None,
+        room_id=room_id,
+        anchor_name=anchor_name,
+        is_live=True,
+        selected_quality=selected_quality,
+        flv_urls=flv_urls,
+        hls_urls=hls_urls,
+    )
 
 
 def _map_streamget(
     stream_data: object,
     normalized_url: str,
     requested_quality: str,
-    available_qualities: Mapping[str, tuple[str, ...]],
+    available_qualities: Mapping[str, QualityCandidates],
 ) -> ResolvedStream:
     acquired_at = datetime.now(UTC)
     is_live = _streamget_field(stream_data, "is_live")
@@ -147,14 +181,20 @@ def _map_streamget(
     )
 
 
-def _streamget_quality_urls(web_data: object) -> dict[str, tuple[str, ...]]:
+def _streamget_quality_urls(web_data: object) -> dict[str, QualityCandidates]:
     if not isinstance(web_data, Mapping):
         return {}
     stream_url = web_data.get("stream_url", web_data.get("streamUrl"))
     if not isinstance(stream_url, Mapping):
         return {}
-    result: dict[str, list[str]] = {}
-    for map_name in ("flv_pull_url", "flvPullUrl", "hls_pull_url_map", "hlsPullUrlMap"):
+    result: dict[str, tuple[list[str], list[str]]] = {}
+    map_names = (
+        ("flv_pull_url", 0),
+        ("flvPullUrl", 0),
+        ("hls_pull_url_map", 1),
+        ("hlsPullUrlMap", 1),
+    )
+    for map_name, candidate_index in map_names:
         url_map = stream_url.get(map_name)
         if not isinstance(url_map, Mapping):
             continue
@@ -164,12 +204,16 @@ def _streamget_quality_urls(web_data: object) -> dict[str, tuple[str, ...]]:
             normalized_key = source_key.strip().upper().replace("-", "_").replace(" ", "_")
             quality_name = QUALITY_NAME_BY_SOURCE_KEY.get(normalized_key)
             if quality_name is not None:
-                result.setdefault(quality_name, []).append(url)
-    return {quality: tuple(urls) for quality, urls in result.items()}
+                candidates = result.setdefault(quality_name, ([], []))
+                candidates[candidate_index].append(url)
+    return {
+        quality: (tuple(flv_urls), tuple(hls_urls))
+        for quality, (flv_urls, hls_urls) in result.items()
+    }
 
 
 def _select_streamget_quality(
-    available_qualities: Mapping[str, tuple[str, ...]], preferred_quality: str | None
+    available_qualities: Mapping[str, QualityCandidates], preferred_quality: str | None
 ) -> str:
     if not available_qualities:
         return preferred_quality if preferred_quality in QUALITY_CODE_BY_NAME else "origin"
@@ -185,10 +229,11 @@ def _actual_streamget_quality(
     stream_data: object,
     returned_urls: tuple[str, ...],
     requested_quality: str,
-    available_qualities: Mapping[str, tuple[str, ...]],
+    available_qualities: Mapping[str, QualityCandidates],
 ) -> str:
     for quality in QUALITY_ORDER:
-        if any(url in available_qualities.get(quality, ()) for url in returned_urls):
+        candidates = available_qualities.get(quality, ((), ()))
+        if any(url in candidates[0] + candidates[1] for url in returned_urls):
             return quality
     actual_code = _streamget_field(stream_data, "quality")
     if isinstance(actual_code, str):

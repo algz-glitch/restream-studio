@@ -43,8 +43,8 @@ Command:
 Output:
 
 ```text
-....................................                                     [100%]
-36 passed in 0.05s
+.....................................                                    [100%]
+37 passed in 0.05s
 ```
 
 The implementation uses only `urllib.parse.urlsplit`, `unquote`, and local parsing. It performs
@@ -53,6 +53,6 @@ no network access or short-link resolution.
 ## Final verification
 
 - `npm run verify`: exit code `0`; Ruff passed, mypy passed for 9 source files, and pytest passed
-  43 tests.
+  44 tests.
 - `npm run build`: exit code `0`; built `restream_studio-0.1.0-py3-none-any.whl`.
 - `git diff --check`: exit code `0`.

@@ -471,6 +471,41 @@ def test_candidate_probe_falls_back_quality_when_preferred_is_unplayable(
     assert result.selected_quality == "origin"
 
 
+def test_candidate_probe_total_failure_never_uses_unprobed_compatibility_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = fixture("douyin_streamget_raw.json")
+    compatibility_calls = 0
+
+    class Client:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return raw
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            nonlocal compatibility_calls
+            compatibility_calls += 1
+            return {
+                "room_id": "7312345678901234567",
+                "anchor_name": "streamget-fixture-anchor",
+                "is_live": True,
+                "quality": quality,
+                "flv_url": "https://media.example.test/unprobed.flv",
+                "m3u8_url": None,
+            }
+
+    async def reject_all(_: str) -> bool:
+        return False
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", Client)
+    with pytest.raises(ResolverNetworkError, match="no playable media candidates"):
+        run_immediate(
+            DouyinResolver(candidate_probe=reject_all).resolve(
+                "https://live.douyin.com/7312345678901234567", "origin"
+            )
+        )
+    assert compatibility_calls == 0
+
+
 def test_streamget_rate_limit_response_preserves_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

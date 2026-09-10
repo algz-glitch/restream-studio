@@ -107,8 +107,10 @@ async def _resolve_with_streamget(
     status = _streamget_status(web_data)
     if status == 4:
         return _map_streamget_offline(web_data, normalized_url)
-    available_qualities = _streamget_quality_urls(web_data)
-    available_qualities = await _probe_quality_candidates(available_qualities, candidate_probe)
+    raw_qualities = _streamget_quality_urls(web_data)
+    available_qualities = await _probe_quality_candidates(raw_qualities, candidate_probe)
+    if raw_qualities and candidate_probe is not None and not available_qualities:
+        raise ResolverNetworkError("candidate probe found no playable media candidates")
     quality_name = _select_streamget_quality(available_qualities, preferred_quality)
     if available_qualities:
         return _map_streamget_raw(

@@ -183,3 +183,16 @@ five-minute lifetime is used. URL-bearing `ResolvedStream` fields are excluded f
 The focused GREEN run reported exit code `0`; `38 passed, 1 deselected in 0.07s`.
 After explicit 429/retry-after and timeout classification regressions were added, the final
 focused run reported `40 passed, 1 deselected in 0.09s`.
+
+## RED/GREEN — total candidate probe failure
+
+A focused regression required an explicit probe rejecting every originally present raw
+candidate to stop resolution before the unprobed StreamGet compatibility path. RED reported
+exit code `1`; `1 failed in 0.17s` because `fetch_stream_url` was called and no
+`ResolverNetworkError` was raised. This is command evidence from one uncommitted cycle.
+
+The implementation now distinguishes “raw candidates were absent” from “raw candidates were
+present but all failed the explicit probe.” Only the former may use `fetch_stream_url`; the
+latter raises `ResolverNetworkError` without returning an unprobed URL. GREEN reported
+`1 passed in 0.03s`; the complete focused file reported
+`41 passed, 1 deselected in 0.07s`.

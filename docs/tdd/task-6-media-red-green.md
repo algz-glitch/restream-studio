@@ -42,3 +42,32 @@ The focused suite executes fake subprocesses without network. When local FFmpeg 
 it also generates a 64x64 H.264/AAC fixture and parses real ffprobe JSON; both commands have
 10-second process timeouts. Final project verification and build results are recorded in the
 Task 6 completion commit/report.
+
+## Quality review RED/GREEN
+
+The quality-review RED first failed during collection because `MediaProbe` lacked profile,
+level, bitrate, and GOP evidence fields. Focused regressions also specified incremental
+stdout/stderr reads, independent per-pipe and aggregate limits, immediate kill/reap,
+localhost/private-literal rejection, mocked mixed DNS answers, strict integer parsing,
+frame-rate fallback, conservative copy, and complete display-path masking.
+
+GREEN replaces `communicate()` with concurrent 64 KiB reads and cancels the peer reader on
+failure. It resolves every hostname through async `getaddrinfo` before spawn and rejects the
+entire result if any answer is non-global. FFprobe is launched with
+`-protocol_whitelist http,https,tcp,tls,crypto` and the locally documented HTTP option
+`-max_redirects 0` (verified from `ffprobe -h full`). This blocks ffprobe HTTP redirects but
+does not bind the validated DNS answer to the later TLS connection. A DNS TOCTOU/rebinding
+window therefore remains and must be closed at a future connection-isolation boundary; this
+module does not claim otherwise.
+
+Normal stream metadata does not prove keyframe spacing, so `gop_seconds` remains unknown
+unless explicit GOP-size evidence is supplied. Copy now requires complete evidence for H.264,
+AAC, yuv420p, <=30 FPS, 48 kHz stereo, dimensions, bitrate, accepted profile/level, and a
+two-second GOP. Every unknown or out-of-range field forces transcoding.
+
+Final focused GREEN: `44 passed`. Final `npm run verify`: `153 passed,
+1 deselected`; lint and strict mypy passed. `npm run build` produced the wheel and
+`git diff --check` passed. The host's Windows loopback `socketpair()` intermittently blocked
+pytest event-loop creation, so verification used a temporary ignored, process-local selector
+shim with no repository/runtime change; all subprocess fakes and the local FFmpeg smoke still
+ran, and no probe/build process was left running.

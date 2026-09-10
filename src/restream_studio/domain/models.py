@@ -67,6 +67,10 @@ class MediaProbe:
     pixel_format: str = ""
     audio_sample_rate: int = 0
     audio_channels: int = 0
+    video_profile: str | None = None
+    video_level: int | None = None
+    video_bitrate: int | None = None
+    gop_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

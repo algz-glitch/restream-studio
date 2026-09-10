@@ -11,7 +11,10 @@ from restream_studio.media.ffmpeg_commands import (
 
 
 def compatible_probe() -> MediaProbe:
-    return MediaProbe("h264", "aac", 1920, 1080, 30.0, "yuv420p", 48000, 2)
+    return MediaProbe(
+        "h264", "aac", 1920, 1080, 30.0, "yuv420p", 48000, 2,
+        video_profile="High", video_level=40, video_bitrate=4_500_000, gop_seconds=2.0,
+    )
 
 
 def test_compatible_probe_uses_copy_and_redacts_raw_destination_key() -> None:
@@ -42,6 +45,19 @@ def test_display_redacts_all_source_query_values_and_single_segment_output_key()
     assert "SOURCE-SECRET" not in command.display_command
     assert "ONLY-SECRET-KEY" not in command.display_command
     assert command.argv[-1].endswith("ONLY-SECRET-KEY")
+    assert command.display_argv[command.display_argv.index("-i") + 1] == "https://media.example.test/***"
+    assert command.display_argv[-1] == "rtmp://push.example.com/***"
+
+
+def test_display_redacts_complete_paths_queries_and_fragments() -> None:
+    command = build_ffmpeg_command(
+        "https://media.example.test/path/SOURCE-SIGNATURE?x=secret#source-fragment",
+        "rtmps://push.example.com/app/OUTPUT-SIGNATURE?auth=secret#output-fragment",
+        DestinationKind.DOUYIN,
+        compatible_probe(),
+    )
+    for secret in ("SOURCE-SIGNATURE", "OUTPUT-SIGNATURE", "source-fragment", "output-fragment"):
+        assert secret not in command.display_command
 
 
 @pytest.mark.parametrize(
@@ -49,7 +65,7 @@ def test_display_redacts_all_source_query_values_and_single_segment_output_key()
     [
         MediaProbe("hevc", "aac", 1920, 1080, 30, "yuv420p", 48000, 2),
         MediaProbe("h264", "aac", 3840, 2160, 30, "yuv420p", 48000, 2),
-        MediaProbe("h264", "aac", 1920, 1080, 61, "yuv420p", 48000, 2),
+        MediaProbe("h264", "aac", 1920, 1080, 31, "yuv420p", 48000, 2),
         MediaProbe("h264", "aac", 1920, 1080, 30, "yuv444p", 48000, 2),
         MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 96000, 2),
         MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 48000, 6),
@@ -68,6 +84,24 @@ def test_copy_requires_every_compatibility_constraint(probe: MediaProbe) -> None
     assert "-g" in command.argv
     assert command.argv[command.argv.index("-g") + 1] == "60"
     assert "-maxrate" in command.argv and "-bufsize" in command.argv
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 48000, 2),
+        MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 48000, 2, video_profile="High", video_level=40, video_bitrate=4_500_000),
+        MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 48000, 2, video_profile="High", video_level=40, video_bitrate=7_000_000, gop_seconds=2.0),
+        MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 44100, 1, video_profile="High", video_level=40, video_bitrate=4_500_000, gop_seconds=2.0),
+        MediaProbe("h264", "aac", 1920, 1080, 30, "yuv420p", 48000, 2, video_profile="High", video_level=51, video_bitrate=4_500_000, gop_seconds=2.0),
+    ],
+)
+def test_unknown_or_out_of_bounds_copy_evidence_forces_transcode(probe: MediaProbe) -> None:
+    command = build_ffmpeg_command(
+        "https://media.example.test/live.m3u8", "rtmp://push.example.com/live/key",
+        DestinationKind.DOUYIN, probe,
+    )
+    assert "libx264" in command.argv
 
 
 def test_hls_and_flv_inputs_include_reconnect_options_and_one_output() -> None:

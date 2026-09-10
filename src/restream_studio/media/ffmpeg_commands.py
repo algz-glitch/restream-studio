@@ -34,12 +34,14 @@ class _Preset:
     audio_bitrate: str
     sample_rate: int
     channels: int
+    copy_max_bitrate: int
+    copy_max_level: int
 
 
 _PRESETS = {
-    DestinationKind.DOUYIN: _Preset(1920, 1080, 60, 30, "5000k", "6000k", "10000k", "160k", 48000, 2),
-    DestinationKind.WECHAT: _Preset(1920, 1080, 60, 30, "4000k", "5000k", "8000k", "128k", 48000, 2),
-    DestinationKind.LOCAL_TEST: _Preset(1920, 1080, 60, 30, "4000k", "5000k", "8000k", "128k", 48000, 2),
+    DestinationKind.DOUYIN: _Preset(1920, 1080, 30, 30, "5000k", "6000k", "10000k", "160k", 48000, 2, 6_000_000, 42),
+    DestinationKind.WECHAT: _Preset(1920, 1080, 30, 30, "4000k", "5000k", "8000k", "128k", 48000, 2, 5_000_000, 42),
+    DestinationKind.LOCAL_TEST: _Preset(1920, 1080, 30, 30, "4000k", "5000k", "8000k", "128k", 48000, 2, 5_000_000, 42),
 }
 
 
@@ -79,23 +81,27 @@ def _can_copy(probe: MediaProbe, preset: _Preset) -> bool:
         and 0 < probe.height <= preset.max_height
         and 0 < probe.frame_rate <= preset.max_fps
         and probe.pixel_format.casefold() == "yuv420p"
-        and probe.audio_sample_rate in {44100, 48000}
-        and probe.audio_channels in {1, 2}
+        and probe.audio_sample_rate == preset.sample_rate
+        and probe.audio_channels == preset.channels
+        and probe.video_profile is not None
+        and probe.video_profile.casefold() in {"baseline", "main", "high"}
+        and probe.video_level is not None
+        and probe.video_level <= preset.copy_max_level
+        and probe.video_bitrate is not None
+        and probe.video_bitrate <= preset.copy_max_bitrate
+        and probe.gop_seconds is not None
+        and 1.9 <= probe.gop_seconds <= 2.1
     )
 
 
 def _display_source_url(value: str) -> str:
     parsed = urlsplit(value)
-    query = "***" if parsed.query else ""
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+    return urlunsplit((parsed.scheme, parsed.netloc, "/***", "", ""))
 
 
 def _display_output_url(value: str) -> str:
     parsed = urlsplit(value)
-    segments = parsed.path.strip("/").split("/") if parsed.path.strip("/") else []
-    safe_path = "/***" if len(segments) <= 1 else f"/{segments[0]}/***"
-    query = "***" if parsed.query else ""
-    return urlunsplit((parsed.scheme, parsed.netloc, safe_path, query, ""))
+    return urlunsplit((parsed.scheme, parsed.netloc, "/***", "", ""))
 
 
 def build_ffmpeg_command(

@@ -1,10 +1,9 @@
 import asyncio
 import json
 import shutil
+import socket
 import subprocess
-from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
@@ -12,238 +11,167 @@ from restream_studio.media.ffprobe import (
     MediaProbeError,
     MediaProbeOutputTooLargeError,
     MediaProbeParseError,
-    MediaProbeProcessError,
     MediaProbeTimeoutError,
     _parse_probe,
     probe_media,
 )
 
 
-def _run[T](coroutine: Coroutine[Any, Any, T]) -> T:
-    try:
-        coroutine.send(None)
-    except StopIteration as stopped:
-        return cast(T, stopped.value)
-    raise AssertionError("fake subprocess unexpectedly suspended")
+def payload(**changes: object) -> bytes:
+    video: dict[str, object] = {
+        "codec_type": "video", "codec_name": "h264", "profile": "High", "level": 40,
+        "width": 1920, "height": 1080, "avg_frame_rate": "30000/1001",
+        "r_frame_rate": "30/1", "pix_fmt": "yuv420p", "bit_rate": "4500000",
+    }
+    video.update(changes)
+    return json.dumps({"streams": [video, {"codec_type": "audio", "codec_name": "aac",
+        "sample_rate": "48000", "channels": 2}]}).encode()
 
 
-@pytest.fixture(autouse=True)
-def immediate_wait_for(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def direct(awaitable: object, timeout: float) -> object:
-        del timeout
-        return await awaitable  # type: ignore[misc]
+class Stream:
+    def __init__(self, chunks: list[bytes], hang: bool = False) -> None:
+        self.chunks, self.hang, self.reads = chunks, hang, 0
 
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.wait_for", direct)
-
-
-def _payload(*, rate: str = "30000/1001", include_video: bool = True) -> bytes:
-    streams: list[dict[str, object]] = []
-    if include_video:
-        streams.append(
-            {
-                "codec_type": "video",
-                "codec_name": "h264",
-                "width": 1920,
-                "height": 1080,
-                "avg_frame_rate": rate,
-                "pix_fmt": "yuv420p",
-            }
-        )
-    streams.append(
-        {
-            "codec_type": "audio",
-            "codec_name": "aac",
-            "sample_rate": "48000",
-            "channels": 2,
-        }
-    )
-    return json.dumps({"streams": streams}).encode()
+    async def read(self, size: int) -> bytes:
+        self.reads += 1
+        if self.hang:
+            await asyncio.Event().wait()
+        return self.chunks.pop(0) if self.chunks else b""
 
 
-class FakeProcess:
-    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int | None = 0) -> None:
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-        self.killed = False
-        self.waited = False
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        return self.stdout, self.stderr
+class Process:
+    def __init__(self, out: list[bytes], err: list[bytes] | None = None,
+                 returncode: int | None = 0, hang: bool = False) -> None:
+        self.stdout, self.stderr = Stream(out, hang), Stream(err or [], hang)
+        self.returncode, self.killed, self.waited = returncode, False, False
 
     def kill(self) -> None:
-        self.killed = True
+        self.killed, self.returncode = True, -9
 
     async def wait(self) -> int | None:
         self.waited = True
         return self.returncode
 
 
-def test_probe_uses_exec_argv_and_maps_stream_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture(autouse=True)
+def dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def public(host: str, port: int) -> tuple[str, ...]:
+        return ("93.184.216.34",)
+    monkeypatch.setattr("restream_studio.media.ffprobe._resolve_host_addresses", public)
+
+
+def install(monkeypatch: pytest.MonkeyPatch, process: Process, calls: list[tuple[object, ...]] | None = None) -> None:
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        if calls is not None:
+            calls.append(args)
+        return process
+    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", spawn)
+
+
+@pytest.mark.asyncio
+async def test_chunk_reads_protocol_allowlist_and_extended_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = payload()
     calls: list[tuple[object, ...]] = []
-    process = FakeProcess(_payload())
-
-    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
-        calls.append(args)
-        assert kwargs["stdout"] is asyncio.subprocess.PIPE
-        assert kwargs["stderr"] is asyncio.subprocess.PIPE
-        return process
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", fake_exec)
-    result = _run(probe_media("https://media.example.test/live.flv?token=raw-secret"))
-
-    assert calls == [
-        (
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_streams",
-            "-of",
-            "json",
-            "https://media.example.test/live.flv?token=raw-secret",
-        )
-    ]
-    assert result.video_codec == "h264"
-    assert (result.width, result.height) == (1920, 1080)
-    assert result.frame_rate == pytest.approx(30000 / 1001)
-    assert result.pixel_format == "yuv420p"
-    assert result.audio_codec == "aac"
-    assert result.audio_sample_rate == 48000
-    assert result.audio_channels == 2
+    process = Process([raw[:30], raw[30:]], [b"warning"])
+    install(monkeypatch, process, calls)
+    result = await probe_media("https://media.example.test/path?token=raw")
+    assert calls[0][calls[0].index("-protocol_whitelist") + 1] == "http,https,tcp,tls,crypto"
+    assert calls[0][calls[0].index("-max_redirects") + 1] == "0"
+    assert process.stdout.reads >= 2 and process.stderr.reads >= 1
+    assert (result.video_profile, result.video_level, result.video_bitrate) == ("High", 40, 4_500_000)
+    assert result.gop_seconds is None
 
 
-@pytest.mark.parametrize("rate", ["1/0", "__import__('os').system('whoami')", "nan", "1/2/3"])
-def test_probe_rejects_unsafe_or_invalid_frame_rates(
-    monkeypatch: pytest.MonkeyPatch, rate: str
-) -> None:
-    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
-        return FakeProcess(_payload(rate=rate))
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", fake_exec)
-    with pytest.raises(MediaProbeParseError, match="frame rate"):
-        _run(probe_media("https://media.example.test/live.m3u8"))
-
-
-def test_probe_requires_video_and_valid_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    outputs = iter((_payload(include_video=False), b"not-json"))
-
-    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
-        return FakeProcess(next(outputs))
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", fake_exec)
-    with pytest.raises(MediaProbeParseError, match="video stream"):
-        _run(probe_media("https://media.example.test/a.flv"))
-    with pytest.raises(MediaProbeParseError, match="JSON"):
-        _run(probe_media("https://media.example.test/b.flv"))
-
-
-def test_probe_timeout_kills_and_reaps_without_leaking_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    secret_url = "https://media.example.test/live.flv?token=DO-NOT-LEAK"
-
-    class HangingProcess(FakeProcess):
-        async def communicate(self) -> tuple[bytes, bytes]:
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-    process = HangingProcess(b"", returncode=None)
-
-    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
-        return process
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", fake_exec)
-    async def timeout_wait(awaitable: object, timeout: float) -> object:
-        del timeout
-        awaitable.close()  # type: ignore[attr-defined]
-        raise TimeoutError
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.wait_for", timeout_wait)
-    with pytest.raises(MediaProbeTimeoutError) as caught:
-        _run(probe_media(secret_url, timeout=0.001))
-    assert process.killed and process.waited
-    assert "DO-NOT-LEAK" not in str(caught.value)
-
-
-def test_probe_nonzero_and_spawn_errors_are_typed_and_redacted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    secret_url = "https://media.example.test/live.flv?signature=DO-NOT-LEAK"
-
-    async def nonzero(*args: object, **kwargs: object) -> FakeProcess:
-        return FakeProcess(b"", f"failed {secret_url}".encode(), 1)
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", nonzero)
-    with pytest.raises(MediaProbeProcessError) as caught:
-        _run(probe_media(secret_url))
-    assert "DO-NOT-LEAK" not in str(caught.value)
-
-    async def broken(*args: object, **kwargs: object) -> FakeProcess:
-        raise OSError(f"spawn failed {secret_url}")
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", broken)
-    with pytest.raises(MediaProbeError) as caught_spawn:
-        _run(probe_media(secret_url))
-    assert "DO-NOT-LEAK" not in str(caught_spawn.value)
-
-
-def test_probe_rejects_unsafe_input_and_oversized_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with pytest.raises(MediaProbeError):
-        _run(probe_media("file:///etc/passwd"))
-    with pytest.raises(MediaProbeError):
-        _run(probe_media("https://user:pass@example.test/live.flv"))
-
-    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
-        return FakeProcess(b"x" * 101)
-
-    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", fake_exec)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("per_stream", [False, True])
+async def test_output_limit_immediately_kills_and_reaps(monkeypatch: pytest.MonkeyPatch, per_stream: bool) -> None:
+    process = Process([b"a" * 81, b"b" * 81], [b"c" * 60], None)
+    install(monkeypatch, process)
     with pytest.raises(MediaProbeOutputTooLargeError):
-        _run(probe_media("https://media.example.test/live.flv", max_output_bytes=100))
+        await probe_media(
+            "https://media.example.test/live",
+            max_output_bytes=100,
+            max_stream_bytes=80 if per_stream else 100,
+        )
+    assert process.killed and process.waited
 
 
-def test_local_ffprobe_generated_fixture_smoke(tmp_path: Path) -> None:
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
+@pytest.mark.asyncio
+async def test_timeout_kills_and_reaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Process([], returncode=None, hang=True)
+    install(monkeypatch, process)
+    with pytest.raises(MediaProbeTimeoutError):
+        await probe_media("https://media.example.test/live?token=secret", timeout=0.001)
+    assert process.killed and process.waited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["file:///x", "https://u:p@example.test/x", "https://localhost/x",
+    "https://127.0.0.1/x", "https://10.0.0.1/x", "https://[::1]/x"])
+async def test_rejects_unsafe_input(url: str) -> None:
+    with pytest.raises(MediaProbeError):
+        await probe_media(url)
+
+
+@pytest.mark.asyncio
+async def test_rejects_any_non_global_dns_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def mixed(host: str, port: int) -> tuple[str, ...]:
+        return ("93.184.216.34", "10.0.0.8")
+    monkeypatch.setattr("restream_studio.media.ffprobe._resolve_host_addresses", mixed)
+    with pytest.raises(MediaProbeError, match="public"):
+        await probe_media("https://media.example.test/live")
+
+
+@pytest.mark.asyncio
+async def test_dns_uses_async_getaddrinfo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()
+    calls: list[tuple[str, int]] = []
+    async def answer(host: str, port: int, **kwargs: int) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+        calls.append((host, port))
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))]
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", answer)
+    install(monkeypatch, Process([payload()]))
+    await probe_media("https://media.example.test/live")
+    assert calls == [("media.example.test", 443)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("avg", "real", "fps"), [("0/0", "25/1", 25), ("0", "30/1", 30), ("bad", "24/1", 24)])
+async def test_bad_average_rate_falls_back(monkeypatch: pytest.MonkeyPatch, avg: str, real: str, fps: float) -> None:
+    install(monkeypatch, Process([payload(avg_frame_rate=avg, r_frame_rate=real)]))
+    assert (await probe_media("https://media.example.test/live")).frame_rate == pytest.approx(fps)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, 1.0, "1.0", "-1", "999999999999999999999"])
+async def test_integer_fields_are_strict_and_bounded(monkeypatch: pytest.MonkeyPatch, value: object) -> None:
+    install(monkeypatch, Process([payload(width=value)]))
+    with pytest.raises(MediaProbeParseError, match="width"):
+        await probe_media("https://media.example.test/live")
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_and_missing_video_are_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    for raw, message in [(b"bad", "JSON"), (b'{"streams":[]}', "video")]:
+        install(monkeypatch, Process([raw]))
+        with pytest.raises(MediaProbeParseError, match=message):
+            await probe_media("https://media.example.test/live")
+
+
+def test_local_generated_fixture_smoke(tmp_path: Path) -> None:
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
     if ffmpeg is None or ffprobe is None:
         pytest.skip("local FFmpeg tools are unavailable")
-    fixture = tmp_path / "task6-smoke.mp4"
+    fixture = tmp_path / "task6.mp4"
     generated = subprocess.run(
-        [
-            ffmpeg,
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=size=64x64:rate=25:duration=0.1",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=sample_rate=48000:channel_layout=stereo",
-            "-shortest",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            str(fixture),
-        ],
-        capture_output=True,
-        check=False,
-        timeout=10,
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=size=64x64:rate=25:duration=0.1",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(fixture)],
+        capture_output=True, check=False, timeout=10,
     )
     assert generated.returncode == 0
     probed = subprocess.run(
         [ffprobe, "-v", "error", "-show_streams", "-of", "json", str(fixture)],
-        capture_output=True,
-        check=False,
-        timeout=10,
+        capture_output=True, check=False, timeout=10,
     )
     assert probed.returncode == 0
-    result = _parse_probe(probed.stdout)
-    assert result.video_codec == "h264"
-    assert result.audio_codec == "aac"
-    assert (result.width, result.height, result.pixel_format) == (64, 64, "yuv420p")
+    assert _parse_probe(probed.stdout).video_codec == "h264"

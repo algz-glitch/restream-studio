@@ -1,6 +1,7 @@
 import json
 import os
 from collections.abc import Coroutine, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ import pytest
 
 from restream_studio.source.base import (
     LiveSourceResolver,
+    ResolverNetworkError,
     ResolverProtocolError,
     ResolverRateLimited,
 )
@@ -320,7 +322,11 @@ def test_default_adapter_bypasses_streamget_bd_fallback_and_selects_raw_blue_url
 def test_default_adapter_maps_streamget_dictionary_result(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeDouyinLiveStream:
         async def fetch_web_stream_data(self, url: str) -> object:
-            return {"source_url": url}
+            return {
+                "status": 4,
+                "anchor_name": "dictionary-anchor",
+                "live_url": "https://live.douyin.com/998877",
+            }
 
         async def fetch_stream_url(self, data: object, quality: str) -> object:
             return {
@@ -359,6 +365,140 @@ def test_default_streamget_exception_is_contained(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(ResolverProtocolError) as caught:
         run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", None))
     assert not isinstance(caught.value, VendorFailure)
+
+
+@pytest.mark.parametrize("status", [None, "2", 0, 3, 5, True])
+def test_streamget_raw_status_is_strict(monkeypatch: pytest.MonkeyPatch, status: object) -> None:
+    class Client:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return {"status": status, "anchor_name": "a", "live_url": url}
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            raise AssertionError("invalid status must stop before URL selection")
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", Client)
+    with pytest.raises(ResolverProtocolError):
+        run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", None))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///tmp/live.flv",
+        "https://user:pass@media.example/live.flv",
+        "https://127.0.0.1/live.flv",
+        "https://10.0.0.1/live.flv",
+        "https://169.254.1.1/live.flv",
+        "https://localhost/live.flv",
+        "https://bad_host/live.flv",
+        "https://media.example/live.flv\nheader: x",
+    ],
+)
+def test_media_urls_reject_unsafe_or_malformed_destinations(url: str) -> None:
+    payload = fixture("douyin_live.json")
+    payload["streams"]["blue"]["flv"] = url
+    with pytest.raises(ResolverProtocolError):
+        run_immediate(
+            DouyinResolver(component=lambda _: payload).resolve(
+                "https://live.douyin.com/731234", "blue"
+            )
+        )
+
+
+def test_signed_url_expiry_and_safe_repr() -> None:
+    payload = fixture("douyin_live.json")
+    payload.pop("expires_at")
+    payload["streams"]["blue"]["flv"] = (
+        "https://media.example.test/live.flv?token=secret&expires=1893456300"
+    )
+    result = run_immediate(
+        DouyinResolver(component=lambda _: payload).resolve(
+            "https://live.douyin.com/731234", "blue"
+        )
+    )
+    assert result.expires_at == datetime.fromtimestamp(1893456300, UTC)
+    assert "secret" not in repr(result)
+    assert "https://" not in repr(result)
+
+
+def test_candidate_probe_keeps_valid_hls_when_flv_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = fixture("douyin_streamget_raw.json")
+
+    class Client:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return raw
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            raise AssertionError("raw qualities bypass compatibility fallback")
+
+    async def probe(url: str) -> bool:
+        return not url.endswith("ultra.flv")
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", Client)
+    result = run_immediate(
+        DouyinResolver(candidate_probe=probe).resolve(
+            "https://live.douyin.com/7312345678901234567", "ultra"
+        )
+    )
+    assert result.selected_quality == "ultra"
+    assert result.flv_urls == ()
+    assert result.hls_urls == ("https://media.example.test/ultra.m3u8",)
+
+
+def test_candidate_probe_falls_back_quality_when_preferred_is_unplayable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = fixture("douyin_streamget_raw.json")
+
+    class Client:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return raw
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            raise AssertionError("raw qualities bypass compatibility fallback")
+
+    async def probe(url: str) -> bool:
+        return "ultra" not in url
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", Client)
+    result = run_immediate(
+        DouyinResolver(candidate_probe=probe).resolve(
+            "https://live.douyin.com/7312345678901234567", "ultra"
+        )
+    )
+    assert result.selected_quality == "origin"
+
+
+def test_streamget_rate_limit_response_preserves_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            return {"status_code": 429, "message": "rate limit", "retry_after": "23"}
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            raise AssertionError("rate-limited response must stop")
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", Client)
+    with pytest.raises(ResolverRateLimited) as caught:
+        run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", None))
+    assert caught.value.retry_after_seconds == 23
+
+
+def test_streamget_timeout_maps_to_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Client:
+        async def fetch_web_stream_data(self, url: str) -> object:
+            raise TimeoutError("vendor timeout details")
+
+        async def fetch_stream_url(self, data: object, quality: str) -> object:
+            raise AssertionError("must not be called")
+
+    monkeypatch.setattr("restream_studio.source.douyin._default_component_factory", Client)
+    with pytest.raises(ResolverNetworkError) as caught:
+        run_immediate(DouyinResolver().resolve("https://live.douyin.com/731234", None))
+    assert "vendor timeout details" not in str(caught.value)
 
 
 @pytest.mark.live_network

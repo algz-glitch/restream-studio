@@ -160,3 +160,26 @@ StreamGet as the parser while avoiding its Douyin BD index defect.
 
 The first complete focused GREEN run reported exit code `0`;
 `21 passed, 1 deselected in 0.07s`.
+
+## RED — boundary hardening review
+
+Tests were added in the uncommitted working tree for unsafe media destinations, signed URL
+expiry, strict raw status, safe representation, real StreamGet quality keys, and injectable
+candidate probing. The first complete focused run reported exit code `1`;
+`9 failed, 27 passed, 1 deselected in 0.26s`. Eight failures accepted unsafe URL forms and
+one showed missing signed-URL expiry derivation. No live-network test ran.
+
+## GREEN — hardened StreamGet boundary
+
+The adapter now accepts only raw status integer `2` or `4`, classifies known rate-limit
+responses and exceptions, separates timeout/network failures, validates media URLs without
+DNS resolution, recognizes sanitized `FULL_HD1`, `HD1`, `SD1`, and `SD2` structures, and
+emits only a non-sensitive count when unknown quality keys are ignored. An injectable async
+candidate probe supports per-protocol filtering and ranked quality fallback; without a probe,
+Task 6 remains responsible for ffprobe-level playability verification. Signed URL expiry is
+derived from `expiry`, `expires`, `expire`, or hexadecimal `wsTime`, otherwise a documented
+five-minute lifetime is used. URL-bearing `ResolvedStream` fields are excluded from repr.
+
+The focused GREEN run reported exit code `0`; `38 passed, 1 deselected in 0.07s`.
+After explicit 429/retry-after and timeout classification regressions were added, the final
+focused run reported `40 passed, 1 deselected in 0.09s`.

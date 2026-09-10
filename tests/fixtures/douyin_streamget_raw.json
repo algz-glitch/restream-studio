@@ -1,0 +1,21 @@
+{
+  "status": 2,
+  "anchor_name": "streamget-fixture-anchor",
+  "live_url": "https://live.douyin.com/7312345678901234567",
+  "stream_url": {
+    "flv_pull_url": {
+      "ORIGIN": "https://media.example.test/origin.flv",
+      "FULL_HD1": "https://media.example.test/ultra.flv",
+      "HD1": "https://media.example.test/high.flv",
+      "SD1": "https://media.example.test/standard.flv",
+      "SD2": "https://media.example.test/smooth.flv"
+    },
+    "hls_pull_url_map": {
+      "ORIGIN": "https://media.example.test/origin.m3u8",
+      "FULL_HD1": "https://media.example.test/ultra.m3u8",
+      "HD1": "https://media.example.test/high.m3u8",
+      "SD1": "https://media.example.test/standard.m3u8",
+      "SD2": "https://media.example.test/smooth.m3u8"
+    }
+  }
+}

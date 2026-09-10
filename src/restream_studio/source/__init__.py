@@ -1,6 +1,8 @@
 from restream_studio.source.base import (
+    CandidateProbe,
     LiveSourceResolver,
     ResolverError,
+    ResolverNetworkError,
     ResolverProtocolError,
     ResolverRateLimited,
 )
@@ -11,10 +13,12 @@ from restream_studio.source.url_normalizer import (
 )
 
 __all__ = [
+    "CandidateProbe",
     "DouyinResolver",
     "DouyinUrlValidationError",
     "LiveSourceResolver",
     "ResolverError",
+    "ResolverNetworkError",
     "ResolverProtocolError",
     "ResolverRateLimited",
     "normalize_douyin_url",

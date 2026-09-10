@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from enum import StrEnum
 
@@ -36,15 +37,15 @@ def _is_timezone_aware(value: datetime) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedStream:
-    url: str
+    url: str = dataclass_field(repr=False)
     acquired_at: datetime
     expires_at: datetime | None
     room_id: str | None = None
     anchor_name: str | None = None
     is_live: bool = True
     selected_quality: str | None = None
-    flv_urls: tuple[str, ...] = ()
-    hls_urls: tuple[str, ...] = ()
+    flv_urls: tuple[str, ...] = dataclass_field(default=(), repr=False)
+    hls_urls: tuple[str, ...] = dataclass_field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if not _is_timezone_aware(self.acquired_at):

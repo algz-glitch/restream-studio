@@ -19,6 +19,14 @@ class ResolverProtocolError(ResolverError):
     """The source component is unavailable or returned an invalid contract."""
 
 
+class ResolverNetworkError(ResolverError):
+    """The source component could not complete due to a network timeout."""
+
+
+class CandidateProbe(Protocol):
+    async def is_playable(self, url: str) -> bool: ...
+
+
 @runtime_checkable
 class LiveSourceResolver(Protocol):
     async def resolve(self, url: str, preferred_quality: str | None) -> ResolvedStream: ...

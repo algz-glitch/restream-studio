@@ -1,0 +1,92 @@
+# Task 7 output supervisor TDD evidence
+
+## Scope
+
+The runtime integration cases use only `sys.executable` plus
+`tests/fixtures/child_process.py`. It performs no network requests and does not contact a live
+streaming platform. The 13 collected cases cover process start/health/stop, timeout kill,
+concurrent idempotent stop, exit status, bounded and redacted stderr, FFmpeg progress metrics,
+the exact retry schedule, terminal authentication failures, destination/process isolation, and
+cancellation cleanup.
+
+## RED
+
+Tests and the deterministic child fixture were created before production code.
+
+Command:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/integration/test_output_supervisor.py -x
+```
+
+Observed result (exit code `1`):
+
+```text
+collected 0 items / 1 error
+E   ModuleNotFoundError: No module named 'restream_studio.media.process'
+ERROR tests/integration/test_output_supervisor.py
+```
+
+The failure was expected because `AsyncProcess` and `OutputSupervisor` did not yet exist.
+
+## GREEN implementation
+
+- `AsyncProcess` launches argv exclusively through `asyncio.create_subprocess_exec`, with no
+  shell, and gives every Windows child a new process group.
+- Graceful stop uses `CTRL_BREAK_EVENT` on Windows and process-group `SIGTERM` on POSIX, then
+  kills after a bounded timeout. Concurrent stops serialize and every stop path waits/reaps.
+- stderr capture uses bounded chunk parsing rather than an unbounded `readline`; redaction is
+  applied before any diagnostic enters snapshots or reprs.
+- Metrics accept only `fps`, `bitrate`, `speed`, `out_time`, and `progress`, with bounded values.
+- One supervisor owns one destination and at most one active child. It reuses `OutputState`,
+  exposes validated `transition`, retries transient exits at `2, 5, 10, 20, 30, 30...`, and
+  terminates retrying after authentication rejection.
+- Cancellation closes the owned child and re-raises `CancelledError`.
+
+## Windows async test environment blocker
+
+The post-implementation focused test was run individually with an external pytest faulthandler
+deadline as requested:
+
+```powershell
+.venv\Scripts\python.exe -m pytest `
+  tests/integration/test_output_supervisor.py::test_async_process_starts_collects_metrics_and_stops_cleanly `
+  -vv -o faulthandler_timeout=5
+```
+
+It did not enter the test body. The faulthandler stack consistently stopped while pytest-asyncio
+was creating the Windows Proactor event loop:
+
+```text
+Timeout (0:00:05)!
+File "socket.py", line 295 in accept
+File "socket.py", line 627 in _fallback_socketpair
+File "asyncio/proactor_events.py", line 787 in _make_self_pipe
+File "asyncio/windows_events.py", line 316 in __init__
+```
+
+The independent reproduction
+`.venv\Scripts\python.exe -c "import socket; print(socket.socketpair())"` also timed out. This
+confirms a host socketpair restriction before application code executes, not an output supervisor
+failure. The hung test process was terminated externally. No asyncio/test shim was added.
+
+Collection remains healthy:
+
+```text
+13 tests collected
+```
+
+## Verification
+
+- `npm run lint`: exit `0`, all checks passed (Ruff also reported two pre-existing inaccessible
+  cache/temp paths).
+- `npm run typecheck`: exit `0`, `Success: no issues found in 27 source files`.
+- Synchronous regression slice excluding the host-blocked ffprobe asyncio module: exit `0`,
+  `137 passed, 1 deselected`.
+- `npm run build`: blocked before build backend execution by `PermissionError` creating pip's
+  build-tracker file. Repointing `TEMP`/`TMP` to the workspace `build` directory produced the same
+  host filesystem denial.
+- Focused Task 7 runtime tests are blocked at Windows Proactor socketpair creation as evidenced
+  above. Full `npm run verify` reaches pytest after clean lint/typecheck, then collection is blocked
+  by a pre-existing inaccessible root `tmp0fe8fhgz` directory. No indefinite wait was left
+  running.

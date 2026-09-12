@@ -154,6 +154,56 @@ async def test_supervisor_start_reaches_live_and_stop_reaps_process() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelling_public_start_cancels_runner_and_closes_started_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered_start = asyncio.Event()
+    release_start = asyncio.Event()
+    child_stopped = asyncio.Event()
+    child_exited = asyncio.Event()
+
+    class FakeAsyncProcess:
+        def __init__(self, _argv: object, *, sensitive_values: object) -> None:
+            self.started = False
+            self.auth_failed = False
+
+        async def start(self) -> None:
+            self.started = True
+            entered_start.set()
+            await release_start.wait()
+
+        async def stop(self, *, timeout: float) -> int:
+            child_stopped.set()
+            child_exited.set()
+            return 0
+
+        async def wait(self) -> int:
+            await child_exited.wait()
+            return 0
+
+    monkeypatch.setattr("restream_studio.outputs.supervisor.AsyncProcess", FakeAsyncProcess)
+    supervisor = OutputSupervisor(DestinationKind.DOUYIN, child("healthy"))
+    start_task = asyncio.create_task(supervisor.start())
+    await asyncio.wait_for(entered_start.wait(), timeout=1.0)
+
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+    try:
+        await asyncio.wait_for(child_stopped.wait(), timeout=0.1)
+    finally:
+        release_start.set()
+        await supervisor.stop()
+
+    assert supervisor.state is OutputState.STOPPED
+    assert not any(
+        task.get_name().startswith("output-supervisor-") and not task.done()
+        for task in asyncio.all_tasks()
+    )
+    assert not any(task.get_name() == "output-supervisor-live" for task in asyncio.all_tasks())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
     ["authentication failed", "HTTP 403", "invalid stream key", "publish denied"],
@@ -219,6 +269,70 @@ async def test_timeout_kill_terminates_descendant_process_tree() -> None:
 
 
 @pytest.mark.asyncio
+async def test_windows_tree_kill_is_async_and_does_not_block_peer_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows taskkill behavior")
+    taskkill_entered = asyncio.Event()
+    release_taskkill = asyncio.Event()
+    peer_progressed = asyncio.Event()
+
+    class FakeMainProcess:
+        pid = 4242
+        returncode: int | None = None
+
+        def send_signal(self, _signal: int) -> None:
+            return None
+
+        async def wait(self) -> int:
+            if self.returncode is None:
+                await asyncio.Event().wait()
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    main_process = FakeMainProcess()
+
+    class FakeTaskkillProcess:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            taskkill_entered.set()
+            await release_taskkill.wait()
+            self.returncode = 0
+            main_process.returncode = 1
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_create(*argv: str, **kwargs: object) -> asyncio.subprocess.Process:
+        assert argv == ("taskkill", "/PID", "4242", "/T", "/F")
+        assert "shell" not in kwargs
+        return FakeTaskkillProcess()  # type: ignore[return-value]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    process = AsyncProcess(("unused",))
+    object.__setattr__(process, "_process", main_process)
+
+    stop_task = asyncio.create_task(process.stop(timeout=0.01))
+    await asyncio.wait_for(taskkill_entered.wait(), timeout=1.0)
+
+    async def peer_supervisor_work() -> None:
+        await asyncio.sleep(0)
+        peer_progressed.set()
+
+    peer_task = asyncio.create_task(peer_supervisor_work())
+    await asyncio.wait_for(peer_progressed.wait(), timeout=0.1)
+    assert not stop_task.done()
+    release_taskkill.set()
+    await asyncio.wait_for(asyncio.gather(stop_task, peer_task), timeout=1.0)
+
+
+@pytest.mark.asyncio
 async def test_two_supervisors_isolate_processes_and_stop_groups() -> None:
     first = OutputSupervisor(DestinationKind.DOUYIN, child("healthy"))
     second = OutputSupervisor(DestinationKind.WECHAT, child("healthy"))
@@ -229,7 +343,7 @@ async def test_two_supervisors_isolate_processes_and_stop_groups() -> None:
     second_pid = second.pid
 
     assert first.process is not None
-    first.process.kill()
+    await first.process.kill()
     await eventually(lambda: first.state is OutputState.RECONNECTING)
     assert second.state is OutputState.LIVE
     assert second_pid is not None and psutil.pid_exists(second_pid)

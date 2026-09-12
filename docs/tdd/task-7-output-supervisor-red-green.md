@@ -116,3 +116,36 @@ cases then failed immediately at the host boundary with `PermissionError(13, Win
 `asyncio.create_subprocess_exec`; they did not hang and no child application code ran. This is
 separate from the implementation assertions and is retained here rather than reported as a green
 runtime suite.
+
+## Final review follow-up: public start cancellation and asynchronous taskkill
+
+### RED
+
+Two deterministic fake-process tests were added before implementation. With the process-local
+loopback runner, both failed against the previous code:
+
+- cancelling public `start()` timed out waiting for `child_stopped`, proving its internal runner
+  continued in the background;
+- the Windows escalation test timed out waiting for `taskkill_entered`, proving the implementation
+  called synchronous `subprocess.run` instead of the patched async subprocess boundary.
+
+### GREEN
+
+`start()` now names and owns its newly created runner and live-wait task. Caller cancellation
+cancels and awaits both, waits for runner cancellation cleanup, closes any child that crossed the
+startup boundary, restores `STOPPED`, and re-raises `CancelledError`. A caller merely joining an
+already-running supervisor does not acquire ownership of that existing runner.
+
+Windows tree escalation now launches the fixed argv
+`taskkill /PID <integer> /T /F` with `asyncio.create_subprocess_exec`. It applies a five-second
+timeout, kills and reaps a stuck taskkill helper, falls back to the already-owned main-process
+handle when taskkill fails, and never invokes a shell. The concurrent regression proves peer
+event-loop work progresses while the fake taskkill helper is deliberately blocked.
+
+Focused GREEN command result:
+
+```text
+2 passed, 1 warning in 0.08s
+```
+
+No loopback or asyncio shim was added to the repository.

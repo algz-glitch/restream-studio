@@ -234,7 +234,7 @@ class AsyncProcess:
                     await asyncio.wait_for(process.wait(), timeout=timeout)
                 except TimeoutError:
                     self._was_killed = True
-                    self.kill()
+                    await self.kill()
                     await process.wait()
             await self._finalize_reader()
             assert process.returncode is not None
@@ -256,7 +256,7 @@ class AsyncProcess:
                 except ProcessLookupError:
                     pass
 
-    def kill(self) -> None:
+    async def kill(self) -> None:
         process = self._require_process()
         if process.returncode is not None:
             return
@@ -264,18 +264,24 @@ class AsyncProcess:
             if os.name != "nt":
                 os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
             else:
-                completed = subprocess.run(
-                    ("taskkill", "/PID", str(int(process.pid)), "/T", "/F"),
+                taskkill = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(int(process.pid)),
+                    "/T",
+                    "/F",
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    check=False,
-                    shell=False,
-                    timeout=5.0,
                 )
-                if completed.returncode != 0 and process.returncode is None:
+                try:
+                    taskkill_returncode = await asyncio.wait_for(taskkill.wait(), timeout=5.0)
+                except TimeoutError:
+                    taskkill.kill()
+                    taskkill_returncode = await taskkill.wait()
+                if taskkill_returncode != 0 and process.returncode is None:
                     process.kill()
-        except (OSError, ProcessLookupError, subprocess.SubprocessError):
+        except (OSError, ProcessLookupError):
             if process.returncode is None:
                 try:
                     process.kill()

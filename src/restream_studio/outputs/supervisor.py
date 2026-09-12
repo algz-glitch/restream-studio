@@ -87,13 +87,25 @@ class OutputSupervisor:
             await self._live.wait()
             return
         self._live.clear()
-        self._runner = asyncio.create_task(self.run())
-        live_wait = asyncio.create_task(self._live.wait())
-        done, _ = await asyncio.wait({self._runner, live_wait}, return_when=asyncio.FIRST_COMPLETED)
-        if self._runner in done:
+        runner = asyncio.create_task(
+            self.run(), name=f"output-supervisor-{self.destination.value.casefold()}"
+        )
+        self._runner = runner
+        live_wait = asyncio.create_task(self._live.wait(), name="output-supervisor-live")
+        try:
+            done, _ = await asyncio.wait({runner, live_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if runner in done:
+                runner.result()
+        except asyncio.CancelledError:
+            runner.cancel()
+            live_wait.cancel()
+            await asyncio.gather(runner, live_wait, return_exceptions=True)
+            await self._close_process()
+            self._to_stopped()
+            raise
+        finally:
             live_wait.cancel()
             await asyncio.gather(live_wait, return_exceptions=True)
-            self._runner.result()
 
     async def run(self) -> None:
         current = asyncio.current_task()

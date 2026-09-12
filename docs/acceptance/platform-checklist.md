@@ -70,9 +70,9 @@ FFmpeg 退出码或本地 RTMP 测试都不能代替平台预览。任何自动�
 
 两个目标恢复 LIVE 后，以同一 UTC 起点开始连续 **30 分钟**观察。每分钟只写一条同步记录，
 `minute=1..30`，不得事后批量补填。每条必须同时记录：应用/来源状态、两个目标状态、各目标
-码率、累计掉帧、累计重连、各自平台预览音频/视频、整机或应用进程 CPU 和内存。
-平台未提供数值时写 `null` 并在 `notes` 说明数据来源缺失，禁止猜测；但平台预览音视频必须
-由账号持有人实际观察并记录布尔值。
+码率、累计掉帧、累计重连、各自平台预览音频/视频、整机或应用进程 CPU 和内存。验收通过
+记录不得以 `null`、空字段或说明文字代替指标；平台预览音视频必须由账号持有人实际观察并
+记录为 `true`。
 
 | minute | UTC | 来源/应用 | 抖音状态/码率/掉帧/重连/预览音视频 | 视频号状态/码率/掉帧/重连/预览音视频 | CPU%/内存 MiB | 记录人 |
 |---:|---|---|---|---|---|---|
@@ -141,209 +141,26 @@ Cookie/Authorization/token、浏览器地址栏查询参数、本机用户名与
 - [ ] 每张截图由复核人确认无法恢复敏感内容。
 - [ ] `result.json` 只引用证据目录内的相对路径和 SHA-256，不包含图片数据或绝对路径。
 
-## 8. `result.json` schema
+## 8. `result.json` schema 与执行门禁
 
 `result.json` 是一次真实运行的结构化索引，不是自动生成的通过证明。应在本地忽略目录中生成，
-填写真实观测后由账号持有人和验收人签字。禁止提交示例通过文件。以下为 JSON Schema
-Draft 2020-12；实现校验器时必须按原 schema 校验，不得删除必填项或放宽数量限制。
+填写真实观测后由账号持有人和验收人签字。禁止提交示例通过文件。唯一规范 schema 为
+`docs/acceptance/platform-result.schema.json`（JSON Schema Draft 2020-12），执行门禁为
+`scripts/validate_platform_acceptance.py`。
 
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://local.invalid/restream-studio/platform-acceptance-result.schema.json",
-  "title": "Restream Studio real platform acceptance result",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["schema_version", "run_id", "status", "started_at_utc", "completed_at_utc", "build", "local_chain", "credential_provenance", "initial_preview", "stop_isolation", "minute_samples", "source_interruption", "screenshots", "signoff", "rollback"],
-  "properties": {
-    "schema_version": { "const": 1 },
-    "run_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9-]+$" },
-    "status": { "enum": ["LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING", "LOCAL_CHAIN_VERIFIED_PLATFORM_ACCEPTANCE_PENDING", "PLATFORM_ACCEPTED"] },
-    "started_at_utc": { "$ref": "#/$defs/utc" },
-    "completed_at_utc": { "$ref": "#/$defs/utc" },
-    "build": {
-      "type": "object", "additionalProperties": false,
-      "required": ["app_version", "git_commit", "windows_version", "ffmpeg_version", "mediamtx_version"],
-      "properties": {
-        "app_version": { "type": "string", "minLength": 1 },
-        "git_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
-        "windows_version": { "type": "string", "minLength": 1 },
-        "ffmpeg_version": { "type": "string", "minLength": 1 },
-        "mediamtx_version": { "type": ["string", "null"] }
-      }
-    },
-    "local_chain": {
-      "type": "object", "additionalProperties": false,
-      "required": ["verified", "evidence_sha256"],
-      "properties": {
-        "verified": { "type": "boolean" },
-        "evidence_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
-      }
-    },
-    "credential_provenance": {
-      "type": "object", "additionalProperties": false,
-      "required": ["douyin", "wechat_channels"],
-      "properties": {
-        "douyin": { "$ref": "#/$defs/provenance" },
-        "wechat_channels": { "$ref": "#/$defs/provenance" }
-      }
-    },
-    "initial_preview": { "$ref": "#/$defs/twoTargetObservation" },
-    "stop_isolation": {
-      "type": "array", "minItems": 2, "maxItems": 2,
-      "items": { "$ref": "#/$defs/isolation" }
-    },
-    "minute_samples": {
-      "type": "array", "minItems": 30, "maxItems": 30,
-      "items": { "$ref": "#/$defs/minuteSample" }
-    },
-    "source_interruption": {
-      "type": "object", "additionalProperties": false,
-      "required": ["started_at_utc", "restored_at_utc", "duration_seconds", "standby", "recovery_probes"],
-      "properties": {
-        "started_at_utc": { "$ref": "#/$defs/utc" },
-        "restored_at_utc": { "$ref": "#/$defs/utc" },
-        "duration_seconds": { "type": "number", "exclusiveMinimum": 60 },
-        "standby": { "$ref": "#/$defs/twoTargetObservation" },
-        "recovery_probes": {
-          "type": "array", "minItems": 2, "maxItems": 2,
-          "items": { "$ref": "#/$defs/recoveryProbe" }
-        }
-      }
-    },
-    "screenshots": {
-      "type": "array", "minItems": 7,
-      "items": { "$ref": "#/$defs/screenshot" }
-    },
-    "signoff": {
-      "type": "object", "additionalProperties": false,
-      "required": ["account_holder", "acceptance_verifier"],
-      "properties": {
-        "account_holder": { "$ref": "#/$defs/signature" },
-        "acceptance_verifier": { "$ref": "#/$defs/signature" }
-      }
-    },
-    "rollback": {
-      "type": "object", "additionalProperties": false,
-      "required": ["backup_reference", "old_program_reference", "outputs_stopped", "platform_sessions_ended", "credentials_removed_or_rotated", "verified_at_utc"],
-      "properties": {
-        "backup_reference": { "type": "string", "minLength": 1 },
-        "old_program_reference": { "type": "string", "minLength": 1 },
-        "outputs_stopped": { "type": "boolean" },
-        "platform_sessions_ended": { "type": "boolean" },
-        "credentials_removed_or_rotated": { "type": "boolean" },
-        "verified_at_utc": { "$ref": "#/$defs/utc" }
-      }
-    },
-    "failures": {
-      "type": "array",
-      "items": { "type": "string", "minLength": 1, "maxLength": 500 }
-    }
-  },
-  "$defs": {
-    "utc": { "type": "string", "format": "date-time", "pattern": "Z$" },
-    "provenance": {
-      "type": "object", "additionalProperties": false,
-      "required": ["official_console", "obtained_by_account_holder", "input_channel", "persisted_outside_app"],
-      "properties": {
-        "official_console": { "enum": ["抖音直播伴侣", "视频号助手"] },
-        "obtained_by_account_holder": { "const": true },
-        "input_channel": { "const": "restream_studio_ui" },
-        "persisted_outside_app": { "const": false }
-      }
-    },
-    "targetObservation": {
-      "type": "object", "additionalProperties": false,
-      "required": ["status", "video_visible", "audio_audible", "observed_at_utc", "observed_by"],
-      "properties": {
-        "status": { "type": "string", "minLength": 1 },
-        "video_visible": { "type": "boolean" },
-        "audio_audible": { "type": "boolean" },
-        "observed_at_utc": { "$ref": "#/$defs/utc" },
-        "observed_by": { "type": "string", "minLength": 1 }
-      }
-    },
-    "twoTargetObservation": {
-      "type": "object", "additionalProperties": false,
-      "required": ["douyin", "wechat_channels"],
-      "properties": {
-        "douyin": { "$ref": "#/$defs/targetObservation" },
-        "wechat_channels": { "$ref": "#/$defs/targetObservation" }
-      }
-    },
-    "isolation": {
-      "type": "object", "additionalProperties": false,
-      "required": ["stopped_target", "stopped_at_utc", "peer_remained_live", "stopped_target_absent_in_preview", "resumed_at_utc", "observed_by"],
-      "properties": {
-        "stopped_target": { "enum": ["douyin", "wechat_channels"] },
-        "stopped_at_utc": { "$ref": "#/$defs/utc" },
-        "peer_remained_live": { "type": "boolean" },
-        "stopped_target_absent_in_preview": { "type": "boolean" },
-        "resumed_at_utc": { "$ref": "#/$defs/utc" },
-        "observed_by": { "type": "string", "minLength": 1 }
-      }
-    },
-    "targetMinute": {
-      "type": "object", "additionalProperties": false,
-      "required": ["status", "bitrate_kbps", "dropped_frames", "reconnect_count", "platform_video_visible", "platform_audio_audible"],
-      "properties": {
-        "status": { "type": "string", "minLength": 1 },
-        "bitrate_kbps": { "type": ["number", "null"], "minimum": 0 },
-        "dropped_frames": { "type": ["integer", "null"], "minimum": 0 },
-        "reconnect_count": { "type": ["integer", "null"], "minimum": 0 },
-        "platform_video_visible": { "type": "boolean" },
-        "platform_audio_audible": { "type": "boolean" }
-      }
-    },
-    "minuteSample": {
-      "type": "object", "additionalProperties": false,
-      "required": ["minute", "captured_at_utc", "application_status", "source_status", "douyin", "wechat_channels", "cpu_percent", "memory_mib", "recorded_by", "notes"],
-      "properties": {
-        "minute": { "type": "integer", "minimum": 1, "maximum": 30 },
-        "captured_at_utc": { "$ref": "#/$defs/utc" },
-        "application_status": { "type": "string", "minLength": 1 },
-        "source_status": { "type": "string", "minLength": 1 },
-        "douyin": { "$ref": "#/$defs/targetMinute" },
-        "wechat_channels": { "$ref": "#/$defs/targetMinute" },
-        "cpu_percent": { "type": "number", "minimum": 0 },
-        "memory_mib": { "type": "number", "minimum": 0 },
-        "recorded_by": { "type": "string", "minLength": 1 },
-        "notes": { "type": "string", "maxLength": 500 }
-      }
-    },
-    "recoveryProbe": {
-      "type": "object", "additionalProperties": false,
-      "required": ["captured_at_utc", "source_live", "targets"],
-      "properties": {
-        "captured_at_utc": { "$ref": "#/$defs/utc" },
-        "source_live": { "const": true },
-        "targets": { "$ref": "#/$defs/twoTargetObservation" }
-      }
-    },
-    "screenshot": {
-      "type": "object", "additionalProperties": false,
-      "required": ["step", "relative_path", "sha256", "captured_at_utc", "redacted", "reviewed_by"],
-      "properties": {
-        "step": { "type": "string", "minLength": 1 },
-        "relative_path": { "type": "string", "pattern": "^(?![A-Za-z]:|[/\\\\]|.*\\.\\.).+$" },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "captured_at_utc": { "$ref": "#/$defs/utc" },
-        "redacted": { "const": true },
-        "reviewed_by": { "type": "string", "minLength": 1 }
-      }
-    },
-    "signature": {
-      "type": "object", "additionalProperties": false,
-      "required": ["name", "signed", "signed_at_utc"],
-      "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "signed": { "const": true },
-        "signed_at_utc": { "$ref": "#/$defs/utc" }
-      }
-    }
-  }
-}
+在仓库根目录执行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\validate_platform_acceptance.py `
+  artifacts\platform-acceptance\<UTC-run-id>\result.json
 ```
+
+校验器只输出 `PLATFORM_ACCEPTED` 或脱敏字段路径错误，不回显提交值，也不读取应用数据库、
+配置、日志、官方凭据或 RTMP URL。任何缺项、额外字段、重复 JSON 键、重复/缺失分钟、必需
+布尔值为 `false`、凭据字段或 URL 内容均非零退出。pending 状态用于记录仓库/流程维度，不能
+通过该最终验收门禁。
+
+Schema 中所有通过所需布尔均使用 `const: true`，`status` 使用三值复合枚举；校验器在此基础上只允许最终状态 `PLATFORM_ACCEPTED`，并执行分钟唯一性、双目标隔离覆盖、时间顺序、中断时长和连续探测等跨字段检查。
 
 JSON Schema 不能表达全部跨字段约束。验收人还必须人工核对：分钟编号恰为 1–30 且不重复；
 UTC 时间单调递增；两项停止隔离分别覆盖两个目标；两个恢复探测间隔至少 10 秒；所有截图

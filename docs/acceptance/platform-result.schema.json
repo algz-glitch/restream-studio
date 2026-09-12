@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Restream Studio platform acceptance result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "started_at_utc",
+    "completed_at_utc",
+    "build",
+    "local_chain",
+    "credential_provenance",
+    "initial_preview",
+    "stop_isolation",
+    "minute_samples",
+    "source_interruption",
+    "screenshots",
+    "signoff",
+    "rollback",
+    "failures"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9-]+$" },
+    "status": {
+      "enum": [
+        "LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING",
+        "LOCAL_CHAIN_VERIFIED_PLATFORM_ACCEPTANCE_PENDING",
+        "PLATFORM_ACCEPTED"
+      ]
+    },
+    "started_at_utc": { "$ref": "#/$defs/utc" },
+    "completed_at_utc": { "$ref": "#/$defs/utc" },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_version",
+        "git_commit",
+        "windows_version",
+        "ffmpeg_version",
+        "mediamtx_version"
+      ],
+      "properties": {
+        "app_version": { "$ref": "#/$defs/nonEmpty" },
+        "git_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "windows_version": { "$ref": "#/$defs/nonEmpty" },
+        "ffmpeg_version": { "$ref": "#/$defs/nonEmpty" },
+        "mediamtx_version": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "local_chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified", "evidence_sha256"],
+      "properties": {
+        "verified": { "const": true },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "credential_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["douyin", "wechat_channels"],
+      "properties": {
+        "douyin": { "$ref": "#/$defs/douyinProvenance" },
+        "wechat_channels": { "$ref": "#/$defs/wechatProvenance" }
+      }
+    },
+    "initial_preview": { "$ref": "#/$defs/twoTargetObservation" },
+    "stop_isolation": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/isolation" }
+    },
+    "minute_samples": {
+      "type": "array",
+      "minItems": 30,
+      "maxItems": 30,
+      "items": { "$ref": "#/$defs/minuteSample" }
+    },
+    "source_interruption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at_utc",
+        "restored_at_utc",
+        "duration_seconds",
+        "standby",
+        "consecutive_probes",
+        "recovery_probes"
+      ],
+      "properties": {
+        "started_at_utc": { "$ref": "#/$defs/utc" },
+        "restored_at_utc": { "$ref": "#/$defs/utc" },
+        "duration_seconds": { "type": "number", "exclusiveMinimum": 60 },
+        "standby": { "$ref": "#/$defs/twoTargetObservation" },
+        "consecutive_probes": { "type": "integer", "minimum": 2 },
+        "recovery_probes": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/recoveryProbe" }
+        }
+      }
+    },
+    "screenshots": {
+      "type": "array",
+      "minItems": 7,
+      "items": { "$ref": "#/$defs/screenshot" }
+    },
+    "signoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account_holder", "acceptance_verifier"],
+      "properties": {
+        "account_holder": { "$ref": "#/$defs/signature" },
+        "acceptance_verifier": { "$ref": "#/$defs/signature" }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup_reference",
+        "old_program_reference",
+        "outputs_stopped",
+        "platform_sessions_ended",
+        "credentials_removed_or_rotated",
+        "rollback_path_verified",
+        "verified_at_utc"
+      ],
+      "properties": {
+        "backup_reference": { "$ref": "#/$defs/safeReference" },
+        "old_program_reference": { "$ref": "#/$defs/safeReference" },
+        "outputs_stopped": { "const": true },
+        "platform_sessions_ended": { "const": true },
+        "credentials_removed_or_rotated": { "const": true },
+        "rollback_path_verified": { "const": true },
+        "verified_at_utc": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "failures": { "type": "array", "maxItems": 0 }
+  },
+  "$defs": {
+    "utc": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "nonEmpty": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "safeReference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^(?![A-Za-z]:|[/\\\\]|.*\\.\\.).+$"
+    },
+    "douyinProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "official_console",
+        "obtained_by_account_holder",
+        "input_channel",
+        "persisted_outside_app"
+      ],
+      "properties": {
+        "official_console": { "const": "抖音直播伴侣" },
+        "obtained_by_account_holder": { "const": true },
+        "input_channel": { "const": "restream_studio_ui" },
+        "persisted_outside_app": { "const": false }
+      }
+    },
+    "wechatProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "official_console",
+        "obtained_by_account_holder",
+        "input_channel",
+        "persisted_outside_app"
+      ],
+      "properties": {
+        "official_console": { "const": "视频号助手" },
+        "obtained_by_account_holder": { "const": true },
+        "input_channel": { "const": "restream_studio_ui" },
+        "persisted_outside_app": { "const": false }
+      }
+    },
+    "targetObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "video_visible",
+        "audio_audible",
+        "observed_at_utc",
+        "observed_by"
+      ],
+      "properties": {
+        "status": { "$ref": "#/$defs/nonEmpty" },
+        "video_visible": { "const": true },
+        "audio_audible": { "const": true },
+        "observed_at_utc": { "$ref": "#/$defs/utc" },
+        "observed_by": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "twoTargetObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["douyin", "wechat_channels"],
+      "properties": {
+        "douyin": { "$ref": "#/$defs/targetObservation" },
+        "wechat_channels": { "$ref": "#/$defs/targetObservation" }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stopped_target",
+        "stopped_at_utc",
+        "peer_remained_live",
+        "peer_video_visible",
+        "peer_audio_audible",
+        "stopped_target_absent_in_preview",
+        "resumed_at_utc",
+        "observed_by"
+      ],
+      "properties": {
+        "stopped_target": { "enum": ["douyin", "wechat_channels"] },
+        "stopped_at_utc": { "$ref": "#/$defs/utc" },
+        "peer_remained_live": { "const": true },
+        "peer_video_visible": { "const": true },
+        "peer_audio_audible": { "const": true },
+        "stopped_target_absent_in_preview": { "const": true },
+        "resumed_at_utc": { "$ref": "#/$defs/utc" },
+        "observed_by": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "targetMinute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "bitrate_kbps",
+        "dropped_frames",
+        "reconnect_count",
+        "platform_video_visible",
+        "platform_audio_audible"
+      ],
+      "properties": {
+        "status": { "$ref": "#/$defs/nonEmpty" },
+        "bitrate_kbps": { "type": "number", "minimum": 0 },
+        "dropped_frames": { "type": "integer", "minimum": 0 },
+        "reconnect_count": { "type": "integer", "minimum": 0 },
+        "platform_video_visible": { "const": true },
+        "platform_audio_audible": { "const": true }
+      }
+    },
+    "minuteSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minute",
+        "captured_at_utc",
+        "application_status",
+        "source_status",
+        "douyin",
+        "wechat_channels",
+        "cpu_percent",
+        "memory_mib",
+        "recorded_by",
+        "notes"
+      ],
+      "properties": {
+        "minute": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "captured_at_utc": { "$ref": "#/$defs/utc" },
+        "application_status": { "$ref": "#/$defs/nonEmpty" },
+        "source_status": { "$ref": "#/$defs/nonEmpty" },
+        "douyin": { "$ref": "#/$defs/targetMinute" },
+        "wechat_channels": { "$ref": "#/$defs/targetMinute" },
+        "cpu_percent": { "type": "number", "minimum": 0 },
+        "memory_mib": { "type": "number", "minimum": 0 },
+        "recorded_by": { "$ref": "#/$defs/nonEmpty" },
+        "notes": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "recoveryProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["captured_at_utc", "source_live", "targets"],
+      "properties": {
+        "captured_at_utc": { "$ref": "#/$defs/utc" },
+        "source_live": { "const": true },
+        "targets": { "$ref": "#/$defs/twoTargetObservation" }
+      }
+    },
+    "screenshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "relative_path",
+        "sha256",
+        "captured_at_utc",
+        "redacted",
+        "reviewed_by"
+      ],
+      "properties": {
+        "step": { "$ref": "#/$defs/nonEmpty" },
+        "relative_path": { "$ref": "#/$defs/safeReference" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "captured_at_utc": { "$ref": "#/$defs/utc" },
+        "redacted": { "const": true },
+        "reviewed_by": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "signed", "signed_at_utc"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmpty" },
+        "signed": { "const": true },
+        "signed_at_utc": { "$ref": "#/$defs/utc" }
+      }
+    }
+  }
+}

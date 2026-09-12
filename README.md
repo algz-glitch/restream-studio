@@ -38,11 +38,13 @@ $env:MEDIAMTX_PATH='C:\path\to\mediamtx.exe'
 powershell -ExecutionPolicy Bypass -File scripts/e2e-local.ps1
 ```
 
-- `LOCAL_CHAIN_VERIFIED`：仅证明本机来源、双输出、隔离、待机和恢复链路通过。
-- `PLATFORM_ACCEPTANCE_PENDING`：尚未使用账号持有人的官方 RTMP 凭据完成真实平台验证。
-- `PLATFORM_ACCEPTED`：只有抖音与视频号平台预览、音视频、持续推流及断线恢复均由人工确认后才能使用。
+- `LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING`：本地完整链路或真实平台验收至少一项未完成；当前仓库保持此状态。
+- `LOCAL_CHAIN_VERIFIED_PLATFORM_ACCEPTANCE_PENDING`：本地完整链路已验证，真实双平台验收尚未全部通过。
+- `PLATFORM_ACCEPTED`：仅当 `scripts/validate_platform_acceptance.py` 对真实填写的 `result.json` 返回成功时成立。
 
-因此 `LOCAL_CHAIN` **不等于** `PLATFORM_ACCEPTANCE`，本地 HTTP `/health` 成功也不代表平台已收流。
+以上是 `result.json.status` 的完整复合枚举；本地链路维度不等于最终状态。`LOCAL_CHAIN`
+**不等于** `PLATFORM_ACCEPTANCE`，本地 HTTP `/health` 成功也不代表平台已收流。验收结构与
+执行命令见 `docs/acceptance/platform-checklist.md`；仓库不提供或提交通过结果样例。
 
 ## 待机媒体
 

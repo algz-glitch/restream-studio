@@ -243,6 +243,54 @@ def test_platform_acceptance_accepts_inclusive_time_and_minute_interval_boundari
     assert completed.stderr == ""
 
 
+def test_platform_acceptance_accepts_recovery_observations_at_probe_boundary() -> None:
+    result = _accepted_result()
+    probes = result["source_interruption"]["recovery_probes"]
+    for probe in probes:
+        for target in ("douyin", "wechat_channels"):
+            probe["targets"][target]["observed_at_utc"] = probe["captured_at_utc"]
+
+    completed = _run_validator(result)
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "PLATFORM_ACCEPTED"
+    assert completed.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_error"),
+    [
+        (
+            lambda result: result["source_interruption"]["recovery_probes"][1]["targets"]
+            ["douyin"].update(observed_at_utc="2026-09-12T00:32:04Z"),
+            "recovery_probes[1].targets.douyin.observed_at_utc",
+        ),
+        (
+            lambda result: result["screenshots"][6].update(
+                sha256=result["screenshots"][0]["sha256"]
+            ),
+            "screenshots[6].sha256",
+        ),
+        (
+            lambda result: result["minute_samples"][14].update(application_status="ERROR"),
+            "minute_samples[14].application_status",
+        ),
+    ],
+)
+def test_platform_acceptance_rejects_final_semantic_false_positives(
+    mutate: Callable[[dict[str, Any]], object],
+    expected_error: str,
+) -> None:
+    result = _accepted_result()
+    mutate(result)
+
+    completed = _run_validator(result)
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert expected_error in completed.stderr
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected_error"),
     [

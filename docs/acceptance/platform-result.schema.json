@@ -102,6 +102,7 @@
         "recovery_probes": {
           "type": "array",
           "minItems": 2,
+          "$comment": "Each target observed_at_utc is cross-validated at or after restored_at_utc and its enclosing probe captured_at_utc.",
           "items": { "$ref": "#/$defs/recoveryProbe" }
         }
       }
@@ -110,6 +111,7 @@
       "type": "array",
       "minItems": 7,
       "maxItems": 7,
+      "$comment": "The validator requires exactly one item per required step and unique relative_path and sha256 values.",
       "items": { "$ref": "#/$defs/screenshot" }
     },
     "signoff": {
@@ -276,7 +278,7 @@
       "properties": {
         "minute": { "type": "integer", "minimum": 1, "maximum": 30 },
         "captured_at_utc": { "$ref": "#/$defs/utc" },
-        "application_status": { "$ref": "#/$defs/nonEmpty" },
+        "application_status": { "const": "RUNNING" },
         "source_status": { "const": "LIVE" },
         "douyin": { "$ref": "#/$defs/targetMinute" },
         "wechat_channels": { "$ref": "#/$defs/targetMinute" },

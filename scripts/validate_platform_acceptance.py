@@ -260,6 +260,16 @@ def _cross_validate(result: dict[str, Any]) -> None:
                     f".targets.{target}.status",
                     "must equal LIVE",
                 )
+            observed_path = (
+                f"result.source_interruption.recovery_probes[{probe_index}]"
+                f".targets.{target}.observed_at_utc"
+            )
+            observed_at = _parse_utc(probe["targets"][target]["observed_at_utc"], observed_path)
+            if observed_at < interruption_end or observed_at < probe_times[probe_index]:
+                _reject(
+                    observed_path,
+                    "must be at or after source restoration and its successful probe",
+                )
 
     screenshot_steps = [item["step"] for item in result["screenshots"]]
     if sorted(screenshot_steps) != sorted(SCREENSHOT_STEPS):
@@ -270,6 +280,10 @@ def _cross_validate(result: dict[str, Any]) -> None:
     for index, path in enumerate(screenshot_paths):
         if screenshot_paths.index(path) != index:
             _reject(f"result.screenshots[{index}].relative_path", "must be unique")
+    screenshot_hashes = [item["sha256"] for item in result["screenshots"]]
+    for index, sha256 in enumerate(screenshot_hashes):
+        if screenshot_hashes.index(sha256) != index:
+            _reject(f"result.screenshots[{index}].sha256", "must be unique")
 
     started = _parse_utc(result["started_at_utc"], "result.started_at_utc")
     completed = _parse_utc(result["completed_at_utc"], "result.completed_at_utc")

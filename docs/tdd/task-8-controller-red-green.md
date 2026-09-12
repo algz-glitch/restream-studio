@@ -145,3 +145,42 @@ Focused GREEN result after this review:
 
 Final review verification also passed Ruff, strict mypy over 30 source files, and the synchronous
 regression slice with `156 passed, 1 deselected in 0.21s`.
+
+## P1 quality review closure
+
+The quality-review tests were added before implementation. The first focused RED run reported:
+
+```text
+9 failed, 16 passed in 0.36s
+```
+
+This captured stale-poll publication after stop, output-health recovery omissions, raw room-query
+leaks, generic resolver/probe exception propagation, and failure to await a completed controller
+task. Two narrower RED cycles then demonstrated that a stop racing the asynchronous state-store
+load could restore `desired_running=True`, and that an exception from the recovery sleeper could
+terminate `_run`.
+
+GREEN behavior now includes:
+
+- a controller lifecycle generation captured by each poll and checked after resolver, probe,
+  failure sleep, output switch, and before every source-state publication; stop invalidates both
+  resolver-waiting and state-store-waiting polls;
+- output decisions combine controller input mode with live supervisor state. `RECONNECTING` is
+  left to its supervisor, `AUTH_FAILED` remains terminal, and only an `ERROR`/`STOPPED` target with
+  a different source-URL fingerprint is restarted; healthy peers remain untouched;
+- `ConfiguredSource` canonicalizes through `normalize_douyin_url`. Only canonical scheme/host/path
+  room identity enters snapshots, persistence, and repr. The query-bearing resolver URL is
+  immutable, ephemeral, and `repr=False`; task names use a safe room segment plus SHA-256 prefix;
+- unexpected resolver, probe, run-loop, and recovery-wait exceptions become bounded, redacted,
+  URL-free diagnostics and `ERROR` state while monitoring continues. Probe exceptions retain the
+  `PROBE` category. Controller tasks have a done callback that retrieves exceptions, and stop
+  awaits completed as well as running tasks before publishing consistent `STOPPED` state.
+
+Final verification:
+
+```text
+27 focused Task 8 tests passed in 0.06s
+Ruff: All checks passed
+mypy: Success, no issues found in 30 source files
+165 synchronous regression tests passed, 1 deselected, in 0.22s
+```

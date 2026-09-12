@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Final, Protocol
+from urllib.parse import urlsplit
 
 from restream_studio.domain import (
     DestinationKind,
@@ -17,15 +19,18 @@ from restream_studio.domain import (
     ResolvedStream,
     SourceState,
 )
+from restream_studio.security import redact
 from restream_studio.source import (
     LiveSourceResolver,
     ResolverNetworkError,
     ResolverProtocolError,
     ResolverRateLimited,
+    normalize_douyin_url,
 )
 
 _SOURCE_BACKOFF: Final = (2.0, 5.0, 10.0, 20.0, 30.0)
 _SAFE_IDENTIFIER: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_URL_IN_TEXT: Final = re.compile(r"(?i)\b(?:https?|rtmps?)://\S+")
 
 
 class Clock(Protocol):
@@ -70,10 +75,13 @@ class ControllerStateStore(Protocol):
 class ConfiguredSource:
     room_identity: str
     preferred_quality: str | None = None
+    resolver_url: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not self.room_identity or any(ord(character) < 32 for character in self.room_identity):
-            raise ValueError("room identity is malformed")
+        resolver_url = self.room_identity.strip()
+        canonical = normalize_douyin_url(resolver_url)
+        object.__setattr__(self, "room_identity", canonical)
+        object.__setattr__(self, "resolver_url", resolver_url)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +116,9 @@ class PersistedControllerState:
     desired_running: bool
     enabled_destinations: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "room_identity", normalize_douyin_url(self.room_identity))
+
 
 class SourceFailure(StrEnum):
     OFFLINE = "OFFLINE"
@@ -116,6 +127,7 @@ class SourceFailure(StrEnum):
     PROTOCOL = "PROTOCOL"
     PROBE = "PROBE"
     EXPIRED = "EXPIRED"
+    UNEXPECTED = "UNEXPECTED"
 
 
 class OutputInput(StrEnum):
@@ -146,6 +158,7 @@ class ControllerSnapshot:
     desired_running: bool
     source_state: SourceState
     source_failure: SourceFailure | None
+    error_detail: str | None
     recovery_successes: int
     outputs: tuple[ControllerOutputSnapshot, ...]
 
@@ -213,6 +226,7 @@ class Controller:
         self._monitor_interval = monitor_interval
         self._state = SourceState.STOPPED
         self._source_failure: SourceFailure | None = None
+        self._source_error_detail: str | None = None
         self._desired_running = False
         self._enabled = {item.identity: item.enabled for item in self._destinations}
         self._inputs = {item.identity: OutputInput.NONE for item in self._destinations}
@@ -220,6 +234,9 @@ class Controller:
             item.identity: None for item in self._destinations
         }
         self._output_generations = {item.identity: 0 for item in self._destinations}
+        self._output_source_fingerprints: dict[str, str | None] = {
+            item.identity: None for item in self._destinations
+        }
         self._first_failure_at: float | None = None
         self._failure_count = 0
         self._recovery_successes = 0
@@ -230,6 +247,7 @@ class Controller:
         self._cycle_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
+        self._lifecycle_generation = 0
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -240,12 +258,16 @@ class Controller:
             async with self._state_lock:
                 if self._initialized:
                     return
+                generation = self._lifecycle_generation
             restored = (
                 await self._state_store.load(self._source.room_identity)
                 if self._state_store is not None
                 else None
             )
             async with self._state_lock:
+                if generation != self._lifecycle_generation:
+                    self._initialized = True
+                    return
                 if restored is not None and restored.room_identity == self._source.room_identity:
                     enabled = set(restored.enabled_destinations)
                     self._enabled = {identity: identity in enabled for identity in self._enabled}
@@ -254,6 +276,7 @@ class Controller:
                     self._desired_running = True
                 self._state = SourceState.MONITORING
                 self._source_failure = None
+                self._source_error_detail = None
                 self._clear_resolved_recovery_state()
                 self._initialized = True
 
@@ -264,30 +287,40 @@ class Controller:
                 return
             async with self._state_lock:
                 self._desired_running = True
+                self._lifecycle_generation += 1
                 if self._state is SourceState.STOPPED:
                     self._state = SourceState.MONITORING
             await self._persist()
             self._task = asyncio.create_task(
                 self._run(), name=f"source-controller-{self._safe_task_name()}"
             )
+            self._task.add_done_callback(self._retrieve_task_exception)
 
     async def stop(self) -> None:
         async with self._lifecycle_lock:
             task = self._task
+            task_error_detail: str | None = None
             async with self._state_lock:
                 self._desired_running = False
-            if task is not None and task is not asyncio.current_task() and not task.done():
-                task.cancel()
+                self._lifecycle_generation += 1
+            if task is not None and task is not asyncio.current_task():
+                if not task.done():
+                    task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     caller = asyncio.current_task()
                     if caller is not None and caller.cancelling():
                         raise
+                except Exception as error:  # noqa: BLE001 - retrieve finished task failures
+                    task_error_detail = self._safe_error(error)
             await self._stop_outputs()
             async with self._state_lock:
                 self._state = SourceState.STOPPED
-                self._source_failure = None
+                self._source_failure = (
+                    SourceFailure.UNEXPECTED if task_error_detail is not None else None
+                )
+                self._source_error_detail = task_error_detail
                 self._clear_resolved_recovery_state()
                 for identity in self._inputs:
                     self._inputs[identity] = OutputInput.NONE
@@ -300,45 +333,57 @@ class Controller:
     async def poll_once(self) -> None:
         await self.initialize()
         async with self._cycle_lock:
+            generation = await self._active_generation()
+            if generation is None:
+                return
             try:
                 resolved = await self._resolver.resolve(
-                    self._source.room_identity, self._source.preferred_quality
+                    self._source.resolver_url, self._source.preferred_quality
                 )
             except asyncio.CancelledError:
                 raise
             except ResolverRateLimited as error:
+                if not await self._poll_is_current(generation):
+                    return
                 delay = (
                     float(error.retry_after_seconds)
                     if error.retry_after_seconds is not None and error.retry_after_seconds > 0
                     else self._next_backoff()
                 )
-                await self._record_failure(SourceFailure.RATE_LIMITED)
-                await self._sleep_after_failure(delay)
+                if await self._record_failure(SourceFailure.RATE_LIMITED, generation):
+                    await self._sleep_after_failure(delay, generation)
                 return
             except ResolverNetworkError:
-                await self._fail_and_wait(SourceFailure.NETWORK)
+                await self._fail_and_wait(SourceFailure.NETWORK, generation)
                 return
             except ResolverProtocolError:
-                await self._fail_and_wait(SourceFailure.PROTOCOL)
+                await self._fail_and_wait(SourceFailure.PROTOCOL, generation)
+                return
+            except Exception as error:  # noqa: BLE001 - unexpected adapters remain monitored
+                await self._unexpected_and_wait(error, generation)
                 return
 
+            if not await self._poll_is_current(generation):
+                return
             if not resolved.is_live:
-                await self._fail_and_wait(SourceFailure.OFFLINE)
+                await self._fail_and_wait(SourceFailure.OFFLINE, generation)
                 return
             if not self._url_is_fresh(resolved):
-                await self._fail_and_wait(SourceFailure.EXPIRED)
+                await self._fail_and_wait(SourceFailure.EXPIRED, generation)
                 return
             try:
                 probe = await self._media_probe.probe(resolved.url)
             except asyncio.CancelledError:
                 raise
-            except RuntimeError:
-                await self._fail_and_wait(SourceFailure.PROBE)
+            except Exception as error:  # noqa: BLE001 - probe adapters may use custom exceptions
+                await self._unexpected_and_wait(error, generation, SourceFailure.PROBE)
+                return
+            if not await self._poll_is_current(generation):
                 return
             if not self._url_is_fresh(resolved):
-                await self._fail_and_wait(SourceFailure.EXPIRED)
+                await self._fail_and_wait(SourceFailure.EXPIRED, generation)
                 return
-            await self._record_success(resolved, probe)
+            await self._record_success(resolved, probe, generation)
 
     async def snapshot(self) -> ControllerSnapshot:
         async with self._state_lock:
@@ -347,6 +392,7 @@ class Controller:
                 desired_running=self._desired_running,
                 source_state=self._state,
                 source_failure=self._source_failure,
+                error_detail=self._source_error_detail,
                 recovery_successes=self._recovery_successes,
                 outputs=tuple(
                     ControllerOutputSnapshot(
@@ -374,6 +420,7 @@ class Controller:
             self._output_generations[identity] += 1
             if not enabled:
                 self._inputs[identity] = OutputInput.NONE
+                self._output_source_fingerprints[identity] = None
         if not enabled:
             await self._stop_destination(selected)
         await self._persist()
@@ -384,21 +431,68 @@ class Controller:
                 async with self._state_lock:
                     if not self._desired_running:
                         return
-                await self.poll_once()
+                    generation = self._lifecycle_generation
+                try:
+                    await self.poll_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - controller must remain monitoring
+                    try:
+                        if await self._record_unexpected(error, generation):
+                            await self._sleep_after_failure(self._next_backoff(), generation)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as recovery_error:  # noqa: BLE001
+                        await self._record_safe_error_only(recovery_error, generation)
         finally:
             await self._stop_outputs()
 
-    async def _fail_and_wait(self, failure: SourceFailure) -> None:
-        await self._record_failure(failure)
-        await self._sleep_after_failure(self._next_backoff())
+    async def _fail_and_wait(self, failure: SourceFailure, generation: int) -> None:
+        if await self._record_failure(failure, generation):
+            await self._sleep_after_failure(self._next_backoff(), generation)
 
-    async def _sleep_after_failure(self, requested_delay: float) -> None:
+    async def _unexpected_and_wait(
+        self,
+        error: Exception,
+        generation: int,
+        failure: SourceFailure = SourceFailure.UNEXPECTED,
+    ) -> None:
+        if await self._record_unexpected(error, generation, failure):
+            await self._sleep_after_failure(self._next_backoff(), generation)
+
+    async def _record_unexpected(
+        self,
+        error: Exception,
+        generation: int,
+        failure: SourceFailure = SourceFailure.UNEXPECTED,
+    ) -> bool:
+        if not await self._record_failure(failure, generation):
+            return False
         async with self._state_lock:
+            if not self._is_current_unlocked(generation):
+                return False
+            if self._state is not SourceState.STANDBY:
+                self._state = SourceState.ERROR
+            self._source_error_detail = self._safe_error(error)
+            return True
+
+    async def _record_safe_error_only(self, error: Exception, generation: int) -> None:
+        async with self._state_lock:
+            if self._is_current_unlocked(generation):
+                self._state = SourceState.ERROR
+                self._source_failure = SourceFailure.UNEXPECTED
+                self._source_error_detail = self._safe_error(error)
+
+    async def _sleep_after_failure(self, requested_delay: float, generation: int) -> None:
+        async with self._state_lock:
+            if not self._is_current_unlocked(generation):
+                return
             delay = requested_delay
             if (
-                self._state is SourceState.RECONNECTING
+                self._state in {SourceState.RECONNECTING, SourceState.ERROR}
                 and self._standby is not None
                 and self._first_failure_at is not None
+                and any(value is OutputInput.LIVE for value in self._inputs.values())
             ):
                 remaining = max(
                     0.0,
@@ -406,32 +500,41 @@ class Controller:
                 )
                 delay = min(delay, remaining)
         await self._sleeper.sleep(delay)
-        await self._enter_standby_if_due()
+        if await self._poll_is_current(generation):
+            await self._enter_standby_if_due(generation)
 
-    async def _enter_standby_if_due(self) -> None:
+    async def _enter_standby_if_due(self, generation: int) -> None:
         async with self._state_lock:
             due = (
-                self._state is SourceState.RECONNECTING
+                self._is_current_unlocked(generation)
+                and self._state in {SourceState.RECONNECTING, SourceState.ERROR}
                 and self._standby is not None
                 and self._first_failure_at is not None
+                and any(value is OutputInput.LIVE for value in self._inputs.values())
                 and self._clock.monotonic() - self._first_failure_at >= self._standby_after
             )
         if not due:
             return
         await self._switch_outputs(OutputInput.STANDBY, resolved=None, probe=None)
         async with self._state_lock:
-            if self._state is SourceState.RECONNECTING:
+            if self._is_current_unlocked(generation) and self._state in {
+                SourceState.RECONNECTING,
+                SourceState.ERROR,
+            }:
                 self._state = SourceState.STANDBY
 
-    async def _record_failure(self, failure: SourceFailure) -> None:
+    async def _record_failure(self, failure: SourceFailure, generation: int) -> bool:
         should_enter_standby = False
         should_retry_standby = False
         async with self._state_lock:
+            if not self._is_current_unlocked(generation):
+                return False
             now = self._clock.monotonic()
             if self._first_failure_at is None:
                 self._first_failure_at = now
             self._failure_count += 1
             self._source_failure = failure
+            self._source_error_detail = None
             self._recovery_successes = 0
             self._last_recovery_success_at = None
             if self._state is SourceState.STANDBY:
@@ -450,10 +553,16 @@ class Controller:
         if should_enter_standby or should_retry_standby:
             await self._switch_outputs(OutputInput.STANDBY, resolved=None, probe=None)
             async with self._state_lock:
-                self._state = SourceState.STANDBY
+                if self._is_current_unlocked(generation):
+                    self._state = SourceState.STANDBY
+        return await self._poll_is_current(generation)
 
-    async def _record_success(self, resolved: ResolvedStream, probe: MediaProbe) -> None:
+    async def _record_success(
+        self, resolved: ResolvedStream, probe: MediaProbe, generation: int
+    ) -> None:
         async with self._state_lock:
+            if not self._is_current_unlocked(generation):
+                return
             in_standby = self._state is SourceState.STANDBY
             now = self._clock.monotonic()
             if in_standby:
@@ -466,16 +575,15 @@ class Controller:
                 recovered = self._recovery_successes >= 2
             else:
                 recovered = True
-            all_live = all(
-                not self._enabled[identity] or value is OutputInput.LIVE
-                for identity, value in self._inputs.items()
-            )
             self._source_failure = None
+            self._source_error_detail = None
             self._first_failure_at = None
             self._failure_count = 0
-        if recovered and (in_standby or not all_live):
+        if recovered:
             await self._switch_outputs(OutputInput.LIVE, resolved=resolved, probe=probe)
         async with self._state_lock:
+            if not self._is_current_unlocked(generation):
+                return
             if recovered:
                 self._state = SourceState.LIVE
                 self._recovery_successes = 0
@@ -491,11 +599,14 @@ class Controller:
         resolved: ResolvedStream | None,
         probe: MediaProbe | None,
     ) -> None:
+        source_fingerprint = (
+            self._source_fingerprint(resolved.url) if resolved is not None else None
+        )
         async with self._state_lock:
             planned = tuple(
                 (item, self._output_generations[item.identity])
                 for item in self._destinations
-                if self._enabled[item.identity] and self._inputs[item.identity] is not target
+                if self._should_switch_unlocked(item, target, source_fingerprint)
             )
         prepared: list[tuple[ConfiguredDestination, int, object]] = []
         for item, generation in planned:
@@ -517,7 +628,7 @@ class Controller:
                 current = (
                     self._enabled[item.identity]
                     and self._output_generations[item.identity] == generation
-                    and self._inputs[item.identity] is not target
+                    and self._should_switch_unlocked(item, target, source_fingerprint)
                 )
             if not current:
                 continue
@@ -534,6 +645,9 @@ class Controller:
                 if current:
                     self._inputs[item.identity] = target
                     self._output_errors[item.identity] = None
+                    self._output_source_fingerprints[item.identity] = (
+                        source_fingerprint if target is OutputInput.LIVE else None
+                    )
             if not current:
                 await self._stop_destination(item)
 
@@ -542,6 +656,7 @@ class Controller:
             for item in self._destinations:
                 self._output_generations[item.identity] += 1
                 self._inputs[item.identity] = OutputInput.NONE
+                self._output_source_fingerprints[item.identity] = None
         cancellation: asyncio.CancelledError | None = None
         for item in self._destinations:
             try:
@@ -566,6 +681,24 @@ class Controller:
         async with self._state_lock:
             self._output_errors[identity] = error
 
+    def _should_switch_unlocked(
+        self,
+        item: ConfiguredDestination,
+        target: OutputInput,
+        source_fingerprint: str | None,
+    ) -> bool:
+        identity = item.identity
+        if not self._enabled[identity] or item.supervisor.state is OutputState.AUTH_FAILED:
+            return False
+        if target is OutputInput.STANDBY:
+            return self._inputs[identity] is not OutputInput.STANDBY
+        if self._inputs[identity] is not OutputInput.LIVE:
+            return True
+        return (
+            item.supervisor.state in {OutputState.ERROR, OutputState.STOPPED}
+            and self._output_source_fingerprints[identity] != source_fingerprint
+        )
+
     async def _persist(self) -> None:
         if self._state_store is None:
             return
@@ -578,6 +711,17 @@ class Controller:
                 ),
             )
         await self._state_store.save(state)
+
+    async def _active_generation(self) -> int | None:
+        async with self._state_lock:
+            return self._lifecycle_generation if self._desired_running else None
+
+    async def _poll_is_current(self, generation: int) -> bool:
+        async with self._state_lock:
+            return self._is_current_unlocked(generation)
+
+    def _is_current_unlocked(self, generation: int) -> bool:
+        return self._desired_running and self._lifecycle_generation == generation
 
     def _url_is_fresh(self, resolved: ResolvedStream) -> bool:
         if resolved.expires_at is None:
@@ -603,7 +747,33 @@ class Controller:
         raise KeyError(identity)
 
     def _safe_task_name(self) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]", "_", self._source.room_identity)[:64]
+        segment = urlsplit(self._source.room_identity).path.strip("/").split("/")[-1]
+        safe_segment = re.sub(r"[^A-Za-z0-9_.-]", "_", segment)[:24] or "source"
+        digest = hashlib.sha256(self._source.room_identity.encode()).hexdigest()[:12]
+        return f"room-{safe_segment}-{digest}"
+
+    @staticmethod
+    def _source_fingerprint(url: str) -> str:
+        return hashlib.sha256(url.encode()).hexdigest()
+
+    @staticmethod
+    def _safe_error(error: Exception) -> str:
+        try:
+            redacted = str(redact(str(error)))
+            without_urls = _URL_IN_TEXT.sub("<url>", redacted)
+            bounded = "".join(character for character in without_urls if character.isprintable())[
+                :160
+            ]
+        except Exception:  # noqa: BLE001 - exception formatting must never kill monitoring
+            return error.__class__.__name__
+        return bounded or error.__class__.__name__
+
+    @staticmethod
+    def _retrieve_task_exception(task: asyncio.Task[None]) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
 
     def __repr__(self) -> str:
         return (

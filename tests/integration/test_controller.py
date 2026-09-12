@@ -25,7 +25,12 @@ from restream_studio.orchestration.controller import (
     PersistedControllerState,
     StandbyMedia,
 )
-from restream_studio.source import ResolverNetworkError, ResolverRateLimited
+from restream_studio.source import (
+    LiveSourceResolver,
+    ResolverNetworkError,
+    ResolverRateLimited,
+    normalize_douyin_url,
+)
 
 
 def drive[T](coroutine: Coroutine[Any, Any, T]) -> T:
@@ -156,6 +161,8 @@ class FakeStore:
 
 
 PROBE = MediaProbe("h264", "aac", 1920, 1080, 30.0)
+RAW_ROOM_URL = "https://LIVE.DOUYIN.COM/room-42?token=room-secret&from=copy"
+CANONICAL_ROOM = normalize_douyin_url(RAW_ROOM_URL)
 
 
 def stream(clock: FakeClock, token: str, *, live: bool = True, ttl: float = 300) -> ResolvedStream:
@@ -169,7 +176,7 @@ def stream(clock: FakeClock, token: str, *, live: bool = True, ttl: float = 300)
 
 
 def make_controller(
-    resolver: FakeResolver,
+    resolver: LiveSourceResolver,
     *,
     probe: FakeProbe | None = None,
     clock: FakeClock | None = None,
@@ -180,7 +187,7 @@ def make_controller(
     douyin = FakeSupervisor("primary", DestinationKind.DOUYIN)
     wechat = FakeSupervisor("secondary", DestinationKind.WECHAT)
     controller = Controller(
-        source=ConfiguredSource("room-42", preferred_quality="origin"),
+        source=ConfiguredSource(RAW_ROOM_URL, preferred_quality="origin"),
         resolver=resolver,
         media_probe=probe or FakeProbe(),
         destinations=(
@@ -264,6 +271,36 @@ def test_one_output_reconnecting_does_not_restart_or_stop_live_peer() -> None:
     assert second.stop_count == 0
 
 
+def test_failed_output_restarts_only_on_new_source_and_auth_failure_stays_terminal() -> None:
+    clock = FakeClock()
+    controller, _, _, first, second = make_controller(
+        FakeResolver(
+            [
+                stream(clock, "one"),
+                stream(clock, "one"),
+                stream(clock, "two"),
+                stream(clock, "three"),
+            ]
+        ),
+        clock=clock,
+    )
+    drive(controller.poll_once())
+    first.state = OutputState.ERROR
+
+    drive(controller.poll_once())
+    assert len(first.restarted) == 1
+    assert len(second.restarted) == 1
+
+    drive(controller.poll_once())
+    assert len(first.restarted) == 2
+    assert len(second.restarted) == 1
+
+    first.state = OutputState.AUTH_FAILED
+    drive(controller.poll_once())
+    assert len(first.restarted) == 2
+    assert len(second.restarted) == 1
+
+
 def test_source_loss_re_resolves_and_hits_standby_deadline_exactly() -> None:
     clock = FakeClock()
     failures = [ResolverNetworkError("gone") for _ in range(5)]
@@ -276,7 +313,7 @@ def test_source_loss_re_resolves_and_hits_standby_deadline_exactly() -> None:
 
     assert sleeper.delays == [3.0, 2.0, 5.0, 10.0, 20.0, 23.0]
     assert len(resolver.calls) == 6
-    assert all(call == ("room-42", "origin") for call in resolver.calls)
+    assert all(call == (RAW_ROOM_URL, "origin") for call in resolver.calls)
     assert clock.elapsed == 63.0
     assert drive(controller.snapshot()).source_state is SourceState.STANDBY
 
@@ -411,12 +448,15 @@ def test_snapshot_is_immutable_and_safe_to_repr() -> None:
         snapshot.source_state = SourceState.ERROR  # type: ignore[misc]
     rendered = repr(snapshot)
     assert secret not in rendered
-    assert "rtmp://" not in rendered and "https://" not in rendered
+    assert "?" not in snapshot.room_identity
+    assert "rtmp://" not in rendered
 
 
 def test_restart_loads_only_desired_state_then_resolves_room_identity() -> None:
     persisted = PersistedControllerState(
-        room_identity="room-42", desired_running=True, enabled_destinations=("secondary",)
+        room_identity=CANONICAL_ROOM,
+        desired_running=True,
+        enabled_destinations=("secondary",),
     )
     store = FakeStore(persisted)
     clock = FakeClock()
@@ -428,10 +468,92 @@ def test_restart_loads_only_desired_state_then_resolves_room_identity() -> None:
     drive(controller.poll_once())
 
     assert before.source_state is SourceState.MONITORING
-    assert store.load_calls == ["room-42"]
-    assert resolver.calls == [("room-42", "origin")]
+    assert store.load_calls == [CANONICAL_ROOM]
+    assert resolver.calls == [(RAW_ROOM_URL, "origin")]
     assert not first.restarted and second.restarted[-1].label == "live"
     assert all(not hasattr(saved, "url") for saved in store.saved)
+
+
+def test_room_identity_is_canonical_and_ephemeral_resolver_url_never_leaks() -> None:
+    source = ConfiguredSource(RAW_ROOM_URL, preferred_quality="origin")
+    controller, _, _, _, _ = make_controller(FakeResolver([]))
+    snapshot = drive(controller.snapshot())
+    persisted = PersistedControllerState(CANONICAL_ROOM, True, ("primary",))
+    rendered = " ".join(
+        (
+            repr(source),
+            repr(controller),
+            repr(snapshot),
+            repr(persisted),
+            controller._safe_task_name(),
+        )
+    )
+
+    assert source.room_identity == CANONICAL_ROOM
+    assert source.resolver_url == RAW_ROOM_URL
+    assert snapshot.room_identity == CANONICAL_ROOM
+    assert "room-secret" not in rendered
+    assert "?" not in rendered
+    assert controller._safe_task_name().startswith("room-")
+
+
+def test_stop_invalidates_poll_waiting_for_resolver_before_it_can_publish_live() -> None:
+    class PauseOnce:
+        def __await__(self) -> Any:
+            yield "resolver-paused"
+
+    class PausingResolver:
+        async def resolve(
+            self, room_identity: str, preferred_quality: str | None
+        ) -> ResolvedStream:
+            await PauseOnce()
+            return stream(clock, "stale")
+
+    clock = FakeClock()
+    probe = FakeProbe()
+    controller, _, _, first, second = make_controller(
+        PausingResolver(),
+        probe=probe,
+        clock=clock,
+    )
+    polling = controller.poll_once()
+    assert polling.send(None) == "resolver-paused"
+
+    drive(controller.stop())
+    drive(polling)
+
+    snapshot = drive(controller.snapshot())
+    assert snapshot.desired_running is False
+    assert snapshot.source_state is SourceState.STOPPED
+    assert probe.urls == []
+    assert not first.restarted and not second.restarted
+
+
+def test_stop_invalidates_poll_waiting_for_persisted_state_load() -> None:
+    class PauseOnce:
+        def __await__(self) -> Any:
+            yield "store-paused"
+
+    class PausingStore(FakeStore):
+        async def load(self, room_identity: str) -> PersistedControllerState | None:
+            self.load_calls.append(room_identity)
+            await PauseOnce()
+            return self.loaded
+
+    store = PausingStore(PersistedControllerState(CANONICAL_ROOM, True, ("primary", "secondary")))
+    resolver = FakeResolver([])
+    controller, _, _, first, second = make_controller(resolver, store=store)
+    polling = controller.poll_once()
+    assert polling.send(None) == "store-paused"
+
+    drive(controller.stop())
+    drive(polling)
+
+    snapshot = drive(controller.snapshot())
+    assert snapshot.desired_running is False
+    assert snapshot.source_state is SourceState.STOPPED
+    assert resolver.calls == []
+    assert first.stop_count == second.stop_count == 1
 
 
 def test_disable_during_inflight_restart_cannot_publish_or_leave_output_live() -> None:
@@ -451,7 +573,7 @@ def test_disable_during_inflight_restart_cannot_publish_or_leave_output_live() -
     first = PausingSupervisor("primary", DestinationKind.DOUYIN)
     second = FakeSupervisor("secondary", DestinationKind.WECHAT)
     controller = Controller(
-        source=ConfiguredSource("room-42"),
+        source=ConfiguredSource(RAW_ROOM_URL),
         resolver=FakeResolver([stream(clock, "fresh")]),
         media_probe=FakeProbe(),
         destinations=(
@@ -495,6 +617,119 @@ def test_cleanup_finishes_later_destinations_then_propagates_cancelled_error() -
         drive(controller.stop())
 
     assert second.stop_count == 1
+
+
+@pytest.mark.parametrize("failure", [ValueError("probe exploded"), Exception("probe broke")])
+def test_unexpected_probe_exception_becomes_safe_error_and_monitoring_continues(
+    failure: Exception,
+) -> None:
+    clock = FakeClock()
+    secret_url = "https://media.example/live.flv?token=probe-secret"
+    controller, _, sleeper, first, second = make_controller(
+        FakeResolver([stream(clock, "source")]),
+        probe=FakeProbe([type(failure)(f"failed {secret_url}")]),
+        clock=clock,
+    )
+
+    drive(controller.poll_once())
+
+    snapshot = drive(controller.snapshot())
+    assert snapshot.source_state is SourceState.ERROR
+    assert snapshot.source_failure is not None
+    assert snapshot.error_detail is not None
+    assert "https://" not in snapshot.error_detail and "probe-secret" not in repr(snapshot)
+    assert sleeper.delays == [2.0]
+    assert not first.restarted and not second.restarted
+
+
+def test_unexpected_resolver_and_run_exceptions_are_safe_and_do_not_kill_monitoring() -> None:
+    secret_url = "https://live.douyin.com/room-42?token=resolver-secret"
+    controller, _, sleeper, first, second = make_controller(
+        FakeResolver([Exception(f"resolver failed {secret_url}")])
+    )
+
+    drive(controller.poll_once())
+    first_snapshot = drive(controller.snapshot())
+    assert first_snapshot.source_state is SourceState.ERROR
+    assert first_snapshot.error_detail is not None
+    assert "https://" not in first_snapshot.error_detail
+    assert "resolver-secret" not in repr(first_snapshot)
+
+    attempts = 0
+
+    async def fail_once_then_finish() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LookupError(f"run failed {secret_url}")
+        controller._desired_running = False
+
+    controller.poll_once = fail_once_then_finish  # type: ignore[method-assign]
+    drive(controller._run())
+
+    assert attempts == 2
+    assert sleeper.delays == [2.0, 5.0]
+    assert first.stop_count == second.stop_count == 1
+
+
+def test_run_keeps_monitoring_when_error_backoff_itself_raises_once() -> None:
+    class FlakySleeper(FakeSleeper):
+        async def sleep(self, delay: float) -> None:
+            self.delays.append(delay)
+            if len(self.delays) == 1:
+                raise OSError("sleep failed https://example.invalid/?token=sleep-secret")
+            self.clock.advance(delay)
+
+    controller, clock, _, first, second = make_controller(FakeResolver([]))
+    sleeper = FlakySleeper(clock)
+    controller._sleeper = sleeper
+    drive(controller.initialize())
+    attempts = 0
+
+    async def fail_once_then_finish() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LookupError("poll failed")
+        controller._desired_running = False
+
+    controller.poll_once = fail_once_then_finish  # type: ignore[method-assign]
+
+    drive(controller._run())
+
+    assert attempts == 2
+    assert sleeper.delays == [2.0]
+    assert first.stop_count == second.stop_count == 1
+
+
+def test_stop_awaits_done_task_and_retrieves_its_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DoneTask:
+        retrieved = False
+
+        def done(self) -> bool:
+            return True
+
+        def cancel(self) -> bool:
+            raise AssertionError("done task must not be cancelled")
+
+        def __await__(self) -> Any:
+            self.retrieved = True
+            raise RuntimeError("done task failed with https://example.invalid/?token=secret")
+            yield
+
+    task = DoneTask()
+    controller, _, _, _, _ = make_controller(FakeResolver([]))
+    controller._task = task  # type: ignore[assignment]
+    monkeypatch.setattr(asyncio, "current_task", lambda: None)
+
+    drive(controller.stop())
+
+    snapshot = drive(controller.snapshot())
+    assert task.retrieved is True
+    assert snapshot.desired_running is False
+    assert snapshot.source_state is SourceState.STOPPED
 
 
 def test_standby_rejects_network_urls_and_path_traversal() -> None:

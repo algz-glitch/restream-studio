@@ -300,10 +300,15 @@ function Test-FrontendHomepage {
 function Stop-ExactProcess {
     param([Diagnostics.Process]$Process)
     if ($null -eq $Process) { return }
-    $Process.Refresh()
-    if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
-    if (-not $Process.WaitForExit(10000)) {
-        throw "process $($Process.Id) did not exit"
+    try {
+        $Process.Refresh()
+        if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
+        if (-not $Process.WaitForExit(10000)) {
+            throw "process $($Process.Id) did not exit"
+        }
+    }
+    finally {
+        $Process.Dispose()
     }
 }
 
@@ -354,10 +359,14 @@ finally {
     try {
         try {
             Stop-ExactProcess -Process $frontend
-            Stop-ExactProcess -Process $backend
         }
         finally {
-            if ($null -ne $ProcessJob) { $ProcessJob.Dispose() }
+            try {
+                Stop-ExactProcess -Process $backend
+            }
+            finally {
+                if ($null -ne $ProcessJob) { $ProcessJob.Dispose() }
+            }
         }
     }
     finally {

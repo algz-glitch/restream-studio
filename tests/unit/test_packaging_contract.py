@@ -99,6 +99,23 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
     assert "exit 1" in script
 
 
+def test_package_smoke_disposes_process_once_after_stop_wait_and_port_release() -> None:
+    script = _read("scripts/verify.ps1")
+    start = script.index("function Test-PackageHealth {")
+    end = script.index("\n\nif (-not (Test-Path", start)
+    package_health = script[start:end]
+
+    cleanup = package_health.index("finally {")
+    stop = package_health.index("Stop-Process -Id $process.Id -Force", cleanup)
+    wait = package_health.index("$process.WaitForExit(10000)", stop)
+    port_release = package_health.index("Wait-LocalPortReleased -Port $port", wait)
+    dispose_finally = package_health.index("finally {", port_release)
+    dispose = package_health.index("$process.Dispose()", dispose_finally)
+
+    assert cleanup < stop < wait < port_release < dispose_finally < dispose
+    assert package_health.count("$process.Dispose()") == 1
+
+
 def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
     script = _read("scripts/dev.ps1")
     root_vite = "node_modules\\vite\\bin\\vite.js"
@@ -147,6 +164,28 @@ def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
     cleanup = script.rindex("\nfinally {")
     assert cleanup < script.index("Stop-ExactProcess -Process $frontend", cleanup)
     assert cleanup < script.index("Stop-ExactProcess -Process $backend", cleanup)
+
+
+def test_dev_disposes_each_exact_process_once_after_stop_and_wait_on_all_paths() -> None:
+    script = _read("scripts/dev.ps1")
+    start = script.index("function Stop-ExactProcess {")
+    end = script.index("\n\nPush-Location", start)
+    stop_exact_process = script[start:end]
+
+    cleanup_try = stop_exact_process.index("try {")
+    stop = stop_exact_process.index("Stop-Process -Id $Process.Id -Force", cleanup_try)
+    wait = stop_exact_process.index("$Process.WaitForExit(10000)", stop)
+    dispose_finally = stop_exact_process.index("finally {", wait)
+    dispose = stop_exact_process.index("$Process.Dispose()", dispose_finally)
+
+    assert cleanup_try < stop < wait < dispose_finally < dispose
+    assert stop_exact_process.count("$Process.Dispose()") == 1
+
+    outer_cleanup = script[script.rindex("\nfinally {") :]
+    frontend = outer_cleanup.index("Stop-ExactProcess -Process $frontend")
+    backend_finally = outer_cleanup.index("finally {", frontend)
+    backend = outer_cleanup.index("Stop-ExactProcess -Process $backend", backend_finally)
+    assert frontend < backend_finally < backend
 
 
 def test_package_builds_frontend_first_and_uses_directory_distribution() -> None:

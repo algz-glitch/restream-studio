@@ -125,16 +125,25 @@ function Test-PackageHealth {
         throw 'packaged /health readiness timed out'
     }
     finally {
-        [Environment]::SetEnvironmentVariable('RESTREAM_STUDIO_PORT', $oldPort)
-        [Environment]::SetEnvironmentVariable('RESTREAM_STUDIO_DATA_DIR', $oldData)
-        if ($null -ne $process) {
-            $process.Refresh()
-            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
-            if (-not $process.WaitForExit(10000)) {
-                throw 'packaged executable did not exit after Stop-Process'
-            }
-            if (-not (Wait-LocalPortReleased -Port $port)) {
-                throw "packaged port was not released: $port"
+        try {
+            [Environment]::SetEnvironmentVariable('RESTREAM_STUDIO_PORT', $oldPort)
+            [Environment]::SetEnvironmentVariable('RESTREAM_STUDIO_DATA_DIR', $oldData)
+        }
+        finally {
+            if ($null -ne $process) {
+                try {
+                    $process.Refresh()
+                    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+                    if (-not $process.WaitForExit(10000)) {
+                        throw 'packaged executable did not exit after Stop-Process'
+                    }
+                    if (-not (Wait-LocalPortReleased -Port $port)) {
+                        throw "packaged port was not released: $port"
+                    }
+                }
+                finally {
+                    $process.Dispose()
+                }
             }
         }
     }

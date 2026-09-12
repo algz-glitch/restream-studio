@@ -1,0 +1,21 @@
+logLevel: warn
+logDestinations: [stdout]
+
+api: yes
+apiAddress: 127.0.0.1:9997
+
+rtsp: no
+rtmp: yes
+rtmpAddress: 127.0.0.1:1935
+hls: no
+webrtc: no
+srt: no
+playback: no
+
+paths:
+  source/main:
+    source: publisher
+  target/douyin:
+    source: publisher
+  target/wechat:
+    source: publisher

@@ -225,6 +225,42 @@ async def test_concurrent_start_joiner_terminates_when_stopped_before_live(
 
 
 @pytest.mark.asyncio
+async def test_stop_intent_survives_runner_scheduled_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_entered = asyncio.Event()
+    release_runner = asyncio.Event()
+    children_created = 0
+
+    class UnexpectedProcess:
+        def __init__(self, _argv: object, *, sensitive_values: object) -> None:
+            nonlocal children_created
+            children_created += 1
+
+    supervisor = OutputSupervisor(DestinationKind.DOUYIN, child("healthy"))
+    original_run_generation = supervisor._run_generation
+
+    async def delayed_run(generation: int) -> None:
+        runner_entered.set()
+        await release_runner.wait()
+        await original_run_generation(generation)
+
+    monkeypatch.setattr(supervisor, "_run_generation", delayed_run)
+    monkeypatch.setattr("restream_studio.outputs.supervisor.AsyncProcess", UnexpectedProcess)
+    start_task = asyncio.create_task(supervisor.start())
+    await runner_entered.wait()
+    stop_task = asyncio.create_task(supervisor.stop())
+    await asyncio.sleep(0)
+    release_runner.set()
+
+    result = await asyncio.gather(start_task, return_exceptions=True)
+    await asyncio.wait_for(stop_task, timeout=1.0)
+    assert isinstance(result[0], RuntimeError)
+    assert children_created == 0
+    assert supervisor.state is OutputState.STOPPED
+
+
+@pytest.mark.asyncio
 async def test_cancelling_public_start_cancels_runner_and_closes_started_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,6 +362,16 @@ def test_auth_classifier_requires_status_context_and_boundaries() -> None:
 
     process._capture_line(b"RTMP server returned 403 Forbidden")
     assert process.auth_failed is True
+
+
+def test_out_time_rejects_non_finite_and_over_seven_days() -> None:
+    process = AsyncProcess(("unused",))
+    process._capture_line(b"out_time=999999999:00:00")
+    process._capture_line(b"out_time=00:00:inf")
+    assert "out_time_seconds" not in process.metrics
+
+    process._capture_line(b"out_time=168:00:00")
+    assert process.metrics["out_time_seconds"] == 604_800.0
 
 
 @pytest.mark.asyncio
@@ -445,6 +491,49 @@ async def test_windows_tree_kill_is_async_and_does_not_block_peer_work(
     assert not stop_task.done()
     release_taskkill.set()
     await asyncio.wait_for(asyncio.gather(stop_task, peer_task), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_failed_job_attach_uses_taskkill_before_gentle_parent_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows process-tree behavior")
+    calls: list[str] = []
+
+    class FakeMainProcess:
+        pid = 4444
+        returncode: int | None = None
+
+        def send_signal(self, _signal: int) -> None:
+            calls.append("gentle")
+
+        async def wait(self) -> int:
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            calls.append("main-kill")
+            self.returncode = -9
+
+    main_process = FakeMainProcess()
+
+    async def fake_taskkill(pid: int) -> int:
+        assert pid == main_process.pid
+        calls.append("taskkill")
+        main_process.returncode = 1
+        return 0
+
+    monkeypatch.setattr(AsyncProcess, "_run_taskkill", staticmethod(fake_taskkill))
+    process = AsyncProcess(("unused",))
+    object.__setattr__(process, "_process", main_process)
+    object.__setattr__(process, "_process_group_id", main_process.pid)
+    object.__setattr__(process, "_tree_control_failed", True)
+
+    await process.stop(timeout=1.0)
+
+    assert calls == ["taskkill"]
+    assert process.snapshot().tree_control_failed is True
 
 
 @pytest.mark.asyncio

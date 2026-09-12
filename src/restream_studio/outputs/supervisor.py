@@ -58,8 +58,10 @@ class OutputSupervisor:
         self._process: AsyncProcess | None = None
         self._stop_requested = asyncio.Event()
         self._stop_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._runner: asyncio.Task[None] | None = None
         self._live = asyncio.Event()
+        self._generation = 0
 
     @property
     def state(self) -> OutputState:
@@ -83,17 +85,24 @@ class OutputSupervisor:
         self._state = target
 
     async def start(self) -> None:
-        existing = self._runner
-        if existing is not None and not existing.done():
+        owns_runner = False
+        async with self._lifecycle_lock:
+            existing = self._runner
+            if existing is None or existing.done():
+                self._stop_requested.clear()
+                self._live.clear()
+                self._reconnect_count = 0
+                self._generation += 1
+                existing = asyncio.create_task(
+                    self._run_generation(self._generation),
+                    name=f"output-supervisor-{self.destination.value.casefold()}",
+                )
+                self._runner = existing
+                owns_runner = True
+        if not owns_runner:
             await self._wait_until_live_or_done(existing, owns_runner=False)
             return
-        self._live.clear()
-        self._reconnect_count = 0
-        runner = asyncio.create_task(
-            self.run(), name=f"output-supervisor-{self.destination.value.casefold()}"
-        )
-        self._runner = runner
-        await self._wait_until_live_or_done(runner, owns_runner=True)
+        await self._wait_until_live_or_done(existing, owns_runner=True)
 
     async def _wait_until_live_or_done(
         self, runner: asyncio.Task[None], *, owns_runner: bool
@@ -118,13 +127,18 @@ class OutputSupervisor:
 
     async def run(self) -> None:
         current = asyncio.current_task()
-        if self._runner is not None and self._runner is not current and not self._runner.done():
-            raise RuntimeError("supervisor is already running")
-        self._runner = current
-        self._stop_requested.clear()
-        self._live.clear()
+        assert current is not None
+        async with self._lifecycle_lock:
+            if self._runner is not None and self._runner is not current and not self._runner.done():
+                raise RuntimeError("supervisor is already running")
+            self._runner = current
+            self._generation += 1
+            generation = self._generation
+        await self._run_generation(generation)
+
+    async def _run_generation(self, generation: int) -> None:
         try:
-            while not self._stop_requested.is_set():
+            while generation == self._generation and not self._stop_requested.is_set():
                 self.transition(OutputState.CONNECTING)
                 process = AsyncProcess(self._argv, sensitive_values=self._sensitive_values)
                 self._process = process
@@ -181,9 +195,10 @@ class OutputSupervisor:
 
     async def stop(self) -> None:
         async with self._stop_lock:
-            self._stop_requested.set()
+            async with self._lifecycle_lock:
+                self._stop_requested.set()
+                runner = self._runner
             await self._close_process()
-            runner = self._runner
             if runner is not None and runner is not asyncio.current_task() and not runner.done():
                 await runner
             self._to_stopped()

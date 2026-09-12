@@ -18,6 +18,7 @@ from restream_studio.security.redaction import redact
 
 _PROGRESS_KEYS: Final = frozenset({"fps", "bitrate", "speed", "out_time", "progress"})
 _TIME_PATTERN: Final = re.compile(r"^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$")
+_MAX_OUT_TIME_SECONDS: Final = 7 * 24 * 60 * 60
 _AUTH_FAILURE_PATTERN: Final = re.compile(
     r"(?ix)(?:"
     r"\bauthentication\s+failed\b|"
@@ -136,6 +137,7 @@ class ProcessSnapshot:
     running: bool
     returncode: int | None
     was_killed: bool
+    tree_control_failed: bool
     stderr_tail: tuple[str, ...]
     metrics: Mapping[str, float | str]
 
@@ -180,6 +182,7 @@ class AsyncProcess:
         self._auth_failed = False
         self._process_group_id: int | None = None
         self._windows_job: _WindowsJob | None = None
+        self._tree_control_failed = False
         self._tree_cleanup_done = False
         self._tree_cleanup_lock = asyncio.Lock()
 
@@ -242,7 +245,10 @@ class AsyncProcess:
                 raise ProcessStartError("output process could not be started") from None
             self._process_group_id = self._process.pid
             if os.name == "nt":
+                # asyncio cannot safely expose CREATE_SUSPENDED without private transports. Attach
+                # immediately; FFmpeg does not spawn descendants during this very small window.
                 self._windows_job = _WindowsJob.attach(self._process.pid)
+                self._tree_control_failed = self._windows_job is None
             self._stderr_task = asyncio.create_task(self._read_stderr())
 
     async def _read_stderr(self) -> None:
@@ -339,7 +345,13 @@ class AsyncProcess:
                 return 0
             process = self._process
             try:
-                if process.returncode is None:
+                if os.name == "nt" and self._tree_control_failed and process.returncode is None:
+                    self._was_killed = True
+                    tree_stopped = await self._cleanup_process_tree()
+                    if not tree_stopped and process.returncode is None:
+                        process.kill()
+                    await process.wait()
+                elif process.returncode is None:
                     self._gentle_stop()
                     try:
                         await asyncio.wait_for(process.wait(), timeout=timeout)
@@ -453,6 +465,7 @@ class AsyncProcess:
             running=self.running,
             returncode=self.returncode,
             was_killed=self.was_killed,
+            tree_control_failed=self._tree_control_failed,
             stderr_tail=self.stderr_tail,
             metrics=self.metrics,
         )
@@ -478,7 +491,13 @@ def _parse_time(value: str) -> float | None:
     matched = _TIME_PATTERN.fullmatch(value)
     if matched is None:
         return None
-    hours, minutes, seconds = matched.groups()
-    if int(minutes) >= 60 or float(seconds) >= 60:
+    raw_hours, raw_minutes, raw_seconds = matched.groups()
+    hours = int(raw_hours)
+    minutes = int(raw_minutes)
+    seconds = float(raw_seconds)
+    if hours > 168 or minutes >= 60 or not math.isfinite(seconds) or seconds >= 60:
         return None
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    total = hours * 3600 + minutes * 60 + seconds
+    if not math.isfinite(total) or total > _MAX_OUT_TIME_SECONDS:
+        return None
+    return total

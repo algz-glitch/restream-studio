@@ -192,3 +192,33 @@ Final verification after the quality-review implementation:
 Ruff: All checks passed
 mypy: Success, no issues found in 27 source files
 ```
+
+## Remaining review closure
+
+RED was recorded for the final three review items:
+
+- the deterministic delayed-runner test failed because `_run_generation` did not exist and the
+  old `run()` could clear a stop intent after runner creation;
+- the metrics test retained `out_time_seconds=3599999996400.0` for an excessive timestamp;
+- the failed-Job-attach test required taskkill to precede any graceful parent signal.
+
+GREEN changes use one supervisor lifecycle lock and a monotonically increasing generation. A new
+public session clears stop intent before creating its runner; `_run_generation` never clears it,
+so a stop between `create_task` and first runner execution remains authoritative. FFmpeg out-time
+is finite and bounded to seven days (`604800` seconds), including the exact boundary.
+
+On Windows, Job attachment remains immediate after `create_subprocess_exec` returns. There is an
+unavoidable very short create-to-attach interval because `CREATE_SUSPENDED` would break the public
+asyncio subprocess contract and private transports are intentionally not used. Production output
+children are FFmpeg processes and do not normally create descendants in that interval. If Job
+attachment fails, `tree_control_failed` is exposed in the safe snapshot and stop escalates through
+async taskkill while the parent PID is still alive, before attempting graceful parent exit.
+
+Final focused evidence:
+
+```text
+11 runnable Task 7 cases passed, 17 deselected, in 0.09s
+138 synchronous regression cases passed, 1 deselected, in 0.19s
+28 Task 7 cases collected
+Ruff and strict mypy passed
+```

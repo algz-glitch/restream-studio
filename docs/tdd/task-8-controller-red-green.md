@@ -104,3 +104,44 @@ avoid those unrelated paths explicitly.
 `npm run build` was attempted and blocked before the build backend ran because pip could not write
 its build-tracker entry under `G:\CodexData\tmp` (`PermissionError: [Errno 13]`). This is an
 environment filesystem restriction, not a package or Task 8 compilation failure.
+
+## Specification review closure
+
+Five deterministic regressions were added before changing the controller. After adding only the
+new safe output-error enum required for test collection, the focused suite produced six behavioral
+failures:
+
+```text
+6 failed, 12 passed in 0.24s
+```
+
+The RED failures proved that the previous implementation started outputs after a probe crossed the
+URL-validity threshold, slept 30 seconds past the standby deadline, propagated an arbitrary
+destination `Exception`, published `LIVE` after a concurrent disable, aborted cleanup on an
+ordinary stop exception, and failed to clean the second destination after cancellation from the
+first.
+
+The GREEN changes are:
+
+- resolved URL freshness is checked both before and immediately after media probing;
+- every source-failure sleep is bounded by the remaining continuous-failure standby deadline, and
+  waking on that deadline performs the standby switch without another delayed resolve cycle;
+- preparation, restart, and stop failures publish only enum error categories, never exception text;
+  ordinary `Exception` instances are isolated while `CancelledError`, `SystemExit`, and
+  `KeyboardInterrupt` retain base-exception semantics;
+- enabled/input/error/generation state shares the controller state lock. Output switching captures
+  a generation, validates it immediately before restart, and validates it again afterward. A
+  disable during an in-flight restart invalidates publication and forces the stale output stopped,
+  without awaiting a supervisor while holding the state lock;
+- all-output cleanup invalidates generations first, executes every destination in its own
+  `try`/`finally`, records ordinary failures safely, completes later destinations after a
+  cancellation, then re-raises the cancellation.
+
+Focused GREEN result after this review:
+
+```text
+18 passed in 0.05s
+```
+
+Final review verification also passed Ruff, strict mypy over 30 source files, and the synchronous
+regression slice with `156 passed, 1 deselected in 0.21s`.

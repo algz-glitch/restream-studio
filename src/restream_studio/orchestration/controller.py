@@ -124,6 +124,12 @@ class OutputInput(StrEnum):
     STANDBY = "STANDBY"
 
 
+class OutputFailure(StrEnum):
+    PREPARE = "PREPARE_FAILED"
+    RESTART = "RESTART_FAILED"
+    STOP = "STOP_FAILED"
+
+
 @dataclass(frozen=True, slots=True)
 class ControllerOutputSnapshot:
     identity: str
@@ -131,6 +137,7 @@ class ControllerOutputSnapshot:
     enabled: bool
     state: OutputState
     input: OutputInput
+    last_error: OutputFailure | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +216,10 @@ class Controller:
         self._desired_running = False
         self._enabled = {item.identity: item.enabled for item in self._destinations}
         self._inputs = {item.identity: OutputInput.NONE for item in self._destinations}
+        self._output_errors: dict[str, OutputFailure | None] = {
+            item.identity: None for item in self._destinations
+        }
+        self._output_generations = {item.identity: 0 for item in self._destinations}
         self._first_failure_at: float | None = None
         self._failure_count = 0
         self._recovery_successes = 0
@@ -302,7 +313,7 @@ class Controller:
                     else self._next_backoff()
                 )
                 await self._record_failure(SourceFailure.RATE_LIMITED)
-                await self._sleeper.sleep(delay)
+                await self._sleep_after_failure(delay)
                 return
             except ResolverNetworkError:
                 await self._fail_and_wait(SourceFailure.NETWORK)
@@ -323,6 +334,9 @@ class Controller:
                 raise
             except RuntimeError:
                 await self._fail_and_wait(SourceFailure.PROBE)
+                return
+            if not self._url_is_fresh(resolved):
+                await self._fail_and_wait(SourceFailure.EXPIRED)
                 return
             await self._record_success(resolved, probe)
 
@@ -345,6 +359,7 @@ class Controller:
                             else OutputState.DISABLED
                         ),
                         input=self._inputs[item.identity],
+                        last_error=self._output_errors[item.identity],
                     )
                     for item in self._destinations
                 ),
@@ -353,11 +368,14 @@ class Controller:
     async def set_destination_enabled(self, identity: str, enabled: bool) -> None:
         selected = self._destination(identity)
         async with self._state_lock:
+            if self._enabled[identity] is enabled:
+                return
             self._enabled[identity] = enabled
+            self._output_generations[identity] += 1
             if not enabled:
                 self._inputs[identity] = OutputInput.NONE
         if not enabled:
-            await selected.supervisor.stop()
+            await self._stop_destination(selected)
         await self._persist()
 
     async def _run(self) -> None:
@@ -372,7 +390,38 @@ class Controller:
 
     async def _fail_and_wait(self, failure: SourceFailure) -> None:
         await self._record_failure(failure)
-        await self._sleeper.sleep(self._next_backoff())
+        await self._sleep_after_failure(self._next_backoff())
+
+    async def _sleep_after_failure(self, requested_delay: float) -> None:
+        async with self._state_lock:
+            delay = requested_delay
+            if (
+                self._state is SourceState.RECONNECTING
+                and self._standby is not None
+                and self._first_failure_at is not None
+            ):
+                remaining = max(
+                    0.0,
+                    self._first_failure_at + self._standby_after - self._clock.monotonic(),
+                )
+                delay = min(delay, remaining)
+        await self._sleeper.sleep(delay)
+        await self._enter_standby_if_due()
+
+    async def _enter_standby_if_due(self) -> None:
+        async with self._state_lock:
+            due = (
+                self._state is SourceState.RECONNECTING
+                and self._standby is not None
+                and self._first_failure_at is not None
+                and self._clock.monotonic() - self._first_failure_at >= self._standby_after
+            )
+        if not due:
+            return
+        await self._switch_outputs(OutputInput.STANDBY, resolved=None, probe=None)
+        async with self._state_lock:
+            if self._state is SourceState.RECONNECTING:
+                self._state = SourceState.STANDBY
 
     async def _record_failure(self, failure: SourceFailure) -> None:
         should_enter_standby = False
@@ -442,10 +491,14 @@ class Controller:
         resolved: ResolvedStream | None,
         probe: MediaProbe | None,
     ) -> None:
-        prepared: list[tuple[ConfiguredDestination, object]] = []
-        for item in self._destinations:
-            if not self._enabled[item.identity] or self._inputs[item.identity] is target:
-                continue
+        async with self._state_lock:
+            planned = tuple(
+                (item, self._output_generations[item.identity])
+                for item in self._destinations
+                if self._enabled[item.identity] and self._inputs[item.identity] is not target
+            )
+        prepared: list[tuple[ConfiguredDestination, int, object]] = []
+        for item, generation in planned:
             try:
                 if target is OutputInput.LIVE:
                     if resolved is None or probe is None:
@@ -455,29 +508,63 @@ class Controller:
                     if self._standby is None:
                         raise RuntimeError("standby media is unavailable")
                     command = item.supervisor.prepare_standby(self._standby)
-            except asyncio.CancelledError:
-                raise
-            except (RuntimeError, ValueError):
+            except Exception:  # noqa: BLE001 - destination isolation is the contract
+                await self._record_output_error(item.identity, OutputFailure.PREPARE)
                 continue
-            prepared.append((item, command))
-        for item, command in prepared:
+            prepared.append((item, generation, command))
+        for item, generation, command in prepared:
+            async with self._state_lock:
+                current = (
+                    self._enabled[item.identity]
+                    and self._output_generations[item.identity] == generation
+                    and self._inputs[item.identity] is not target
+                )
+            if not current:
+                continue
             try:
                 await item.supervisor.restart(command)
-            except asyncio.CancelledError:
-                raise
-            except RuntimeError:
+            except Exception:  # noqa: BLE001 - destination isolation is the contract
+                await self._record_output_error(item.identity, OutputFailure.RESTART)
                 continue
             async with self._state_lock:
-                self._inputs[item.identity] = target
+                current = (
+                    self._enabled[item.identity]
+                    and self._output_generations[item.identity] == generation
+                )
+                if current:
+                    self._inputs[item.identity] = target
+                    self._output_errors[item.identity] = None
+            if not current:
+                await self._stop_destination(item)
 
     async def _stop_outputs(self) -> None:
+        async with self._state_lock:
+            for item in self._destinations:
+                self._output_generations[item.identity] += 1
+                self._inputs[item.identity] = OutputInput.NONE
+        cancellation: asyncio.CancelledError | None = None
         for item in self._destinations:
             try:
                 await item.supervisor.stop()
-            except asyncio.CancelledError:
-                raise
-            except RuntimeError:
-                continue
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+            except Exception:  # noqa: BLE001 - cleanup must continue for peer destinations
+                await self._record_output_error(item.identity, OutputFailure.STOP)
+            finally:
+                async with self._state_lock:
+                    self._inputs[item.identity] = OutputInput.NONE
+        if cancellation is not None:
+            raise cancellation
+
+    async def _stop_destination(self, item: ConfiguredDestination) -> None:
+        try:
+            await item.supervisor.stop()
+        except Exception:  # noqa: BLE001 - one destination cannot block controller cleanup
+            await self._record_output_error(item.identity, OutputFailure.STOP)
+
+    async def _record_output_error(self, identity: str, error: OutputFailure) -> None:
+        async with self._state_lock:
+            self._output_errors[identity] = error
 
     async def _persist(self) -> None:
         if self._state_store is None:

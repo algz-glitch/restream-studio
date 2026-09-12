@@ -21,6 +21,7 @@ from restream_studio.orchestration.controller import (
     ConfiguredSource,
     Controller,
     ControllerSnapshot,
+    OutputFailure,
     PersistedControllerState,
     StandbyMedia,
 )
@@ -105,6 +106,8 @@ class FakeSupervisor:
         self.stop_count = 0
         self.events: list[str] = []
         self.fail_next_restart = False
+        self.restart_error: BaseException | None = None
+        self.stop_error: BaseException | None = None
 
     def prepare_live(self, source_url: str, probe: MediaProbe) -> FakeCommand:
         assert probe is PROBE
@@ -120,6 +123,9 @@ class FakeSupervisor:
     async def restart(self, command: object) -> None:
         assert isinstance(command, FakeCommand)
         self.events.append(f"restart-{command.label}")
+        if self.restart_error is not None:
+            error, self.restart_error = self.restart_error, None
+            raise error
         if self.fail_next_restart:
             self.fail_next_restart = False
             self.state = OutputState.ERROR
@@ -129,6 +135,9 @@ class FakeSupervisor:
 
     async def stop(self) -> None:
         self.stop_count += 1
+        if self.stop_error is not None:
+            error, self.stop_error = self.stop_error, None
+            raise error
         self.state = OutputState.STOPPED
 
 
@@ -215,6 +224,30 @@ def test_live_source_is_probed_before_two_enabled_outputs_start() -> None:
     assert drive(controller.snapshot()).source_state is SourceState.LIVE
 
 
+def test_url_crossing_expiry_threshold_during_probe_is_discarded_and_reresolved() -> None:
+    clock = FakeClock()
+
+    class AdvancingProbe(FakeProbe):
+        async def probe(self, url: str) -> MediaProbe:
+            result = await super().probe(url)
+            clock.advance(2)
+            return result
+
+    resolver = FakeResolver(
+        [stream(clock, "expires-during-probe", ttl=31), stream(clock, "replacement")]
+    )
+    controller, _, _, first, second = make_controller(resolver, probe=AdvancingProbe(), clock=clock)
+
+    drive(controller.poll_once())
+    assert not first.restarted and not second.restarted
+    assert drive(controller.snapshot()).source_failure is not None
+
+    drive(controller.poll_once())
+
+    assert len(resolver.calls) == 2
+    assert first.restarted[-1].label == second.restarted[-1].label == "live"
+
+
 def test_one_output_reconnecting_does_not_restart_or_stop_live_peer() -> None:
     clock = FakeClock()
     resolver = FakeResolver([stream(clock, "one"), stream(clock, "two")])
@@ -231,7 +264,7 @@ def test_one_output_reconnecting_does_not_restart_or_stop_live_peer() -> None:
     assert second.stop_count == 0
 
 
-def test_source_loss_re_resolves_with_explicit_backoff() -> None:
+def test_source_loss_re_resolves_and_hits_standby_deadline_exactly() -> None:
     clock = FakeClock()
     failures = [ResolverNetworkError("gone") for _ in range(5)]
     resolver = FakeResolver([stream(clock, "initial"), *failures])
@@ -241,9 +274,11 @@ def test_source_loss_re_resolves_with_explicit_backoff() -> None:
     for _ in failures:
         drive(controller.poll_once())
 
-    assert sleeper.delays == [3.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+    assert sleeper.delays == [3.0, 2.0, 5.0, 10.0, 20.0, 23.0]
     assert len(resolver.calls) == 6
     assert all(call == ("room-42", "origin") for call in resolver.calls)
+    assert clock.elapsed == 63.0
+    assert drive(controller.snapshot()).source_state is SourceState.STANDBY
 
 
 def test_sixty_seconds_source_failure_switches_each_output_to_safe_standby() -> None:
@@ -289,6 +324,22 @@ def test_failed_standby_destination_is_retried_without_restarting_healthy_peer()
 
     assert first.restarted[-1].label == "standby"
     assert len(second.restarted) == healthy_restart_count
+
+
+def test_arbitrary_restart_exception_is_isolated_and_recorded_without_secret() -> None:
+    clock = FakeClock()
+    controller, _, _, first, second = make_controller(
+        FakeResolver([stream(clock, "fresh")]), clock=clock
+    )
+    secret = "rtmp://destination.example/app/stream-key"
+    first.restart_error = Exception(secret)
+
+    drive(controller.poll_once())
+
+    snapshot = drive(controller.snapshot())
+    assert second.restarted[-1].label == "live"
+    assert snapshot.outputs[0].last_error is OutputFailure.RESTART
+    assert secret not in repr(snapshot)
 
 
 def test_standby_requires_two_spaced_successes_and_probe_failure_resets_count() -> None:
@@ -381,6 +432,69 @@ def test_restart_loads_only_desired_state_then_resolves_room_identity() -> None:
     assert resolver.calls == [("room-42", "origin")]
     assert not first.restarted and second.restarted[-1].label == "live"
     assert all(not hasattr(saved, "url") for saved in store.saved)
+
+
+def test_disable_during_inflight_restart_cannot_publish_or_leave_output_live() -> None:
+    class PauseOnce:
+        def __await__(self) -> Any:
+            yield "restart-paused"
+
+    class PausingSupervisor(FakeSupervisor):
+        async def restart(self, command: object) -> None:
+            assert isinstance(command, FakeCommand)
+            self.events.append(f"restart-{command.label}")
+            await PauseOnce()
+            self.restarted.append(command)
+            self.state = OutputState.LIVE
+
+    clock = FakeClock()
+    first = PausingSupervisor("primary", DestinationKind.DOUYIN)
+    second = FakeSupervisor("secondary", DestinationKind.WECHAT)
+    controller = Controller(
+        source=ConfiguredSource("room-42"),
+        resolver=FakeResolver([stream(clock, "fresh")]),
+        media_probe=FakeProbe(),
+        destinations=(
+            ConfiguredDestination("primary", first),
+            ConfiguredDestination("secondary", second),
+        ),
+        clock=clock,
+        sleeper=FakeSleeper(clock),
+        standby=StandbyMedia("safe-slate"),
+    )
+    polling = controller.poll_once()
+    assert polling.send(None) == "restart-paused"
+
+    drive(controller.set_destination_enabled("primary", False))
+    drive(polling)
+
+    snapshot = drive(controller.snapshot())
+    assert snapshot.outputs[0].enabled is False
+    assert snapshot.outputs[0].input.value == "NONE"
+    assert first.state is OutputState.STOPPED
+
+
+def test_cleanup_isolates_ordinary_stop_exception_and_records_safe_error() -> None:
+    controller, _, _, first, second = make_controller(FakeResolver([]))
+    secret = "rtmp://destination.example/app/stop-secret"
+    first.stop_error = Exception(secret)
+
+    drive(controller.stop())
+
+    snapshot = drive(controller.snapshot())
+    assert second.stop_count == 1
+    assert snapshot.outputs[0].last_error is OutputFailure.STOP
+    assert secret not in repr(snapshot)
+
+
+def test_cleanup_finishes_later_destinations_then_propagates_cancelled_error() -> None:
+    controller, _, _, first, second = make_controller(FakeResolver([]))
+    first.stop_error = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        drive(controller.stop())
+
+    assert second.stop_count == 1
 
 
 def test_standby_rejects_network_urls_and_path_traversal() -> None:

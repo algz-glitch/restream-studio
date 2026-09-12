@@ -96,3 +96,48 @@ directories, `pytest-cache-files-c2lyex6b` and `tmp0fe8fhgz`, with `WinError 5`.
 was attempted and stopped before the build backend because pip could not create a build-tracker
 entry under `G:\CodexData\tmp` (`PermissionError: [Errno 13]`). These are host filesystem/ACL
 blocks; the focused and synchronous suites above provide the executable Task 9 evidence.
+
+## Quality review closure
+
+Thirteen review regressions were added before their fixes. The first RED run stopped at collection
+because `DatabaseBusyError` did not exist. After the initial implementation, a narrower schema
+history regression produced the expected behavioral RED:
+
+```text
+Failed: DID NOT RAISE DatabaseCorruptError
+1 failed, 38 deselected in 0.28s
+```
+
+The review GREEN changes are:
+
+- event input is mapping-only; URL removal and recursive key redaction are followed by conservative
+  free-text masking for `stream_key`, `token`, `password`, `passwd`, `secret`, `authorization`,
+  and `cookie` assignments. Tests checkpoint WAL and verify both queried JSON and database bytes;
+- schema v2 removes legacy `enabled_destinations_json`. Controller load derives its enabled tuple
+  only from `destination_config.enabled`; controller save updates those rows, while `set_source`
+  does not modify destination state. Migration ignores malformed legacy JSON and preserves rows;
+- every migration acquires `BEGIN IMMEDIATE` before re-reading the version. SQLite busy/locked
+  conditions receive four bounded attempts and become `DatabaseBusyError`, never corruption.
+  Two independent instances concurrently opening a fresh database converge on schema v2;
+- v2 adds SQL checks for backoff bounds/order, RTMP(S) server shape, booleans, and JSON validity.
+  Every public read repeats semantic validation; path policy, destination server, desired state,
+  and event JSON tampering fail closed as `DatabaseCorruptError`;
+- open validates contiguous version history, the exact five-table/column contract, required check
+  clauses, and the exact event index. Missing/falsely complete schemas are rejected;
+- import validates the complete source, destination, and settings payload before entering one
+  write transaction. Secret-shaped import fields remain ignored and any failure leaves all rows
+  unchanged;
+- `dump_text()` now renders only the public secret-free export and already-redacted events. It
+  contains neither plaintext nor DPAPI ciphertext;
+- connection lookup and each SQLite operation are covered by the same reentrant lock. A stress
+  regression racing close against reads observes only `DatabaseClosedError`, never leaked
+  `sqlite3.ProgrammingError`.
+
+Final review verification:
+
+```text
+39 focused Task 9 tests passed
+206 synchronous regression tests passed, 1 deselected
+Ruff: All checks passed
+mypy: Success, no issues found in 34 source files
+```

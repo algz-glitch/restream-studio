@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,6 +17,7 @@ from restream_studio.persistence import database as database_module
 from restream_studio.persistence.database import (
     AppSettings,
     Database,
+    DatabaseBusyError,
     DatabaseClosedError,
     DatabaseCorruptError,
     DestinationSecretError,
@@ -95,7 +97,7 @@ def test_first_open_creates_exact_schema_and_pragmas_and_reopen_is_idempotent(
     with Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
     ) as database:
-        assert database.schema_version == 1
+        assert database.schema_version == 2
         assert cast(str, database.pragma("journal_mode")).lower() == "wal"
         assert database.pragma("foreign_keys") == 1
         assert database.pragma("busy_timeout") == 5_000
@@ -117,7 +119,7 @@ def test_first_open_creates_exact_schema_and_pragmas_and_reopen_is_idempotent(
     with Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
     ) as reopened:
-        assert reopened.schema_version == 1
+        assert reopened.schema_version == 2
 
 
 def test_close_is_idempotent_and_operations_after_close_are_explicit(
@@ -168,7 +170,7 @@ def test_failed_migration_rolls_back_schema_and_version(
     database.close()
 
     with sqlite3.connect(paths.database_file) as connection:
-        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 1
+        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 2
         assert (
             connection.execute(
                 "SELECT count(*) FROM sqlite_master WHERE name='must_rollback'"
@@ -194,6 +196,17 @@ def test_source_is_singleton_canonical_and_never_persists_resolved_media_url(db:
         )
     columns = {row[1] for row in db.execute_for_test("PRAGMA table_info(source_config)").fetchall()}
     assert not columns & {"url", "source_url", "resolved_url", "flv_url", "hls_url", "query_token"}
+    assert "enabled_destinations_json" not in columns
+
+
+def test_set_source_preserves_initial_destination_enabled_state(db: Database) -> None:
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "one", enabled=True)
+    db.set_destination(DestinationKind.WECHAT, "rtmp://two.test/app", "two", enabled=False)
+
+    db.set_source("https://live.douyin.com/room-one", "origin", True)
+
+    assert db.get_destination(DestinationKind.DOUYIN).enabled is True  # type: ignore[union-attr]
+    assert db.get_destination(DestinationKind.WECHAT).enabled is False  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(
@@ -382,6 +395,36 @@ def test_events_never_retain_urls_in_fields_or_free_form_messages(db: Database) 
     assert "media.example" not in db.dump_text()
 
 
+def test_event_messages_conservatively_redact_secret_assignments(
+    db: Database, paths: AppPaths
+) -> None:
+    secrets = (
+        "STREAM-SECRET",
+        "TOKEN-SECRET",
+        "PASSWORD-SECRET",
+        "AUTH-SECRET",
+        "COOKIE-SECRET",
+        "GENERIC-SECRET",
+    )
+    message = (
+        "stream_key=STREAM-SECRET token=TOKEN-SECRET password: PASSWORD-SECRET "
+        "authorization=Bearer AUTH-SECRET cookie: COOKIE-SECRET secret=GENERIC-SECRET"
+    )
+    db.add_event("ERROR", "credential_failure", {"message": message})
+    db.execute_for_test("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
+    query_text = json.dumps(db.list_events()[0].payload)
+    database_bytes = paths.database_file.read_bytes()
+    for secret in secrets:
+        assert secret not in query_text
+        assert secret.encode() not in database_bytes
+
+
+def test_event_api_rejects_unstructured_payload(db: Database) -> None:
+    with pytest.raises(TypeError, match="mapping"):
+        db.add_event("INFO", "bad", "token=SECRET")  # type: ignore[arg-type]
+
+
 def test_concurrent_event_writes_are_atomic_and_stably_ordered(db: Database) -> None:
     def writer(index: int) -> None:
         db.add_event("INFO", "concurrent", {"index": index})
@@ -430,11 +473,39 @@ def test_export_is_secret_free_json_serializable_and_import_ignores_secret_field
     assert db.get_destination_runtime(DestinationKind.LOCAL_TEST).stream_key == "LOCAL-SECRET"  # type: ignore[union-attr]
 
 
+def test_import_validates_everything_before_one_atomic_transaction(db: Database) -> None:
+    db.set_source("https://live.douyin.com/original", "origin", True)
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "keep", enabled=True)
+
+    with pytest.raises(ValueError):
+        db.import_config(
+            {
+                "source": {
+                    "room_identity": "https://live.douyin.com/replacement",
+                    "preferred_quality": "hd",
+                    "desired_running": False,
+                },
+                "destinations": [
+                    {
+                        "kind": "douyin",
+                        "base_server": "https://invalid.test/app",
+                        "enabled": False,
+                    }
+                ],
+            }
+        )
+
+    assert db.get_source().room_identity == "https://live.douyin.com/original"  # type: ignore[union-attr]
+    assert db.get_destination(DestinationKind.DOUYIN).enabled is True  # type: ignore[union-attr]
+
+
 def test_database_adapts_controller_state_store_without_resolved_url(db: Database) -> None:
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "one", enabled=False)
+    db.set_destination(DestinationKind.WECHAT, "rtmp://two.test/app", "two", enabled=True)
     state = PersistedControllerState(
         room_identity="https://live.douyin.com/room-9?token=DROP-ME",
         desired_running=True,
-        enabled_destinations=("primary", "secondary"),
+        enabled_destinations=("douyin",),
     )
     run(db.save(state))
     restored = run(db.load("https://live.douyin.com/room-9"))
@@ -442,12 +513,195 @@ def test_database_adapts_controller_state_store_without_resolved_url(db: Databas
     assert restored == PersistedControllerState(
         room_identity="https://live.douyin.com/room-9",
         desired_running=True,
-        enabled_destinations=("primary", "secondary"),
+        enabled_destinations=("douyin",),
     )
     assert "DROP-ME" not in db.dump_text()
     assert "resolved" not in {
         row[1].lower() for row in db.execute_for_test("PRAGMA table_info(source_config)")
     }
+
+
+def test_controller_load_builds_enabled_set_from_destination_rows(db: Database) -> None:
+    db.set_source("https://live.douyin.com/room-state", None, True)
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "one", enabled=True)
+    db.set_destination(DestinationKind.WECHAT, "rtmp://two.test/app", "two", enabled=False)
+    db.set_destination(DestinationKind.LOCAL_TEST, "rtmp://local.test/app", "local", enabled=True)
+
+    restored = run(db.load("https://live.douyin.com/room-state"))
+
+    assert restored is not None
+    assert restored.enabled_destinations == ("douyin", "local_test")
+
+
+def test_busy_database_has_distinct_error_and_is_not_reported_corrupt(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    first = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    )
+    second = Database(
+        paths.database_file,
+        paths=paths,
+        encrypt_secret=crypto[0],
+        decrypt_secret=crypto[1],
+        busy_timeout_ms=10,
+    )
+    first.open()
+    second.open()
+    try:
+        with first.transaction() as connection:
+            connection.execute(
+                "INSERT INTO events(created_at, level, event_type, payload_json) "
+                "VALUES('now','INFO','locked','{}')"
+            )
+            with pytest.raises(DatabaseBusyError):
+                second.add_event("INFO", "blocked", {})
+    finally:
+        second.close()
+        first.close()
+
+
+def test_two_database_instances_can_open_and_migrate_concurrently(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    barrier = threading.Barrier(2)
+
+    def opener(_: int) -> int:
+        database = Database(
+            paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+        )
+        barrier.wait()
+        try:
+            database.open()
+            return database.schema_version
+        finally:
+            database.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(opener, range(2))) == [2, 2]
+
+
+def test_open_rejects_schema_version_that_claims_missing_schema(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    with sqlite3.connect(paths.database_file) as connection:
+        connection.execute(
+            "CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_version VALUES(?, 'now')",
+            [(1,), (2,)],
+        )
+    database = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    )
+    with pytest.raises(DatabaseCorruptError, match="schema"):
+        database.open()
+
+
+def test_open_rejects_non_contiguous_schema_version_history(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    with Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    ):
+        pass
+    with sqlite3.connect(paths.database_file) as connection:
+        connection.execute("DELETE FROM schema_version WHERE version=1")
+
+    database = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    )
+    with pytest.raises(DatabaseCorruptError, match="version"):
+        database.open()
+
+
+def test_v1_migration_discards_duplicate_enabled_json_and_preserves_destination_rows(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    with sqlite3.connect(paths.database_file) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        database_module.MIGRATIONS[0](connection)
+        connection.execute("INSERT INTO schema_version VALUES(1, 'now')")
+        connection.execute(
+            "INSERT INTO source_config VALUES(1, 'https://live.douyin.com/legacy', NULL, 1, "
+            "'not-json', 'now')"
+        )
+        connection.execute(
+            "INSERT INTO destination_config VALUES('douyin', 'rtmp://one.test/app', "
+            "'cipher:eno', 1, 'now')"
+        )
+        connection.commit()
+
+    with Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    ) as migrated:
+        columns = {
+            row[1]
+            for row in migrated.execute_for_test("PRAGMA table_info(source_config)").fetchall()
+        }
+        restored = run(migrated.load("https://live.douyin.com/legacy"))
+        assert "enabled_destinations_json" not in columns
+        assert restored is not None and restored.enabled_destinations == ("douyin",)
+
+
+def test_tampered_settings_destination_and_event_json_fail_closed(
+    db: Database, paths: AppPaths
+) -> None:
+    standby = paths.standby_dir / "safe.mp4"
+    standby.write_bytes(b"video")
+    db.set_app_settings(AppSettings(standby_file=standby))
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "key")
+    db.add_event("INFO", "valid", {"ok": True})
+    db.execute_for_test("PRAGMA ignore_check_constraints=ON")
+    db.execute_for_test(
+        "UPDATE app_settings SET backoff_initial_seconds=0, standby_file='C:\\outside.mp4'"
+    )
+    db.execute_for_test(
+        "UPDATE destination_config SET base_server='https://invalid.test/app' WHERE kind='douyin'"
+    )
+    db.execute_for_test("UPDATE events SET payload_json='{broken' WHERE event_type='valid'")
+
+    with pytest.raises(DatabaseCorruptError, match="settings"):
+        db.get_app_settings()
+    with pytest.raises(DatabaseCorruptError, match="destination"):
+        db.get_destination(DestinationKind.DOUYIN)
+    with pytest.raises(DatabaseCorruptError, match="event"):
+        db.list_events()
+
+
+def test_dump_text_never_exposes_ciphertext_or_plaintext(db: Database) -> None:
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "PLAIN-SECRET")
+    dumped = db.dump_text()
+    assert "PLAIN-SECRET" not in dumped
+    assert "cipher:" not in dumped
+    assert "encrypted_stream_key" not in dumped
+    assert "configured" in dumped
+
+
+def test_close_racing_reads_only_surfaces_typed_closed_error(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    database = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    )
+    database.open()
+    errors: list[BaseException] = []
+
+    def reader() -> None:
+        for _ in range(2_000):
+            try:
+                database.list_destinations()
+            except DatabaseClosedError as exc:
+                errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(reader)
+        executor.submit(database.close).result()
+        future.result()
+
+    assert errors
+    assert all(isinstance(error, DatabaseClosedError) for error in errors)
 
 
 def test_transaction_rolls_back_all_writes_on_error(db: Database) -> None:

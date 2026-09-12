@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -27,6 +28,10 @@ _BUSY_TIMEOUT_MS: Final = 5_000
 _EVENT_LIMIT: Final = 5_000
 _SAFE_EVENT_NAME: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _URL_IN_TEXT: Final = re.compile(r"(?i)\b(?:https?|rtmps?)://[^\s\"'<>]+")
+_SECRET_ASSIGNMENT: Final = re.compile(
+    r"(?i)\b(stream[_-]?key|token|password|passwd|secret|authorization|cookie)"
+    r"\s*[:=]\s*(?:bearer\s+|basic\s+)?[^\s,;]+"
+)
 _KIND_TO_STORAGE: Final = {
     DestinationKind.DOUYIN: "douyin",
     DestinationKind.WECHAT: "wechat_channels",
@@ -45,6 +50,10 @@ class DatabaseClosedError(DatabaseError):
 
 class DatabaseCorruptError(DatabaseError):
     """Raised when SQLite reports malformed or inconsistent storage."""
+
+
+class DatabaseBusyError(DatabaseError):
+    """Raised after bounded retries cannot acquire the SQLite writer lock."""
 
 
 class MigrationError(DatabaseError):
@@ -136,7 +145,65 @@ def _migration_1(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: tuple[Migration, ...] = (_migration_1,)
+def _migration_2(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE source_config RENAME TO source_config_v1")
+    connection.execute(
+        "CREATE TABLE source_config ("
+        "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1), "
+        "room_identity TEXT NOT NULL CHECK("
+        "(room_identity LIKE 'https://live.douyin.com/%' OR "
+        "room_identity LIKE 'https://v.douyin.com/%') AND "
+        "instr(room_identity, '?') = 0 AND instr(room_identity, '#') = 0 AND "
+        "lower(room_identity) NOT LIKE '%.flv%' AND lower(room_identity) NOT LIKE '%.m3u8%'), "
+        "preferred_quality TEXT, "
+        "desired_running INTEGER NOT NULL CHECK(desired_running IN (0, 1)), "
+        "updated_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO source_config(singleton_id, room_identity, preferred_quality, desired_running, updated_at) "
+        "SELECT singleton_id, room_identity, preferred_quality, desired_running, updated_at FROM source_config_v1"
+    )
+    connection.execute("DROP TABLE source_config_v1")
+
+    connection.execute("ALTER TABLE destination_config RENAME TO destination_config_v1")
+    connection.execute(
+        "CREATE TABLE destination_config ("
+        "kind TEXT PRIMARY KEY CHECK(kind IN ('douyin','wechat_channels','local_test')), "
+        "base_server TEXT NOT NULL CHECK("
+        "(lower(base_server) LIKE 'rtmp://%' OR lower(base_server) LIKE 'rtmps://%') AND "
+        "instr(base_server, '?') = 0 AND instr(base_server, '#') = 0 AND instr(base_server, '@') = 0), "
+        "encrypted_stream_key TEXT NOT NULL CHECK(length(encrypted_stream_key) > 0), "
+        "enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)), updated_at TEXT NOT NULL)"
+    )
+    connection.execute("INSERT INTO destination_config SELECT * FROM destination_config_v1")
+    connection.execute("DROP TABLE destination_config_v1")
+
+    connection.execute("ALTER TABLE app_settings RENAME TO app_settings_v1")
+    connection.execute(
+        "CREATE TABLE app_settings ("
+        "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1), standby_file TEXT, "
+        "backoff_initial_seconds REAL NOT NULL "
+        "CHECK(backoff_initial_seconds BETWEEN 1.0 AND 60.0), "
+        "backoff_max_seconds REAL NOT NULL "
+        "CHECK(backoff_max_seconds BETWEEN backoff_initial_seconds AND 300.0), "
+        "updated_at TEXT NOT NULL)"
+    )
+    connection.execute("INSERT INTO app_settings SELECT * FROM app_settings_v1")
+    connection.execute("DROP TABLE app_settings_v1")
+
+    connection.execute("ALTER TABLE events RENAME TO events_v1")
+    connection.execute(
+        "CREATE TABLE events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, "
+        "level TEXT NOT NULL, event_type TEXT NOT NULL, "
+        "payload_json TEXT NOT NULL CHECK(json_valid(payload_json)))"
+    )
+    connection.execute("INSERT INTO events SELECT * FROM events_v1")
+    connection.execute("DROP TABLE events_v1")
+    connection.execute("CREATE INDEX idx_events_created_id ON events(created_at, id)")
+
+
+MIGRATIONS: tuple[Migration, ...] = (_migration_1, _migration_2)
 
 
 class Database:
@@ -189,14 +256,22 @@ class Database:
                     check_same_thread=False,
                 )
                 connection.row_factory = sqlite3.Row
-                connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-                connection.execute("PRAGMA foreign_keys=ON")
-                connection.execute("PRAGMA journal_mode=WAL")
+                self._execute_with_busy_retry(
+                    connection, f"PRAGMA busy_timeout={self._busy_timeout_ms}"
+                )
+                self._execute_with_busy_retry(connection, "PRAGMA foreign_keys=ON")
+                self._execute_with_busy_retry(connection, "PRAGMA journal_mode=WAL")
                 integrity = cast(str, connection.execute("PRAGMA quick_check").fetchone()[0])
                 if integrity != "ok":
                     raise DatabaseCorruptError("SQLite integrity check failed")
                 self._connection = connection
                 self._migrate()
+                self._validate_schema()
+            except DatabaseBusyError:
+                if connection is not None:
+                    connection.close()
+                self._connection = None
+                raise
             except DatabaseCorruptError:
                 if connection is not None:
                     connection.close()
@@ -222,8 +297,8 @@ class Database:
 
     @property
     def schema_version(self) -> int:
-        connection = self._require_connection()
         with self._lock:
+            connection = self._require_connection()
             row = connection.execute("SELECT max(version) FROM schema_version").fetchone()
             return int(row[0] or 0)
 
@@ -241,21 +316,32 @@ class Database:
 
     def _migrate(self) -> None:
         connection = self._require_connection()
-        has_version_table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
-        ).fetchone()
-        current = 0
-        if has_version_table:
-            current = int(
-                connection.execute(
-                    "SELECT coalesce(max(version), 0) FROM schema_version"
-                ).fetchone()[0]
-            )
-        if current > len(MIGRATIONS):
-            raise MigrationError("Database schema is newer than this application")
-        for version, migration in enumerate(MIGRATIONS[current:], start=current + 1):
+        while True:
+            version = 0
             try:
-                connection.execute("BEGIN IMMEDIATE")
+                self._execute_with_busy_retry(connection, "BEGIN IMMEDIATE")
+                has_version_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+                ).fetchone()
+                current = 0
+                if has_version_table:
+                    current = int(
+                        connection.execute(
+                            "SELECT coalesce(max(version), 0) FROM schema_version"
+                        ).fetchone()[0]
+                    )
+                elif connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name IN ('source_config','destination_config','app_settings','events') LIMIT 1"
+                ).fetchone():
+                    raise DatabaseCorruptError("Database schema_version table is missing")
+                if current > len(MIGRATIONS):
+                    raise MigrationError("Database schema is newer than this application")
+                if current == len(MIGRATIONS):
+                    connection.commit()
+                    return
+                version = current + 1
+                migration = MIGRATIONS[current]
                 migration(connection)
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(?, ?)",
@@ -264,16 +350,115 @@ class Database:
                 connection.commit()
             except BaseException as exc:
                 connection.rollback()
+                if isinstance(exc, (DatabaseBusyError, DatabaseCorruptError, MigrationError)):
+                    raise
                 raise MigrationError(f"Migration {version} failed") from exc
+
+    def _execute_with_busy_retry(self, connection: sqlite3.Connection, sql: str) -> sqlite3.Cursor:
+        for attempt in range(4):
+            try:
+                return connection.execute(sql)
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                if attempt == 3:
+                    raise DatabaseBusyError("SQLite database remained busy after retries") from exc
+                time.sleep(0.025 * (attempt + 1))
+        raise AssertionError("unreachable")
+
+    def _validate_schema(self) -> None:
+        connection = self._require_connection()
+        versions = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ).fetchall()
+        ]
+        if versions != list(range(1, len(MIGRATIONS) + 1)):
+            raise DatabaseCorruptError("Database schema version history is invalid")
+        required_columns = {
+            "schema_version": {"version", "applied_at"},
+            "source_config": {
+                "singleton_id",
+                "room_identity",
+                "preferred_quality",
+                "desired_running",
+                "updated_at",
+            },
+            "destination_config": {
+                "kind",
+                "base_server",
+                "encrypted_stream_key",
+                "enabled",
+                "updated_at",
+            },
+            "app_settings": {
+                "singleton_id",
+                "standby_file",
+                "backoff_initial_seconds",
+                "backoff_max_seconds",
+                "updated_at",
+            },
+            "events": {"id", "created_at", "level", "event_type", "payload_json"},
+        }
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        if tables != set(required_columns):
+            raise DatabaseCorruptError("Database schema tables are incomplete")
+        for table, expected in required_columns.items():
+            actual = {
+                str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if actual != expected:
+                raise DatabaseCorruptError(f"Database schema columns are invalid for {table}")
+        index = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_events_created_id' "
+            "AND tbl_name='events'"
+        ).fetchone()
+        index_columns = [
+            str(row[2])
+            for row in connection.execute("PRAGMA index_info(idx_events_created_id)").fetchall()
+        ]
+        schema_sql = " ".join(
+            str(row[0]).lower()
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name IN "
+                "('source_config','destination_config','app_settings','events')"
+            ).fetchall()
+        )
+        required_checks = (
+            "json_valid(payload_json)",
+            "backoff_initial_seconds between 1.0 and 60.0",
+            "encrypted_stream_key",
+            "desired_running in (0, 1)",
+        )
+        if (
+            index is None
+            or index_columns != ["created_at", "id"]
+            or any(check not in schema_sql for check in required_checks)
+        ):
+            raise DatabaseCorruptError("Database schema constraints or indexes are incomplete")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             connection = self._require_connection()
             try:
-                connection.execute("BEGIN IMMEDIATE")
+                self._execute_with_busy_retry(connection, "BEGIN IMMEDIATE")
                 yield connection
                 connection.commit()
+            except DatabaseBusyError:
+                connection.rollback()
+                raise
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if _is_busy(exc):
+                    raise DatabaseBusyError("SQLite database is busy") from exc
+                raise
             except BaseException:
                 connection.rollback()
                 raise
@@ -292,11 +477,11 @@ class Database:
         with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO source_config(singleton_id, room_identity, preferred_quality, "
-                "desired_running, enabled_destinations_json, updated_at) VALUES(1,?,?,?,?,?) "
+                "desired_running, updated_at) VALUES(1,?,?,?,?) "
                 "ON CONFLICT(singleton_id) DO UPDATE SET room_identity=excluded.room_identity, "
                 "preferred_quality=excluded.preferred_quality, desired_running=excluded.desired_running, "
                 "updated_at=excluded.updated_at",
-                (canonical, quality, int(desired_running), "[]", _now()),
+                (canonical, quality, int(desired_running), _now()),
             )
 
     def get_source(self) -> SourceConfig | None:
@@ -310,7 +495,13 @@ class Database:
             )
         if row is None:
             return None
-        return SourceConfig(str(row[0]), cast(str | None, row[1]), bool(row[2]))
+        try:
+            canonical = normalize_douyin_url(str(row[0]))
+            if row[2] not in (0, 1):
+                raise ValueError("invalid desired state")
+        except (TypeError, ValueError) as exc:
+            raise DatabaseCorruptError("Persisted source configuration is invalid") from exc
+        return SourceConfig(canonical, cast(str | None, row[1]), bool(row[2]))
 
     def set_destination(
         self,
@@ -358,19 +549,21 @@ class Database:
         row = self._destination_row(kind)
         if row is None:
             return None
-        return DestinationConfig(kind, str(row[1]), bool(row[3]), bool(row[2]))
+        server, enabled = _validated_destination_row(row)
+        return DestinationConfig(kind, server, enabled, bool(row[2]))
 
     def get_destination_runtime(self, kind: DestinationKind) -> RuntimeDestination | None:
         row = self._destination_row(kind)
         if row is None:
             return None
+        server, enabled = _validated_destination_row(row)
         try:
             secret = self._decrypt_secret(str(row[2]))
         except Exception as exc:
             raise DestinationSecretError("Unable to decrypt destination secret") from exc
         if not secret.strip():
             raise DestinationSecretError("Decrypted destination secret is empty")
-        return RuntimeDestination(kind, str(row[1]), secret, bool(row[3]))
+        return RuntimeDestination(kind, server, secret, enabled)
 
     def _destination_row(self, kind: DestinationKind) -> sqlite3.Row | None:
         with self._lock:
@@ -394,12 +587,15 @@ class Database:
                 )
                 .fetchall()
             )
-        return [
-            DestinationConfig(
-                _STORAGE_TO_KIND[str(row[0])], str(row[1]), bool(row[3]), bool(row[2])
-            )
-            for row in rows
-        ]
+        destinations: list[DestinationConfig] = []
+        for row in rows:
+            try:
+                kind = _STORAGE_TO_KIND[str(row[0])]
+            except KeyError as exc:
+                raise DatabaseCorruptError("Persisted destination kind is invalid") from exc
+            server, enabled = _validated_destination_row(row)
+            destinations.append(DestinationConfig(kind, server, enabled, bool(row[2])))
+        return destinations
 
     def delete_destination(self, kind: DestinationKind) -> bool:
         with self.transaction() as connection:
@@ -438,7 +634,13 @@ class Database:
             )
         if row is None:
             return AppSettings()
-        return AppSettings(Path(row[0]) if row[0] else None, float(row[1]), float(row[2]))
+        try:
+            settings = AppSettings(Path(row[0]) if row[0] else None, float(row[1]), float(row[2]))
+            _validate_backoff(settings)
+            standby = self._normalize_standby(settings.standby_file)
+        except (TypeError, ValueError) as exc:
+            raise DatabaseCorruptError("Persisted app settings are invalid") from exc
+        return AppSettings(standby, settings.backoff_initial_seconds, settings.backoff_max_seconds)
 
     def _normalize_standby(self, value: Path | None) -> Path | None:
         if value is None:
@@ -456,6 +658,8 @@ class Database:
         return candidate
 
     def add_event(self, level: str, event_type: str, payload: Mapping[str, object]) -> int:
+        if not isinstance(payload, Mapping):
+            raise TypeError("Event payload must be a structured mapping")
         normalized_level = level.upper()
         if normalized_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
             raise ValueError("Unsupported event level")
@@ -495,114 +699,168 @@ class Database:
                 )
                 .fetchall()
             )
-        return [
-            EventRecord(int(row[0]), str(row[1]), str(row[2]), str(row[3]), json.loads(str(row[4])))
-            for row in rows
-        ]
+        events: list[EventRecord] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row[4]))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise DatabaseCorruptError("Persisted event JSON is invalid") from exc
+            if not isinstance(payload, dict):
+                raise DatabaseCorruptError("Persisted event payload is not an object")
+            events.append(
+                EventRecord(
+                    int(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    cast(dict[str, object], payload),
+                )
+            )
+        return events
 
     def export_config(self) -> dict[str, object]:
-        source = self.get_source()
-        settings = self.get_app_settings()
-        return {
-            "source": asdict(source) if source else None,
-            "destinations": [
-                {
-                    "kind": _storage_kind(item.kind),
-                    "base_server": item.base_server,
-                    "enabled": item.enabled,
-                    "configured": item.configured,
-                }
-                for item in self.list_destinations()
-            ],
-            "app_settings": {
-                "standby_file": str(settings.standby_file) if settings.standby_file else None,
-                "backoff_initial_seconds": settings.backoff_initial_seconds,
-                "backoff_max_seconds": settings.backoff_max_seconds,
-            },
-        }
+        with self._lock:
+            source = self.get_source()
+            settings = self.get_app_settings()
+            return {
+                "source": asdict(source) if source else None,
+                "destinations": [
+                    {
+                        "kind": _storage_kind(item.kind),
+                        "base_server": item.base_server,
+                        "enabled": item.enabled,
+                        "configured": item.configured,
+                    }
+                    for item in self.list_destinations()
+                ],
+                "app_settings": {
+                    "standby_file": str(settings.standby_file) if settings.standby_file else None,
+                    "backoff_initial_seconds": settings.backoff_initial_seconds,
+                    "backoff_max_seconds": settings.backoff_max_seconds,
+                },
+            }
 
     def import_config(self, value: Mapping[str, object]) -> None:
+        source_write: tuple[str, str | None, bool] | None = None
         source = value.get("source")
         if isinstance(source, Mapping):
-            self.set_source(
-                str(source["room_identity"]),
-                cast(str | None, source.get("preferred_quality")),
-                bool(source.get("desired_running", False)),
-            )
+            canonical = normalize_douyin_url(str(source["room_identity"]))
+            quality_value = source.get("preferred_quality")
+            if quality_value is not None and not isinstance(quality_value, str):
+                raise ValueError("Preferred quality must be a string or null")
+            quality = quality_value.strip() if quality_value else None
+            source_write = (canonical, quality, bool(source.get("desired_running", False)))
+
+        destination_writes: list[tuple[str, str, bool]] = []
         destinations = value.get("destinations")
         if isinstance(destinations, list):
             for item in destinations:
                 if not isinstance(item, Mapping):
-                    continue
+                    raise TypeError("Destination import entries must be objects")
                 kind = _STORAGE_TO_KIND.get(str(item.get("kind")))
                 if kind is None:
-                    continue
+                    raise ValueError("Destination import kind is unsupported")
                 existing = self._destination_row(kind)
                 if existing is None:
                     continue
                 server = _validate_base_server(str(item.get("base_server", existing[1])))
-                with self.transaction() as connection:
-                    connection.execute(
-                        "UPDATE destination_config SET base_server=?, enabled=?, updated_at=? WHERE kind=?",
-                        (
-                            server,
-                            int(bool(item.get("enabled", existing[3]))),
-                            _now(),
-                            _storage_kind(kind),
-                        ),
-                    )
+                destination_writes.append(
+                    (_storage_kind(kind), server, bool(item.get("enabled", existing[3])))
+                )
+
+        settings_write: AppSettings | None = None
+        settings = value.get("app_settings")
+        if isinstance(settings, Mapping):
+            standby_value = settings.get("standby_file")
+            candidate = AppSettings(
+                standby_file=Path(str(standby_value)) if standby_value else None,
+                backoff_initial_seconds=float(settings.get("backoff_initial_seconds", 2.0)),
+                backoff_max_seconds=float(settings.get("backoff_max_seconds", 30.0)),
+            )
+            _validate_backoff(candidate)
+            settings_write = AppSettings(
+                self._normalize_standby(candidate.standby_file),
+                candidate.backoff_initial_seconds,
+                candidate.backoff_max_seconds,
+            )
+
+        with self.transaction() as connection:
+            if source_write is not None:
+                connection.execute(
+                    "INSERT INTO source_config(singleton_id, room_identity, preferred_quality, "
+                    "desired_running, updated_at) VALUES(1,?,?,?,?) "
+                    "ON CONFLICT(singleton_id) DO UPDATE SET room_identity=excluded.room_identity, "
+                    "preferred_quality=excluded.preferred_quality, "
+                    "desired_running=excluded.desired_running, updated_at=excluded.updated_at",
+                    (*source_write, _now()),
+                )
+            for storage_kind, server, enabled in destination_writes:
+                connection.execute(
+                    "UPDATE destination_config SET base_server=?, enabled=?, updated_at=? WHERE kind=?",
+                    (server, int(enabled), _now(), storage_kind),
+                )
+            if settings_write is not None:
+                connection.execute(
+                    "INSERT INTO app_settings(singleton_id, standby_file, backoff_initial_seconds, "
+                    "backoff_max_seconds, updated_at) VALUES(1,?,?,?,?) "
+                    "ON CONFLICT(singleton_id) DO UPDATE SET standby_file=excluded.standby_file, "
+                    "backoff_initial_seconds=excluded.backoff_initial_seconds, "
+                    "backoff_max_seconds=excluded.backoff_max_seconds, updated_at=excluded.updated_at",
+                    (
+                        str(settings_write.standby_file) if settings_write.standby_file else None,
+                        settings_write.backoff_initial_seconds,
+                        settings_write.backoff_max_seconds,
+                        _now(),
+                    ),
+                )
 
     async def save(self, state: PersistedControllerState) -> None:
         canonical = normalize_douyin_url(state.room_identity)
-        enabled = json.dumps(list(state.enabled_destinations), separators=(",", ":"))
+        enabled = {_normalize_enabled_identity(item) for item in state.enabled_destinations}
+        enabled.discard(None)
         with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO source_config(singleton_id, room_identity, preferred_quality, desired_running, "
-                "enabled_destinations_json, updated_at) VALUES(1,?,NULL,?,?,?) "
+                "updated_at) VALUES(1,?,NULL,?,?) "
                 "ON CONFLICT(singleton_id) DO UPDATE SET room_identity=excluded.room_identity, "
-                "desired_running=excluded.desired_running, enabled_destinations_json=excluded.enabled_destinations_json, "
-                "updated_at=excluded.updated_at",
-                (canonical, int(state.desired_running), enabled, _now()),
+                "desired_running=excluded.desired_running, updated_at=excluded.updated_at",
+                (canonical, int(state.desired_running), _now()),
             )
+            for storage_kind in _STORAGE_TO_KIND:
+                connection.execute(
+                    "UPDATE destination_config SET enabled=?, updated_at=? WHERE kind=?",
+                    (int(storage_kind in enabled), _now(), storage_kind),
+                )
 
     async def load(self, room_identity: str) -> PersistedControllerState | None:
         canonical = normalize_douyin_url(room_identity)
         with self._lock:
-            row = (
-                self._require_connection()
-                .execute(
-                    "SELECT room_identity, desired_running, enabled_destinations_json "
-                    "FROM source_config WHERE singleton_id=1 AND room_identity=?",
-                    (canonical,),
-                )
-                .fetchone()
-            )
+            connection = self._require_connection()
+            row = connection.execute(
+                "SELECT room_identity, desired_running "
+                "FROM source_config WHERE singleton_id=1 AND room_identity=?",
+                (canonical,),
+            ).fetchone()
+            enabled_rows = connection.execute(
+                "SELECT kind FROM destination_config WHERE enabled=1 "
+                "ORDER BY CASE kind WHEN 'douyin' THEN 1 WHEN 'wechat_channels' THEN 2 ELSE 3 END"
+            ).fetchall()
         if row is None:
             return None
-        enabled_raw = json.loads(str(row[2]))
-        if not isinstance(enabled_raw, list) or not all(
-            isinstance(item, str) for item in enabled_raw
-        ):
-            raise DatabaseCorruptError("Persisted controller state is malformed")
-        return PersistedControllerState(str(row[0]), bool(row[1]), tuple(enabled_raw))
+        if row[1] not in (0, 1):
+            raise DatabaseCorruptError("Persisted controller desired state is malformed")
+        enabled = tuple(str(enabled_row[0]) for enabled_row in enabled_rows)
+        return PersistedControllerState(str(row[0]), bool(row[1]), enabled)
 
     def dump_text(self) -> str:
-        """Test/audit representation of stored values; never decrypts credentials."""
+        """Return a fully sanitized diagnostic view without ciphertext or plaintext."""
         with self._lock:
-            connection = self._require_connection()
-            tables = (
-                "schema_version",
-                "source_config",
-                "destination_config",
-                "app_settings",
-                "events",
+            return repr(
+                {
+                    "config": self.export_config(),
+                    "events": [asdict(item) for item in self.list_events(limit=10_000)],
+                }
             )
-            values = [
-                tuple(row)
-                for table in tables
-                for row in connection.execute(f"SELECT * FROM {table}").fetchall()
-            ]
-        return repr(values)
 
 
 def _now() -> str:
@@ -659,6 +917,32 @@ def _validate_backoff(settings: AppSettings) -> None:
         raise ValueError("Maximum backoff must be between initial backoff and 300 seconds")
 
 
+def _validated_destination_row(row: sqlite3.Row) -> tuple[str, bool]:
+    try:
+        server = _validate_base_server(str(row[1]))
+        if row[3] not in (0, 1) or not isinstance(row[2], str) or not row[2]:
+            raise ValueError("invalid destination fields")
+    except (TypeError, ValueError) as exc:
+        raise DatabaseCorruptError("Persisted destination configuration is invalid") from exc
+    return server, bool(row[3])
+
+
+def _normalize_enabled_identity(value: str) -> str | None:
+    normalized = value.strip().lower()
+    aliases = {
+        "douyin": "douyin",
+        "wechat": "wechat_channels",
+        "wechat_channels": "wechat_channels",
+        "local_test": "local_test",
+    }
+    return aliases.get(normalized)
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
 def _is_below(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -669,7 +953,8 @@ def _is_below(path: Path, root: Path) -> bool:
 
 def _remove_event_urls(value: object) -> object:
     if isinstance(value, str):
-        return _URL_IN_TEXT.sub("***", value)
+        without_urls = _URL_IN_TEXT.sub("***", value)
+        return _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=***", without_urls)
     if isinstance(value, Mapping):
         sanitized: dict[object, object] = {}
         for key, item in value.items():

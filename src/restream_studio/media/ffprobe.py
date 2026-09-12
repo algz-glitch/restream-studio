@@ -9,6 +9,9 @@ import math
 import re
 import socket
 from collections.abc import Mapping
+from dataclasses import replace
+from itertools import pairwise
+from statistics import median
 from typing import cast
 from urllib.parse import urlsplit
 
@@ -137,10 +140,6 @@ def _parse_probe(payload: bytes) -> MediaProbe:
     level_value = video_map.get("level")
     bitrate_value = video_map.get("bit_rate")
     frame_rate = _frame_rate(video_map)
-    gop_value = video_map.get("gop_size")
-    gop_seconds = None
-    if gop_value is not None:
-        gop_seconds = _positive_int(gop_value, "GOP size", maximum=100_000) / frame_rate
     return MediaProbe(
         video_codec=codec,
         audio_codec=audio_codec,
@@ -155,8 +154,34 @@ def _parse_probe(payload: bytes) -> MediaProbe:
         video_profile=profile,
         video_level=_positive_int(level_value, "video level", maximum=1_000) if level_value is not None else None,
         video_bitrate=_positive_int(bitrate_value, "video bitrate", maximum=1_000_000_000) if bitrate_value is not None else None,
-        gop_seconds=gop_seconds,
+        gop_seconds=None,
     )
+
+
+def _parse_gop_seconds(payload: bytes) -> float | None:
+    try:
+        document = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, Mapping) or not isinstance(document.get("frames"), list):
+        return None
+    keyframe_times: list[float] = []
+    for frame in cast(list[object], document["frames"]):
+        if not isinstance(frame, Mapping) or frame.get("key_frame") != 1:
+            continue
+        value = frame.get("best_effort_timestamp_time")
+        if not isinstance(value, str) or _RATIONAL.fullmatch(value) is None or "/" in value:
+            continue
+        timestamp = float(value)
+        if math.isfinite(timestamp) and timestamp >= 0:
+            keyframe_times.append(timestamp)
+    intervals = [later - earlier for earlier, later in pairwise(keyframe_times)]
+    if not intervals or any(interval <= 0 or interval > 60 for interval in intervals):
+        return None
+    result = median(intervals)
+    if any(abs(interval - result) > max(0.05, result * 0.1) for interval in intervals):
+        return None
+    return result
 
 
 async def _resolve_host_addresses(host: str, port: int) -> tuple[str, ...]:
@@ -235,19 +260,14 @@ async def _read_process(
     return stdout, stderr
 
 
-async def probe_media(
+async def _execute_ffprobe(
+    executable: str,
     url: str,
-    *,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
-    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-    max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
-    executable: str = "ffprobe",
-) -> MediaProbe:
-    """Probe one HTTP(S) input without a shell and return immutable metadata."""
-    validated_url = validate_input_url(url)
-    if timeout <= 0 or max_output_bytes <= 0 or max_stream_bytes <= 0:
-        raise ValueError("timeout and output limits must be positive")
-    await _validate_resolved_host(validated_url)
+    options: tuple[str, ...],
+    timeout: float,
+    max_output_bytes: int,
+    max_stream_bytes: int,
+) -> bytes:
     argv = (
         executable,
         "-v",
@@ -256,10 +276,10 @@ async def probe_media(
         "http,https,tcp,tls,crypto",
         "-max_redirects",
         "0",
-        "-show_streams",
+        *options,
         "-of",
         "json",
-        validated_url,
+        url,
     )
     try:
         process = await asyncio.create_subprocess_exec(
@@ -279,4 +299,48 @@ async def probe_media(
         raise
     if process.returncode != 0:
         raise MediaProbeProcessError("ffprobe exited with a non-zero status")
-    return _parse_probe(stdout)
+    return stdout
+
+
+async def probe_media(
+    url: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+    executable: str = "ffprobe",
+) -> MediaProbe:
+    """Probe one HTTP(S) input without a shell and return immutable metadata."""
+    validated_url = validate_input_url(url)
+    if timeout <= 0 or max_output_bytes <= 0 or max_stream_bytes <= 0:
+        raise ValueError("timeout and output limits must be positive")
+    await _validate_resolved_host(validated_url)
+    stdout = await _execute_ffprobe(
+        executable,
+        validated_url,
+        ("-show_streams",),
+        timeout,
+        max_output_bytes,
+        max_stream_bytes,
+    )
+    result = _parse_probe(stdout)
+    try:
+        frame_stdout = await _execute_ffprobe(
+            executable,
+            validated_url,
+            (
+                "-select_streams",
+                "v:0",
+                "-show_frames",
+                "-show_entries",
+                "frame=key_frame,best_effort_timestamp_time",
+                "-read_intervals",
+                "%+6",
+            ),
+            timeout,
+            max_output_bytes,
+            max_stream_bytes,
+        )
+    except MediaProbeError:
+        return result
+    return replace(result, gop_seconds=_parse_gop_seconds(frame_stdout))

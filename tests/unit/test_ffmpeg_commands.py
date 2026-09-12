@@ -104,6 +104,36 @@ def test_unknown_or_out_of_bounds_copy_evidence_forces_transcode(probe: MediaPro
     assert "libx264" in command.argv
 
 
+@pytest.mark.parametrize("fps", [15.0, 24.0, 25.0])
+def test_non_preset_frame_rates_force_transcode(fps: float) -> None:
+    probe = compatible_probe()
+    probe = MediaProbe(
+        probe.video_codec, probe.audio_codec, probe.width, probe.height, fps,
+        probe.pixel_format, probe.audio_sample_rate, probe.audio_channels,
+        probe.video_profile, probe.video_level, probe.video_bitrate, probe.gop_seconds,
+    )
+    command = build_ffmpeg_command(
+        "https://media.example.test/live", "rtmp://push.example.com/live/key",
+        DestinationKind.DOUYIN, probe,
+    )
+    assert "libx264" in command.argv
+
+
+@pytest.mark.parametrize("fps", [30.0, 29.97, 30000 / 1001])
+def test_30_and_ntsc_2997_allow_copy_when_all_other_evidence_matches(fps: float) -> None:
+    probe = compatible_probe()
+    probe = MediaProbe(
+        probe.video_codec, probe.audio_codec, probe.width, probe.height, fps,
+        probe.pixel_format, probe.audio_sample_rate, probe.audio_channels,
+        probe.video_profile, probe.video_level, probe.video_bitrate, probe.gop_seconds,
+    )
+    command = build_ffmpeg_command(
+        "https://media.example.test/live", "rtmp://push.example.com/live/key",
+        DestinationKind.DOUYIN, probe,
+    )
+    assert command.argv[command.argv.index("-c") + 1] == "copy"
+
+
 def test_hls_and_flv_inputs_include_reconnect_options_and_one_output() -> None:
     for source in ("https://media.example.test/live.flv", "https://media.example.test/live.m3u8"):
         command = build_ffmpeg_command(

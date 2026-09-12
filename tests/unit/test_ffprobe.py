@@ -12,6 +12,7 @@ from restream_studio.media.ffprobe import (
     MediaProbeOutputTooLargeError,
     MediaProbeParseError,
     MediaProbeTimeoutError,
+    _parse_gop_seconds,
     _parse_probe,
     probe_media,
 )
@@ -26,6 +27,10 @@ def payload(**changes: object) -> bytes:
     video.update(changes)
     return json.dumps({"streams": [video, {"codec_type": "audio", "codec_name": "aac",
         "sample_rate": "48000", "channels": 2}]}).encode()
+
+
+def test_stream_gop_size_is_not_treated_as_keyframe_evidence() -> None:
+    assert _parse_probe(payload(gop_size=60)).gop_seconds is None
 
 
 class Stream:
@@ -80,6 +85,72 @@ async def test_chunk_reads_protocol_allowlist_and_extended_metadata(monkeypatch:
     assert process.stdout.reads >= 2 and process.stderr.reads >= 1
     assert (result.video_profile, result.video_level, result.video_bitrate) == ("High", 40, 4_500_000)
     assert result.gop_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_computes_gop_from_two_keyframes(monkeypatch: pytest.MonkeyPatch) -> None:
+    processes = iter([
+        Process([payload()]),
+        Process([json.dumps({"frames": [
+            {"key_frame": 1, "best_effort_timestamp_time": "0.000000"},
+            {"key_frame": 0, "best_effort_timestamp_time": "1.000000"},
+            {"key_frame": 1, "best_effort_timestamp_time": "2.002000"},
+        ]}).encode()]),
+    ])
+    calls: list[tuple[object, ...]] = []
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        calls.append(args)
+        return next(processes)
+    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", spawn)
+    result = await probe_media("https://media.example.test/live")
+    assert result.gop_seconds == pytest.approx(2.002)
+    assert "-show_frames" in calls[1]
+    assert calls[1][calls[1].index("-read_intervals") + 1] == "%+6"
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_needs_two_keyframes(monkeypatch: pytest.MonkeyPatch) -> None:
+    processes = iter([Process([payload()]), Process([b'{"frames":[{"key_frame":1,"best_effort_timestamp_time":"0"}]}'])])
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        return next(processes)
+    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", spawn)
+    assert (await probe_media("https://media.example.test/live")).gop_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_timeout_kills_reaps_and_returns_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_process = Process([payload()])
+    frame_process = Process([], returncode=None, hang=True)
+    processes = iter([metadata_process, frame_process])
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        return next(processes)
+
+    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", spawn)
+    result = await probe_media("https://media.example.test/live", timeout=0.05)
+    assert result.gop_seconds is None
+    assert frame_process.killed and frame_process.waited
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_output_limit_kills_reaps_and_returns_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_process = Process([payload()])
+    frame_process = Process([b"x" * 1_001], returncode=None)
+    processes = iter([metadata_process, frame_process])
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        return next(processes)
+
+    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", spawn)
+    result = await probe_media(
+        "https://media.example.test/live", max_output_bytes=1_000, max_stream_bytes=1_000
+    )
+    assert result.gop_seconds is None
+    assert frame_process.killed and frame_process.waited
 
 
 @pytest.mark.asyncio
@@ -164,8 +235,9 @@ def test_local_generated_fixture_smoke(tmp_path: Path) -> None:
         pytest.skip("local FFmpeg tools are unavailable")
     fixture = tmp_path / "task6.mp4"
     generated = subprocess.run(
-        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=size=64x64:rate=25:duration=0.1",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(fixture)],
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=size=64x64:rate=30:duration=5",
+         "-c:v", "libx264", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+         "-pix_fmt", "yuv420p", str(fixture)],
         capture_output=True, check=False, timeout=10,
     )
     assert generated.returncode == 0
@@ -175,3 +247,10 @@ def test_local_generated_fixture_smoke(tmp_path: Path) -> None:
     )
     assert probed.returncode == 0
     assert _parse_probe(probed.stdout).video_codec == "h264"
+    frames = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_frames",
+         "-show_entries", "frame=key_frame,best_effort_timestamp_time", "-read_intervals", "%+5",
+         "-of", "json", str(fixture)], capture_output=True, check=False, timeout=10,
+    )
+    assert frames.returncode == 0
+    assert _parse_gop_seconds(frames.stdout) == pytest.approx(2.0, abs=0.02)

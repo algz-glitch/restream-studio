@@ -79,7 +79,10 @@ def _can_copy(probe: MediaProbe, preset: _Preset) -> bool:
         and probe.audio_codec.casefold() == "aac"
         and 0 < probe.width <= preset.max_width
         and 0 < probe.height <= preset.max_height
-        and 0 < probe.frame_rate <= preset.max_fps
+        and (
+            abs(probe.frame_rate - preset.output_fps) <= 0.01
+            or abs(probe.frame_rate - (preset.output_fps * 1000 / 1001)) <= 0.01
+        )
         and probe.pixel_format.casefold() == "yuv420p"
         and probe.audio_sample_rate == preset.sample_rate
         and probe.audio_channels == preset.channels

@@ -60,14 +60,35 @@ does not bind the validated DNS answer to the later TLS connection. A DNS TOCTOU
 window therefore remains and must be closed at a future connection-isolation boundary; this
 module does not claim otherwise.
 
-Normal stream metadata does not prove keyframe spacing, so `gop_seconds` remains unknown
-unless explicit GOP-size evidence is supplied. Copy now requires complete evidence for H.264,
-AAC, yuv420p, <=30 FPS, 48 kHz stereo, dimensions, bitrate, accepted profile/level, and a
-two-second GOP. Every unknown or out-of-range field forces transcoding.
+Normal stream metadata, including a `streams[].gop_size` value, does not prove observed
+keyframe spacing. A second, bounded ffprobe invocation therefore requests only keyframe flags
+and best-effort timestamps from the first six seconds. It accepts a GOP duration only when at
+least two increasing timestamps produce consistent intervals; malformed, insufficient,
+timed-out, oversized, or failed frame evidence leaves `gop_seconds=None` and forces
+transcoding. Both probe invocations retain independent output limits and timeout kill/wait
+reaping.
 
-Final focused GREEN: `44 passed`. Final `npm run verify`: `153 passed,
-1 deselected`; lint and strict mypy passed. `npm run build` produced the wheel and
-`git diff --check` passed. The host's Windows loopback `socketpair()` intermittently blocked
-pytest event-loop creation, so verification used a temporary ignored, process-local selector
-shim with no repository/runtime change; all subprocess fakes and the local FFmpeg smoke still
-ran, and no probe/build process was left running.
+Copy now requires complete evidence for H.264, AAC, yuv420p, 48 kHz stereo, dimensions,
+bitrate, accepted profile/level, a two-second GOP, and a frame rate matching the preset's 30
+FPS cadence. Exact 30 FPS and NTSC 30000/1001 are accepted within 0.01 FPS; 15, 24, and 25
+FPS force transcoding.
+
+The continuation RED added a direct `gop_size=60` regression and failed because the
+interrupted `_parse_probe` returned `None`. GREEN restored the parser, removed all
+`streams.gop_size` dependence, and added frame-probe timeout/output-limit kill-and-reap
+regressions. The Windows event-loop hang was reproduced on the first standard async selector
+and terminated after 30 seconds. A process-local UDP socketpair selector shim (not a repository
+or runtime change) then produced `53 passed, 1 deselected`; the deselected local-tool smoke was
+reproduced directly with 10-second subprocess timeouts and reported H.264 with a measured
+`gop_seconds=2.0`.
+
+The host's Windows loopback `socketpair()` intermittently blocks pytest event-loop creation,
+so the standard verification result and the process-local workaround result are recorded
+separately rather than presenting the workaround as an unmodified environment pass.
+The final standard `npm run verify` completed Ruff and strict mypy, then was terminated after
+30 seconds when pytest hung at the same async boundary. The full process-local workaround run
+completed with `163 passed, 2 deselected`; the deselections were the configured live-network
+test and the separately executed local FFmpeg smoke. The build and diff-check evidence is
+recorded in the completion report. Standard `npm run build` reached wheel construction but
+the managed host denied writes inside pip/setuptools-created temporary directories; this is
+reported as an environment failure rather than a successful build.

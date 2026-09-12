@@ -33,6 +33,29 @@ describe('ApiClient', () => {
     expect(fetcher).toHaveBeenCalledWith('/api/status', expect.objectContaining({ signal: controller.signal }))
   })
 
+  it.each([
+    ['session', (api: ApiClient) => api.session(), { session_token: { secret: 'private-session' } }],
+    ['getSource', (api: ApiClient) => api.getSource(), { configured: 'yes', room_identity: 'private-source', preferred_quality: null }],
+    ['saveSource', (api: ApiClient) => api.saveSource({ room_url: 'https://live.douyin.com/1', preferred_quality: null }), { configured: true, room_identity: 7, preferred_quality: null }],
+    ['getDestination', (api: ApiClient) => api.getDestination('douyin'), { kind: 'douyin', configured: true, masked_stream_key: 'private-key', enabled: true, status: 'LIVE' }],
+    ['saveDestination', (api: ApiClient) => api.saveDestination('douyin', { enabled: true }), { kind: 'other', configured: true, masked_stream_key: null, enabled: true, status: 'LIVE' }],
+    ['getStatus', (api: ApiClient) => api.getStatus(), { desired_running: false, source_state: 'OFFLINE', source_failure: null, outputs: [{ kind: 'douyin', enabled: 'yes', status: 'OFFLINE', input: 'NONE', last_error: null }] }],
+    ['getEvents', (api: ApiClient) => api.getEvents(), { items: [{ id: 'private-event-id', created_at: 'now', level: 'INFO', event_type: 'test', payload: {} }], next_cursor: null }],
+    ['start', (api: ApiClient) => api.start(), { status: 'private-control-state' }],
+    ['stop', (api: ApiClient) => api.stop(), { status: false }],
+    ['reconnect', (api: ApiClient) => api.reconnect('douyin'), { kind: 'douyin', status: 'private-action-state' }],
+    ['testDestination', (api: ApiClient) => api.testDestination('douyin'), { kind: 'douyin', ok: true, diagnostic: 'private-diagnostic' }],
+  ] as const)('拒绝 %s 的畸形 2xx payload 且只返回固定脱敏错误', async (_name, invoke, payload) => {
+    const api = new ApiClient(vi.fn().mockResolvedValue(json(payload)))
+
+    let caught: unknown
+    try { await invoke(api) } catch (error) { caught = error }
+
+    expect(caught).toBeInstanceOf(ApiError)
+    expect(caught).toMatchObject({ status: 200, code: 'response_invalid', message: '服务器响应无效', fields: {}, requestId: '' })
+    expect(JSON.stringify(caught)).not.toContain('private')
+  })
+
   it('统一识别 DOMException 和跨运行时 AbortError', () => {
     expect(isAbortError(new DOMException('aborted', 'AbortError'))).toBe(true)
     expect(isAbortError(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(true)

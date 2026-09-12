@@ -278,12 +278,13 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
   const initializing = sourceLoading || statusLoading || logsLoading || sessionLoading || kinds.some((kind) => destinationLoading[kind])
 
   return <div className="app-shell">
-    <header className="command-bar">
+    <div className="app-background" data-testid="app-background" aria-hidden={confirmStop || undefined} inert={confirmStop || undefined}>
+      <header className="command-bar">
       <div className="brand"><span className="brand__mark" aria-hidden="true">RS</span><div><strong>Restream Studio</strong><small>本地双路播控台</small></div></div>
       <StatusBadge state={globalState} />
       <div className="command-actions"><button className="button button--primary" disabled={!canStart} aria-describedby="start-help" onClick={() => void control('start')}>{controlBusy ? '正在处理' : '开始监控'}</button><button ref={stopButton} className="button" disabled={!sessionReady || controlBusy || !status?.desired_running} onClick={() => void control('stop')}>停止全部</button></div>
-    </header>
-    <main aria-busy={initializing} aria-hidden={confirmStop || undefined} inert={confirmStop || undefined}>
+      </header>
+      <main aria-busy={initializing}>
       <div className="intro"><div><h1>传输控制台</h1><p>配置一次来源，分别监管两个发布通道。</p></div><div id="start-help" className="start-help">{!sessionReady ? '正在建立本地安全会话。' : !source?.configured || !configuredOutput ? '先保存抖音直播间地址，再配置并启用至少一个输出目标。' : '配置就绪，可以开始监控。'}</div></div>
       <div className="sr-live" aria-live="polite">{notice}</div>
       {sessionError && <LoadError text={sessionError} retryLabel="重试初始化会话" onRetry={() => void loadSession()} />}
@@ -297,7 +298,8 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
         {statusLoading && !status ? <PanelSkeleton label="正在加载状态" /> : statusError ? <LoadError text={statusError} retryLabel="重试加载状态" onRetry={() => void loadStatus()} /> : <Monitor status={status ?? blankStatus} />}
         {logsLoading && events.length === 0 && nextCursor === 0 && !logsError ? <PanelSkeleton label="正在加载日志" /> : <Logs items={events} loading={logsLoading} error={logsError} hasMore={nextCursor !== null} onMore={() => void loadEvents(nextCursor ?? 0, true)} onRetry={() => void loadEvents(0)} />}
       </div>
-    </main>
+      </main>
+    </div>
     {confirmStop && <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConfirmStop(false) }}><div ref={dialog} role="dialog" aria-modal="true" aria-labelledby="stop-title" aria-describedby="stop-description" className="dialog"><h2 id="stop-title">停止全部输出？</h2><p id="stop-description">当前有活跃输出。确认后两路发布都会停止。</p><div className="button-row"><button className="button" onClick={() => setConfirmStop(false)}>继续监控</button><button ref={confirmButton} className="button button--danger" onClick={() => void control('stop')}>确认停止</button></div></div></div>}
   </div>
 }

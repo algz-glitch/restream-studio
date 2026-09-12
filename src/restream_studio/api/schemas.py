@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from ipaddress import ip_address
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
@@ -20,6 +21,8 @@ from restream_studio.source import DouyinUrlValidationError, normalize_douyin_ur
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _QUALITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_IPV4_LIKE = re.compile(r"^[0-9.]+$")
 DestinationName = Literal["douyin", "wechat_channels", "local_test"]
 
 
@@ -65,16 +68,17 @@ class DestinationUpdate(StrictModel):
     def safe_server(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        if value != value.strip() or _CONTROL.search(value):
+        if value != value.strip() or _CONTROL.search(value) or any(char.isspace() for char in value):
             raise ValueError("server contains unsupported characters")
         try:
             parsed = urlsplit(value)
             port = parsed.port
         except ValueError as exc:
             raise ValueError("server is malformed") from exc
+        hostname = parsed.hostname
         if (
             parsed.scheme.lower() not in {"rtmp", "rtmps"}
-            or parsed.hostname is None
+            or hostname is None
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
@@ -84,6 +88,19 @@ class DestinationUpdate(StrictModel):
             or ".." in parsed.path.split("/")
         ):
             raise ValueError("server is not an approved RTMP endpoint")
+        try:
+            address = ip_address(hostname)
+        except ValueError:
+            if (
+                len(hostname) > 253
+                or not hostname.isascii()
+                or _IPV4_LIKE.fullmatch(hostname) is not None
+                or any(_HOST_LABEL.fullmatch(label) is None for label in hostname.split("."))
+            ):
+                raise ValueError("server hostname is invalid") from None
+        else:
+            if not address.is_global:
+                raise ValueError("server address is not globally routable")
         return value
 
     @field_validator("stream_key")

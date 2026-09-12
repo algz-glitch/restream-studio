@@ -107,6 +107,19 @@ def _origin_matches_host(origin: str, host: str) -> bool:
     )
 
 
+def mutation_is_authorized(
+    origin: str, host: str, provided_token: str, session_token: str
+) -> bool:
+    """Fail closed before lifespan while comparing token values in constant time."""
+    tokens_match = secrets.compare_digest(provided_token, session_token)
+    return (
+        bool(provided_token)
+        and bool(session_token)
+        and tokens_match
+        and _origin_matches_host(origin, host)
+    )
+
+
 def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -> FastAPI:
     deps = factory()
 
@@ -145,7 +158,7 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
             origin = request.headers.get("origin", "")
             token = request.headers.get("x-restream-session", "")
-            if not _origin_matches_host(origin, host) or not secrets.compare_digest(token, application.state.session_token):
+            if not mutation_is_authorized(origin, host, token, application.state.session_token):
                 return _error(request, 403, "request_forbidden", "Origin or session token is invalid")
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id

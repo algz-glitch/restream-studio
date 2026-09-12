@@ -148,6 +148,17 @@ def _check_write(deps: ApiDependencies, resource: str, expected: int | None, fin
     return deps.fingerprints.get(resource) != fingerprint
 
 
+def start_precondition_error(
+    *, source_configured: bool, real_ready: bool, local_ready: bool
+) -> tuple[str, str] | None:
+    """Return the stable first unmet start prerequisite, in API contract order."""
+    if not real_ready and not local_ready:
+        return "destination_required", "An enabled configured destination is required"
+    if not source_configured:
+        return "source_required", "A source configuration is required"
+    return None
+
+
 async def _destination_response(
     deps: ApiDependencies, kind: DestinationKind
 ) -> DestinationResponse:
@@ -262,15 +273,18 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
 
     @router.post("/api/control/start", response_model=ControlResponse)
     async def start(value: StartRequest) -> ControlResponse:
-        if deps.database.get_source() is None:
-            raise ApiError(409, "source_required", "A source configuration is required")
         configured = {item.kind: item for item in deps.database.list_destinations() if item.configured and item.enabled}
         real_ready = bool({DestinationKind.DOUYIN, DestinationKind.WECHAT} & configured.keys())
         local_ready = DestinationKind.LOCAL_TEST in configured and deps.local_test_mode and value.local_test
         if value.local_test and not deps.local_test_mode:
             raise ApiError(409, "local_test_disabled", "Local test mode is not enabled")
-        if not real_ready and not local_ready:
-            raise ApiError(409, "destination_required", "An enabled configured destination is required")
+        precondition = start_precondition_error(
+            source_configured=deps.database.get_source() is not None,
+            real_ready=real_ready,
+            local_ready=local_ready,
+        )
+        if precondition is not None:
+            raise ApiError(409, precondition[0], precondition[1])
         await deps.controller.start()
         return ControlResponse(status="started")
 

@@ -11,12 +11,12 @@ from typing import Any, cast
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from httpx import Response
+from httpx import ASGITransport, AsyncClient, Response
 from pydantic import SecretStr
 
-from restream_studio.api.routes import ApiDependencies
+from restream_studio.api.routes import ApiDependencies, start_precondition_error
 from restream_studio.domain import DestinationKind, OutputState, SourceState
-from restream_studio.main import create_app
+from restream_studio.main import create_app, mutation_is_authorized
 from restream_studio.orchestration.controller import (
     ControllerOutputSnapshot,
     ControllerSnapshot,
@@ -262,7 +262,7 @@ def test_start_requires_enabled_configured_real_destination(client: TestClient, 
     assert missing.json()["error"]["code"] == "destination_required"
     client.put(
         "/api/destinations/local_test",
-        json={"base_server": "rtmp://127.0.0.1/live", "stream_key": SECRET, "enabled": True},
+        json={"base_server": "rtmp://localhost/live", "stream_key": SECRET, "enabled": True},
     )
     assert client.post("/api/control/start", json={}).status_code == 409
     client.put(
@@ -279,7 +279,7 @@ def test_start_requires_enabled_configured_real_destination(client: TestClient, 
 
 def test_local_test_start_needs_explicit_mode(harness: Harness) -> None:
     harness.db.set_source(CANONICAL, None, False)
-    harness.db.set_destination(DestinationKind.LOCAL_TEST, "rtmp://127.0.0.1/live", SECRET)
+    harness.db.set_destination(DestinationKind.LOCAL_TEST, "rtmp://localhost/live", SECRET)
     deps = ApiDependencies(harness.db, harness.controller, local_test_mode=True)
     app = create_app(lambda: deps)
     with TestClient(app, headers=MUTATING) as client:
@@ -406,3 +406,56 @@ def test_concurrent_put_same_body_is_idempotent_and_stale_different_body_conflic
         )
         assert stale.status_code == 409
         assert stale.json()["error"]["code"] == "write_conflict"
+
+
+def test_pure_session_guard_fails_closed_before_lifespan(app: FastAPI) -> None:
+    assert app.state.session_token == ""
+    assert not mutation_is_authorized("http://localhost", "localhost", "", "")
+    assert not mutation_is_authorized("http://localhost", "localhost", "token", "")
+
+
+@pytest.mark.asyncio
+async def test_direct_asgi_mutation_without_lifespan_fails_closed(app: FastAPI) -> None:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost") as client:
+        response = await client.put(
+            "/api/source",
+            headers={"host": "localhost", "origin": "http://localhost"},
+            json={"room_url": CANONICAL},
+        )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "request_forbidden"
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "rtmp://bad host/live",
+        "rtmp://-bad.example/live",
+        "rtmp://bad-.example/live",
+        "rtmp://bad..example/live",
+        "rtmp://127.0.0.1/live",
+        "rtmp://10.0.0.1/live",
+        "rtmp://169.254.1.1/live",
+        "rtmp://[::1]/live",
+        "rtmp://publish.invalid:99999/live",
+    ],
+)
+def test_pure_destination_hostname_validator_rejects_unsafe_hosts(server: str) -> None:
+    from pydantic import ValidationError
+
+    from restream_studio.api.schemas import DestinationUpdate
+
+    with pytest.raises(ValidationError):
+        DestinationUpdate(base_server=server, stream_key=SecretStr(SECRET))
+
+
+def test_pure_start_precondition_orders_destination_before_source() -> None:
+    assert start_precondition_error(source_configured=False, real_ready=False, local_ready=False) == (
+        "destination_required",
+        "An enabled configured destination is required",
+    )
+    assert start_precondition_error(source_configured=False, real_ready=True, local_ready=False) == (
+        "source_required",
+        "A source configuration is required",
+    )

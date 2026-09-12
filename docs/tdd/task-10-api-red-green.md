@@ -83,3 +83,22 @@ Static verification after the implementation uses:
 
 The focused HTTP suite should be rerun on a host that permits Python's internal event-loop socket
 pair. No network or real platform credentials are required by the tests.
+
+## Specification review follow-up
+
+Three review regressions were added test-first. The first focused RED failed at import because the
+new pure start-precondition helper did not exist. After adding the helper, the corrected focused
+suite is GREEN:
+
+```text
+11 passed, 28 deselected in 0.49s
+```
+
+The follow-up makes mutation authorization fail closed when lifespan has not generated a nonempty
+token while still invoking `secrets.compare_digest`; an async `ASGITransport` regression directly
+targets the app without lifespan, and a socket-free direct invocation returned the fixed 403.
+RTMP(S) host validation now rejects all whitespace, malformed
+DNS labels, malformed or nonglobal IP literals, userinfo, controls, missing hosts, unsafe ports,
+and key-bearing paths. Pure schema/helper tests avoid network and lifecycle dependencies. Start
+validation now preserves the established error order: destination readiness first, then source
+configuration. The full file now collects 39 test cases.

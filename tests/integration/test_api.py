@@ -48,6 +48,9 @@ class FakeDatabase:
     def get_source(self) -> SourceConfig | None:
         return self.source
 
+    def get_source_with_revision(self) -> tuple[SourceConfig | None, int]:
+        return self.source, self.get_api_revision("source")
+
     def set_source(self, room_identity: str, preferred_quality: str | None, desired_running: bool) -> None:
         from restream_studio.source import normalize_douyin_url
 
@@ -67,6 +70,17 @@ class FakeDatabase:
     def get_destination_runtime(self, kind: DestinationKind) -> Any:
         item = self.destinations[kind]
         return type("Runtime", (), {"base_server": item["base_server"], "stream_key": item["stream_key"]})()
+
+    def get_destination_with_revision(
+        self, kind: DestinationKind
+    ) -> tuple[DestinationConfig | None, Any, int]:
+        resource = f"destination:{kind.name.lower() if kind is not DestinationKind.WECHAT else 'wechat_channels'}"
+        public = self.get_destination(kind)
+        runtime = self.get_destination_runtime(kind) if public is not None else None
+        return public, runtime, self.get_api_revision(resource)
+
+    def configuration_snapshot(self) -> tuple[SourceConfig | None, list[DestinationConfig]]:
+        return self.source, self.list_destinations()
 
     def set_destination(
         self,
@@ -144,6 +158,9 @@ class FakeController:
         self.started += 1
 
     async def stop(self) -> None:
+        self.stopped += 1
+
+    async def shutdown(self) -> None:
         self.stopped += 1
 
     async def snapshot(self) -> ControllerSnapshot:
@@ -253,6 +270,20 @@ def test_source_round_trip_normalizes_identity_and_forbids_extra(client: TestCli
     invalid = client.put("/api/source", json={"room_url": CANONICAL, "unexpected": True})
     assert invalid.status_code == 422
     assert set(invalid.json()["error"]) == {"code", "message", "fields", "request_id"}
+
+
+def test_get_source_etag_comes_from_atomic_database_snapshot(
+    client: TestClient, harness: Harness
+) -> None:
+    harness.db.source = SourceConfig(CANONICAL, "origin", False)
+    harness.db.revisions["source"] = 7
+    harness.db.get_source = lambda: (_ for _ in ()).throw(AssertionError("split read"))  # type: ignore[method-assign]
+
+    response = client.get("/api/source")
+
+    assert response.status_code == 200
+    assert response.headers["etag"] == '"7"'
+    assert response.json()["room_identity"] == CANONICAL
 
 
 @pytest.mark.parametrize(
@@ -676,3 +707,160 @@ def test_pure_dns_policy_checks_every_answer_and_allows_explicit_localhost() -> 
     assert run_immediate(
         validate_destination_dns(DestinationKind.LOCAL_TEST, "rtmp://localhost/live")
     ) == ("127.0.0.1", "::1")
+
+
+def test_runtime_initialize_resumes_and_rebuild_shutdown_does_not_rewrite_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import restream_studio.runtime as runtime_module
+    from restream_studio.persistence.database import RuntimeDestination
+
+    database = FakeDatabase()
+    database.source = SourceConfig(CANONICAL, "origin", True)
+    database.revisions["source"] = 9
+    database.set_destination(
+        DestinationKind.DOUYIN,
+        "rtmps://publish.invalid/live",
+        SECRET,
+        enabled=True,
+    )
+    controllers: list[Any] = []
+
+    def runtime_destination(kind: DestinationKind) -> RuntimeDestination:
+        item = database.destinations[kind]
+        return RuntimeDestination(
+            kind,
+            "douyin",
+            cast(str, item["base_server"]),
+            cast(str, item["stream_key"]),
+            cast(bool, item["enabled"]),
+        )
+
+    database.get_destination_runtime = runtime_destination  # type: ignore[method-assign]
+
+    class ControllerSpy(FakeController):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__()
+            del kwargs
+            self.desired = True
+            self.shutdowns = 0
+            controllers.append(self)
+
+        async def snapshot(self) -> ControllerSnapshot:
+            snapshot = await super().snapshot()
+            return ControllerSnapshot(
+                snapshot.room_identity,
+                self.desired,
+                snapshot.source_state,
+                snapshot.source_failure,
+                snapshot.error_detail,
+                snapshot.recovery_successes,
+                snapshot.outputs,
+            )
+
+        async def shutdown(self) -> None:
+            self.shutdowns += 1
+
+    monkeypatch.setattr(runtime_module, "Controller", ControllerSpy)
+    manager = runtime_module.RuntimeManager(cast(Any, database))
+
+    def finish(coroutine: Any) -> Any:
+        iterator = coroutine.__await__()
+        try:
+            iterator.send(None)
+        except StopIteration as stopped:
+            return stopped.value
+        raise AssertionError("runtime spy coroutine unexpectedly suspended")
+
+    finish(manager.initialize())
+    assert controllers[0].started == 1
+    finish(manager.apply_configuration())
+    assert controllers[0].shutdowns == 1
+    assert controllers[1].started == 1
+    assert database.source == SourceConfig(CANONICAL, "origin", True)
+    assert database.revisions["source"] == 9
+
+
+def test_lifespan_cleanup_clears_token_and_closes_database_when_runtime_cleanup_fails() -> None:
+    database = FakeDatabase()
+    controller = FakeController()
+    cleared = False
+
+    async def broken_shutdown() -> None:
+        raise RuntimeError("shutdown detail")
+
+    def broken_clear() -> None:
+        nonlocal cleared
+        cleared = True
+        raise RuntimeError("clear detail")
+
+    controller.shutdown = broken_shutdown  # type: ignore[method-assign]
+    controller.clear = broken_clear  # type: ignore[method-assign]
+    application = create_app(lambda: ApiDependencies(database, controller))
+    lifespan = application.router.lifespan_context(application)
+
+    def finish(coroutine: Any) -> Any:
+        iterator = coroutine.__await__()
+        try:
+            iterator.send(None)
+        except StopIteration as stopped:
+            return stopped.value
+        raise AssertionError("lifespan coroutine unexpectedly suspended")
+
+    finish(lifespan.__aenter__())
+    assert application.state.session_token
+    with pytest.raises(RuntimeError, match="did not complete cleanly"):
+        finish(lifespan.__aexit__(None, None, None))
+    assert application.state.session_token == ""
+    assert application.state.dependencies is None
+    assert cleared
+    assert database.closed
+
+
+def test_runtime_restart_failure_reports_error_instead_of_false_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import restream_studio.runtime as runtime_module
+    from restream_studio.persistence.database import RuntimeDestination
+
+    database = FakeDatabase()
+    database.source = SourceConfig(CANONICAL, None, True)
+    database.set_destination(
+        DestinationKind.DOUYIN, "rtmps://publish.invalid/live", SECRET, enabled=True
+    )
+    database.get_destination_runtime = lambda kind: RuntimeDestination(  # type: ignore[method-assign]
+        kind, "douyin", "rtmps://publish.invalid/live", SECRET, True
+    )
+
+    class FailingController(FakeController):
+        async def snapshot(self) -> ControllerSnapshot:
+            snapshot = await super().snapshot()
+            return ControllerSnapshot(
+                snapshot.room_identity,
+                True,
+                snapshot.source_state,
+                None,
+                None,
+                0,
+                snapshot.outputs,
+            )
+
+        async def start(self) -> None:
+            raise RuntimeError("private startup failure")
+
+    monkeypatch.setattr(runtime_module, "Controller", lambda **kwargs: FailingController())
+    manager = runtime_module.RuntimeManager(cast(Any, database))
+
+    def finish(coroutine: Any) -> Any:
+        iterator = coroutine.__await__()
+        try:
+            iterator.send(None)
+        except StopIteration as stopped:
+            return stopped.value
+        raise AssertionError("runtime failure coroutine unexpectedly suspended")
+
+    finish(manager.initialize())
+    snapshot = finish(manager.snapshot())
+    assert snapshot.desired_running is False
+    assert snapshot.source_state is SourceState.ERROR
+    assert snapshot.error_detail is None

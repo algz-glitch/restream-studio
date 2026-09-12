@@ -6,7 +6,7 @@ Task 10 adds only the localhost FastAPI control boundary: strict Pydantic v2 con
 dependency-injected source/destination/control/test/event routes, structured errors, fixed secret
 masking, optimistic write conflict handling, lifecycle cleanup, optional frontend mounting, and
 localhost Host/Origin/session-token enforcement. The destination test operation is injected and
-bounded to five seconds; it does not start a long-running publication.
+bounded; only an explicit user request runs a one-second FFmpeg publication probe.
 
 ## RED
 
@@ -153,3 +153,57 @@ mypy: Success, 40 source files
 The full TestClient suite remains subject to the recorded managed-host event-loop socket-pair
 restriction. The direct ASGI checks use no platform network and the DNS policy test injects fixed
 answers. Production DNS/TCP functions were not invoked by tests.
+
+## Quality re-review closure
+
+The re-review began with three focused RED failures: `Controller.shutdown` and the atomic database
+snapshot methods did not exist, and `restream_studio.destination_test` failed import during test
+collection. The new tests were then driven GREEN without platform or network access.
+
+- Controller shutdown now has a non-persisting path. Runtime replacement and application shutdown
+  stop/reap old output processes without writing the old controller's desired/enabled state back
+  over a newly committed API transaction. Operator `/stop` retains the persisting path.
+- A runtime rebuild observes both the outgoing runtime intent and the desired-running value loaded
+  by the replacement controller. Persistent `desired_running=true` therefore starts monitoring on
+  process restart. A synchronous resume failure is represented as a safe `ERROR` snapshot rather
+  than a false running state; configuration-apply failures still propagate so the API can restore
+  the old database snapshot and revision.
+- Source and destination GETs now obtain content and ETag revision in one SQLite read transaction.
+  Start obtains source plus all public destination readiness fields in one transaction, and start,
+  stop, and configuration PUTs share the API write lock. Revision increments remain inside the
+  successful configuration write transaction only.
+- `DestinationTester` first validates every DNS answer. Its TCP/TLS preflight connects to one of
+  those validated IP literals; RTMPS uses a verifying default SSL context and passes the original
+  hostname as `server_hostname`, preserving certificate verification and SNI. It then invokes a
+  bounded FFmpeg probe with generated black video and silence for one second against the complete
+  server/key URL. Timeout and oversized stderr paths kill and reap the child, authentication text
+  maps only to a fixed failed diagnostic, and command repr/display forms contain only a constant
+  mask. Fake connector/process tests prove the validated IP and original SNI are used and that the
+  secret exists only in the subprocess argv.
+- FFmpeg's normal network output API does not expose a supported way to pin an already-resolved IP
+  while independently retaining the RTMPS hostname for SNI/certificate checks. Production starts
+  and reconnects therefore revalidate all current addresses immediately before process creation,
+  but FFmpeg resolves the hostname again. DNS changes in that interval remain an explicit TOCTOU
+  residual; this implementation does not claim IP pinning for the production FFmpeg connection.
+- Lifespan cleanup attempts runtime shutdown, clears the token and dependency references, clears
+  runtime references, and closes SQLite independently. A cleanup failure produces one fixed local
+  lifecycle error only after the remaining cleanup steps have run.
+
+Focused GREEN evidence for this re-review:
+
+```text
+34 passed: full controller integration module plus four DestinationTester regressions
+60 passed: full database unit module, including atomic snapshot and revision tests
+14 passed: socket-free API schema/security/helper tests plus focused additions
+3 passed: runtime resume/rebuild, safe resume failure, and failure-tolerant lifespan cleanup
+mypy: Success, 42 source files
+ruff: All checks passed
+```
+
+The managed Windows event-loop socket-pair limitation remains applicable to the full TestClient
+module. No network, DNS lookup, platform credential, or real publishing endpoint was used in the
+GREEN evidence above.
+
+A wider synchronous regression command was also attempted and stopped at the requested 30-second
+bound after 31 progress markers rather than being left running; it produced no failure before the
+stop, but is not reported as a passing suite.

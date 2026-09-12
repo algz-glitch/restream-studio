@@ -116,18 +116,28 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.session_token = secrets.token_urlsafe(32)
         application.state.dependencies = deps
-        deps.database.open()
         try:
+            deps.database.open()
             await deps.controller.initialize()
             yield
         finally:
+            cleanup_failed = False
             try:
-                await deps.controller.stop()
-            finally:
+                await deps.controller.shutdown()
+            except BaseException:  # noqa: BLE001 - every cleanup step must still run
+                cleanup_failed = True
+            application.state.session_token = ""
+            application.state.dependencies = None
+            try:
                 deps.controller.clear()
-                application.state.session_token = ""
-                application.state.dependencies = None
+            except BaseException:  # noqa: BLE001 - every cleanup step must still run
+                cleanup_failed = True
+            try:
                 deps.database.close()
+            except BaseException:  # noqa: BLE001 - every cleanup step must still run
+                cleanup_failed = True
+            if cleanup_failed:
+                raise RuntimeError("Application shutdown did not complete cleanly") from None
 
     application = FastAPI(
         title="Restream Studio Local API",

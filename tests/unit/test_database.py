@@ -102,6 +102,33 @@ def test_revisioned_source_write_is_one_stale_checked_transaction(db: Database) 
     assert db.get_api_revision("source") == 1
 
 
+def test_configuration_reads_return_content_and_revision_from_one_snapshot(db: Database) -> None:
+    db.set_source_revisioned(
+        "https://live.douyin.com/snapshot", "origin", True, expected_revision=0
+    )
+    db.set_destination_revisioned(
+        DestinationKind.DOUYIN,
+        "rtmps://publish.example/live",
+        "snapshot-secret",
+        enabled=True,
+        expected_revision=0,
+    )
+
+    source, source_revision = db.get_source_with_revision()
+    destination, runtime, destination_revision = db.get_destination_with_revision(
+        DestinationKind.DOUYIN
+    )
+    start_source, start_destinations = db.configuration_snapshot()
+
+    assert source is not None and source.room_identity.endswith("/snapshot")
+    assert source_revision == 1
+    assert destination is not None and destination.enabled
+    assert runtime is not None and runtime.stream_key == "snapshot-secret"
+    assert destination_revision == 1
+    assert start_source == source
+    assert start_destinations == [destination]
+
+
 def test_app_paths_create_only_portable_local_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

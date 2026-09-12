@@ -56,10 +56,15 @@ class DatabasePort(Protocol):
     def open(self) -> object: ...
     def close(self) -> None: ...
     def get_source(self) -> SourceConfig | None: ...
+    def get_source_with_revision(self) -> tuple[SourceConfig | None, int]: ...
     def set_source(self, room_identity: str, preferred_quality: str | None, desired_running: bool) -> None: ...
     def delete_source(self) -> bool: ...
     def get_destination(self, kind: DestinationKind) -> DestinationConfig | None: ...
     def get_destination_runtime(self, kind: DestinationKind) -> RuntimeDestination | None: ...
+    def get_destination_with_revision(
+        self, kind: DestinationKind
+    ) -> tuple[DestinationConfig | None, RuntimeDestination | None, int]: ...
+    def configuration_snapshot(self) -> tuple[SourceConfig | None, list[DestinationConfig]]: ...
     def set_destination(
         self,
         kind: DestinationKind,
@@ -97,6 +102,7 @@ class ControllerPort(Protocol):
     async def initialize(self) -> None: ...
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
+    async def shutdown(self) -> None: ...
     async def snapshot(self) -> ControllerSnapshot: ...
     async def set_destination_enabled(self, identity: str, enabled: bool) -> None: ...
     async def apply_configuration(self) -> None: ...
@@ -174,9 +180,10 @@ def start_precondition_error(
 
 
 async def _destination_response(
-    deps: ApiDependencies, kind: DestinationKind
+    deps: ApiDependencies,
+    kind: DestinationKind,
+    config: DestinationConfig | None,
 ) -> DestinationResponse:
-    config = deps.database.get_destination(kind)
     statuses = {item.destination: item.state.value for item in (await deps.controller.snapshot()).outputs}
     return DestinationResponse(
         kind=_NAMES[kind],
@@ -222,8 +229,8 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
 
     @router.get("/api/source", response_model=SourceResponse)
     async def get_source(response: Response) -> SourceResponse:
-        source = deps.database.get_source()
-        response.headers["ETag"] = f'"{deps.database.get_api_revision("source")}"'
+        source, revision = deps.database.get_source_with_revision()
+        response.headers["ETag"] = f'"{revision}"'
         return SourceResponse(
             configured=source is not None,
             room_identity=source.room_identity if source else None,
@@ -239,9 +246,8 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
         resource = "source"
         async with deps.write_lock:
             expected = _required_revision(if_match)
-            revision = deps.database.get_api_revision(resource)
+            existing, revision = deps.database.get_source_with_revision()
             previous_revision = revision
-            existing = deps.database.get_source()
             unchanged = existing is not None and (
                 existing.room_identity,
                 existing.preferred_quality,
@@ -273,7 +279,9 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
                     await deps.controller.apply_configuration()
                     raise ApiError(500, "configuration_apply_failed", "Configuration was not applied") from exc
             response.headers["ETag"] = f'"{revision}"'
-            source = deps.database.get_source()
+            source, stored_revision = deps.database.get_source_with_revision()
+            if stored_revision != revision:
+                raise ApiError(500, "configuration_apply_failed", "Configuration was not applied")
         if source is None:
             raise ApiError(500, "internal_error", "Request could not be completed")
         return SourceResponse(configured=True, room_identity=source.room_identity, preferred_quality=source.preferred_quality)
@@ -281,8 +289,9 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
     @router.get("/api/destinations/{kind}", response_model=DestinationResponse)
     async def get_destination(kind: str, response: Response) -> DestinationResponse:
         selected = _kind(kind)
-        response.headers["ETag"] = f'"{deps.database.get_api_revision(f"destination:{kind}")}"'
-        return await _destination_response(deps, selected)
+        config, _runtime, revision = deps.database.get_destination_with_revision(selected)
+        response.headers["ETag"] = f'"{revision}"'
+        return await _destination_response(deps, selected, config)
 
     @router.put("/api/destinations/{kind}", response_model=DestinationResponse)
     async def put_destination(
@@ -294,8 +303,7 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
         selected = _kind(kind)
         resource = f"destination:{kind}"
         async with deps.write_lock:
-            current = deps.database.get_destination(selected)
-            runtime = deps.database.get_destination_runtime(selected) if current else None
+            current, runtime, revision = deps.database.get_destination_with_revision(selected)
             server = value.base_server or (runtime.base_server if runtime else None)
             key = value.stream_key.get_secret_value() if value.stream_key else (runtime.stream_key if runtime else None)
             enabled = value.enabled if value.enabled is not None else (current.enabled if current else True)
@@ -306,7 +314,6 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
                     "Destination configuration is incomplete",
                     {"body": "base_server and stream_key are required"},
                 )
-            revision = deps.database.get_api_revision(resource)
             previous_revision = revision
             unchanged = current is not None and runtime is not None and (
                 runtime.base_server,
@@ -344,29 +351,45 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
                     await deps.controller.apply_configuration()
                     raise ApiError(500, "configuration_apply_failed", "Configuration was not applied") from exc
             response.headers["ETag"] = f'"{revision}"'
-        return await _destination_response(deps, selected)
+            stored, _stored_runtime, stored_revision = deps.database.get_destination_with_revision(
+                selected
+            )
+            if stored_revision != revision:
+                raise ApiError(500, "configuration_apply_failed", "Configuration was not applied")
+        return await _destination_response(deps, selected, stored)
 
     @router.post("/api/control/start", response_model=ControlResponse)
     async def start(value: StartRequest) -> ControlResponse:
-        configured = {item.kind: item for item in deps.database.list_destinations() if item.configured and item.enabled}
-        real_ready = bool({DestinationKind.DOUYIN, DestinationKind.WECHAT} & configured.keys())
-        local_ready = DestinationKind.LOCAL_TEST in configured and deps.local_test_mode and value.local_test
-        if value.local_test and not deps.local_test_mode:
-            raise ApiError(409, "local_test_disabled", "Local test mode is not enabled")
-        precondition = start_precondition_error(
-            source_configured=deps.database.get_source() is not None,
-            real_ready=real_ready,
-            local_ready=local_ready,
-        )
-        if precondition is not None:
-            raise ApiError(409, precondition[0], precondition[1])
-        await deps.controller.start()
+        async with deps.write_lock:
+            source, destinations = deps.database.configuration_snapshot()
+            configured = {
+                item.kind: item for item in destinations if item.configured and item.enabled
+            }
+            real_ready = bool(
+                {DestinationKind.DOUYIN, DestinationKind.WECHAT} & configured.keys()
+            )
+            local_ready = (
+                DestinationKind.LOCAL_TEST in configured
+                and deps.local_test_mode
+                and value.local_test
+            )
+            if value.local_test and not deps.local_test_mode:
+                raise ApiError(409, "local_test_disabled", "Local test mode is not enabled")
+            precondition = start_precondition_error(
+                source_configured=source is not None,
+                real_ready=real_ready,
+                local_ready=local_ready,
+            )
+            if precondition is not None:
+                raise ApiError(409, precondition[0], precondition[1])
+            await deps.controller.start()
         return ControlResponse(status="started")
 
     @router.post("/api/control/stop", response_model=ControlResponse)
     async def stop(value: EmptyRequest) -> ControlResponse:
         del value
-        await deps.controller.stop()
+        async with deps.write_lock:
+            await deps.controller.stop()
         return ControlResponse(status="stopped")
 
     @router.post("/api/destinations/{kind}/reconnect", response_model=ReconnectResponse)

@@ -300,6 +300,13 @@ class Controller:
             self._task.add_done_callback(self._retrieve_task_exception)
 
     async def stop(self) -> None:
+        await self._stop(persist=True)
+
+    async def shutdown(self) -> None:
+        """Stop child processes without changing the persisted operator intent."""
+        await self._stop(persist=False)
+
+    async def _stop(self, *, persist: bool) -> None:
         async with self._lifecycle_lock:
             task = self._task
             task_error_detail: str | None = None
@@ -329,7 +336,8 @@ class Controller:
                 self._clear_resolved_recovery_state()
                 for identity in self._inputs:
                     self._inputs[identity] = OutputInput.NONE
-            await self._persist()
+            if persist:
+                await self._persist()
             self._task = None
 
     async def cancel(self) -> None:

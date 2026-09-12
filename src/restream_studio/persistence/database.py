@@ -667,6 +667,26 @@ class Database:
             raise DatabaseCorruptError("Persisted source configuration is invalid") from exc
         return SourceConfig(canonical, cast(str | None, row[1]), bool(row[2]))
 
+    def get_source_with_revision(self) -> tuple[SourceConfig | None, int]:
+        with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT room_identity, preferred_quality, desired_running FROM source_config "
+                    "WHERE singleton_id=1"
+                ).fetchone()
+                settings = connection.execute(
+                    "SELECT api_revisions_json FROM app_settings WHERE singleton_id=1"
+                ).fetchone()
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        source = self._source_from_row(row)
+        revisions = _parse_api_revisions(settings[0]) if settings is not None else {}
+        return source, revisions.get("source", 0)
+
     def set_destination(
         self,
         kind: DestinationKind,
@@ -744,6 +764,79 @@ class Database:
         if not secret.strip():
             raise DestinationSecretError("Decrypted destination secret is empty")
         return RuntimeDestination(kind, str(row[1]), server, secret, enabled)
+
+    def get_destination_with_revision(
+        self, kind: DestinationKind
+    ) -> tuple[DestinationConfig | None, RuntimeDestination | None, int]:
+        resource = f"destination:{_storage_kind(kind)}"
+        with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT kind, controller_identity, base_server, encrypted_stream_key, enabled "
+                    "FROM destination_config WHERE kind=?",
+                    (_storage_kind(kind),),
+                ).fetchone()
+                settings = connection.execute(
+                    "SELECT api_revisions_json FROM app_settings WHERE singleton_id=1"
+                ).fetchone()
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        revisions = _parse_api_revisions(settings[0]) if settings is not None else {}
+        if row is None:
+            return None, None, revisions.get(resource, 0)
+        server, enabled = _validated_destination_row(row)
+        try:
+            secret = self._decrypt_secret(str(row[3]))
+        except Exception as exc:
+            raise DestinationSecretError("Unable to decrypt destination secret") from exc
+        if not secret.strip():
+            raise DestinationSecretError("Decrypted destination secret is empty")
+        public = DestinationConfig(kind, str(row[1]), server, enabled, bool(row[3]))
+        runtime = RuntimeDestination(kind, str(row[1]), server, secret, enabled)
+        return public, runtime, revisions.get(resource, 0)
+
+    def configuration_snapshot(self) -> tuple[SourceConfig | None, list[DestinationConfig]]:
+        with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN")
+            try:
+                source_row = connection.execute(
+                    "SELECT room_identity, preferred_quality, desired_running FROM source_config "
+                    "WHERE singleton_id=1"
+                ).fetchone()
+                destination_rows = connection.execute(
+                    "SELECT kind, controller_identity, base_server, encrypted_stream_key, enabled "
+                    "FROM destination_config ORDER BY kind"
+                ).fetchall()
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        destinations: list[DestinationConfig] = []
+        for row in destination_rows:
+            try:
+                kind = _STORAGE_TO_KIND[str(row[0])]
+            except KeyError as exc:
+                raise DatabaseCorruptError("Persisted destination kind is invalid") from exc
+            server, enabled = _validated_destination_row(row)
+            destinations.append(DestinationConfig(kind, str(row[1]), server, enabled, bool(row[3])))
+        return self._source_from_row(source_row), destinations
+
+    @staticmethod
+    def _source_from_row(row: sqlite3.Row | None) -> SourceConfig | None:
+        if row is None:
+            return None
+        try:
+            canonical = normalize_douyin_url(str(row[0]))
+            if row[2] not in (0, 1):
+                raise ValueError("invalid desired state")
+        except (TypeError, ValueError) as exc:
+            raise DatabaseCorruptError("Persisted source configuration is invalid") from exc
+        return SourceConfig(canonical, cast(str | None, row[1]), bool(row[2]))
 
     def _destination_row(self, kind: DestinationKind) -> sqlite3.Row | None:
         with self._lock:

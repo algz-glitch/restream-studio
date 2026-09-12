@@ -206,6 +206,19 @@ def make_controller(
     return controller, clock, sleeper, douyin, wechat
 
 
+def test_shutdown_stops_processes_without_persisting_desired_state() -> None:
+    store = FakeStore(PersistedControllerState(CANONICAL_ROOM, True, ("primary",)))
+    controller, _, _, douyin, wechat = make_controller(FakeResolver([]), store=store)
+
+    drive(controller.initialize())
+    store.saved.clear()
+    drive(controller.shutdown())
+
+    assert store.saved == []
+    assert douyin.stop_count == 1
+    assert wechat.stop_count == 1
+
+
 def test_real_controller_store_round_trips_primary_secondary_identities(tmp_path: Path) -> None:
     paths = AppPaths.create(tmp_path / "controller-store")
     encrypt = lambda value: "cipher:" + value[::-1]

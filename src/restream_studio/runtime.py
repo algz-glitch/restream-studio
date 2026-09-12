@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import socket
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
+from restream_studio.destination_test import DestinationTester
 from restream_studio.domain import DestinationKind, MediaProbe, OutputState, SourceState
 from restream_studio.media.ffmpeg_commands import FfmpegCommand, build_ffmpeg_command
 from restream_studio.media.ffprobe import probe_media
@@ -17,6 +19,7 @@ from restream_studio.orchestration.controller import (
     Controller,
     ControllerSnapshot,
     MediaProbePort,
+    SourceFailure,
     StandbyMedia,
 )
 from restream_studio.outputs.supervisor import OutputSupervisor
@@ -142,18 +145,26 @@ class RuntimeManager:
         *,
         resolver_factory: Callable[[], LiveSourceResolver] = DouyinResolver,
         probe_factory: Callable[[], MediaProbePort] = _Probe,
+        destination_tester: DestinationTester | None = None,
     ) -> None:
         self._database = database
         self._resolver_factory = resolver_factory
         self._probe_factory = probe_factory
+        self._destination_tester = destination_tester or DestinationTester(
+            dns_validator=validate_destination_dns
+        )
         self._controller: Controller | None = None
         self._adapters: dict[DestinationKind, _DestinationAdapter] = {}
         self._lock = asyncio.Lock()
+        self._startup_failed = False
 
     async def initialize(self) -> None:
-        await self.apply_configuration()
+        await self._apply_configuration(suppress_resume_failure=True)
 
     async def apply_configuration(self) -> None:
+        await self._apply_configuration(suppress_resume_failure=False)
+
+    async def _apply_configuration(self, *, suppress_resume_failure: bool) -> None:
         async with self._lock:
             source = self._database.get_source()
             destinations = [
@@ -181,20 +192,36 @@ class RuntimeManager:
                     state_store=self._database,
                 )
                 await new_controller.initialize()
+            restored_running = (
+                (await new_controller.snapshot()).desired_running
+                if new_controller is not None
+                else False
+            )
             old = self._controller
             was_running = False
             if old is not None:
                 was_running = (await old.snapshot()).desired_running
                 try:
-                    await old.stop()
+                    await old.shutdown()
                 except BaseException:
                     if new_controller is not None:
-                        await new_controller.stop()
+                        await new_controller.shutdown()
                     raise
             self._controller = new_controller
             self._adapters = new_adapters
-            if was_running and has_enabled_destination and new_controller is not None:
-                await new_controller.start()
+            self._startup_failed = False
+            if (
+                (was_running or restored_running)
+                and has_enabled_destination
+                and new_controller is not None
+            ):
+                try:
+                    await new_controller.start()
+                except Exception:
+                    await new_controller.shutdown()
+                    self._startup_failed = True
+                    if not suppress_resume_failure:
+                        raise
 
     async def start(self) -> None:
         async with self._lock:
@@ -202,17 +229,34 @@ class RuntimeManager:
             if controller is None:
                 raise RuntimeBuildError("runtime is not configured")
             await controller.start()
+            self._startup_failed = False
 
     async def stop(self) -> None:
         async with self._lock:
             controller = self._controller
             if controller is not None:
                 await controller.stop()
+            self._startup_failed = False
+
+    async def shutdown(self) -> None:
+        async with self._lock:
+            controller = self._controller
+            if controller is not None:
+                await controller.shutdown()
 
     async def snapshot(self) -> ControllerSnapshot:
         controller = self._controller
         if controller is not None:
-            return await controller.snapshot()
+            snapshot = await controller.snapshot()
+            if self._startup_failed:
+                return replace(
+                    snapshot,
+                    desired_running=False,
+                    source_state=SourceState.ERROR,
+                    source_failure=SourceFailure.UNEXPECTED,
+                    error_detail=None,
+                )
+            return snapshot
         source = self._database.get_source()
         return ControllerSnapshot(
             source.room_identity if source else "https://live.douyin.com/unconfigured",
@@ -237,20 +281,9 @@ class RuntimeManager:
             await adapter.reconnect()
 
     async def test_destination(self, kind: DestinationKind, server: str, key: str) -> bool:
-        del key
-        await validate_destination_dns(kind, server)
-        parsed = urlsplit(server)
-        try:
-            _reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(parsed.hostname, parsed.port or (443 if parsed.scheme == "rtmps" else 1935)),
-                timeout=3.0,
-            )
-        except (OSError, TimeoutError):
-            return False
-        writer.close()
-        await writer.wait_closed()
-        return True
+        return await self._destination_tester.test(kind, server, key)
 
     def clear(self) -> None:
         self._controller = None
         self._adapters = {}
+        self._startup_failed = False

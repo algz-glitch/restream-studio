@@ -1,0 +1,13 @@
+Restream Studio third-party notices
+====================================
+
+This distribution includes FFmpeg and ffprobe. The package script copies the
+license shipped beside the selected FFmpeg build into licenses/FFmpeg-LICENSE.txt.
+FFmpeg source and licensing information: https://ffmpeg.org/legal.html
+
+Python and JavaScript dependencies retain their own license metadata. Exact
+dependency versions are recorded in metadata/pyproject.toml and
+metadata/package-lock.json inside the directory distribution. Their project
+metadata is also collected by PyInstaller where available.
+
+Restream Studio does not claim ownership of third-party components or trademarks.

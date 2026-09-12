@@ -100,7 +100,8 @@ def test_dual_target_restream_recovers_end_to_end() -> None:
             str(SCRIPT),
         ],
         cwd=ROOT,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
     )
     try:

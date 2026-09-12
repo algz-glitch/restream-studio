@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import secrets
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,10 +24,46 @@ from restream_studio.persistence.database import Database
 from restream_studio.runtime import RuntimeManager
 
 
+def _bundled_path(relative: str) -> Path | None:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if not getattr(sys, "frozen", False) or not isinstance(bundle_root, str):
+        return None
+    candidate = Path(bundle_root) / relative
+    return candidate if candidate.is_file() else None
+
+
+def _server_port() -> int:
+    raw = os.environ.get("RESTREAM_STUDIO_PORT", "8000")
+    try:
+        port = int(raw)
+    except ValueError:
+        raise ValueError("RESTREAM_STUDIO_PORT must be an integer") from None
+    if not 1024 <= port <= 65535:
+        raise ValueError("RESTREAM_STUDIO_PORT must be between 1024 and 65535")
+    return port
+
+
+def _tool_executable(name: str, environment_name: str) -> str:
+    configured = os.environ.get(environment_name)
+    if configured:
+        path = Path(configured).expanduser().resolve(strict=False)
+        if not path.is_file():
+            raise RuntimeError(f"{environment_name} points to a missing file")
+        return str(path)
+    bundled = _bundled_path(f"{name}.exe")
+    return str(bundled) if bundled is not None else name
+
+
 def _default_dependencies() -> ApiDependencies:
-    paths = AppPaths.create(Path.cwd() / "runtime")
+    configured_data = os.environ.get("RESTREAM_STUDIO_DATA_DIR")
+    default_data = None if getattr(sys, "frozen", False) else Path.cwd() / "runtime"
+    paths = AppPaths.create(configured_data or default_data)
     database = Database(paths.database_file, paths=paths)
-    runtime = RuntimeManager(database)
+    runtime = RuntimeManager(
+        database,
+        ffmpeg_executable=_tool_executable("ffmpeg", "FFMPEG_PATH"),
+        ffprobe_executable=_tool_executable("ffprobe", "FFPROBE_PATH"),
+    )
     return ApiDependencies(
         database,
         runtime,
@@ -205,7 +243,12 @@ app = create_app()
 
 
 def run() -> None:
-    uvicorn.run("restream_studio.main:app", host="127.0.0.1", port=8000, proxy_headers=False)
+    uvicorn.run(
+        "restream_studio.main:app",
+        host="127.0.0.1",
+        port=_server_port(),
+        proxy_headers=False,
+    )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from restream_studio.persistence.database import (
     DestinationSecretError,
     MigrationError,
     PathPolicyError,
+    RevisionConflictError,
 )
 
 
@@ -67,6 +68,40 @@ def db(
         database.close()
 
 
+def test_api_revision_persists_across_reopen(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    first = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    ).open()
+    first.set_api_revision("source", 7)
+    first.set_api_revision("destination:douyin", 3)
+    first.close()
+
+    reopened = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    ).open()
+    try:
+        assert reopened.get_api_revision("source") == 7
+        assert reopened.get_api_revision("destination:douyin") == 3
+    finally:
+        reopened.close()
+
+
+def test_revisioned_source_write_is_one_stale_checked_transaction(db: Database) -> None:
+    assert db.set_source_revisioned(
+        "https://live.douyin.com/first", None, False, expected_revision=0
+    ) == 1
+    with pytest.raises(RevisionConflictError):
+        db.set_source_revisioned(
+            "https://live.douyin.com/stale", "origin", False, expected_revision=0
+        )
+    source = db.get_source()
+    assert source is not None
+    assert source.room_identity == "https://live.douyin.com/first"
+    assert db.get_api_revision("source") == 1
+
+
 def test_app_paths_create_only_portable_local_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -97,7 +132,7 @@ def test_first_open_creates_exact_schema_and_pragmas_and_reopen_is_idempotent(
     with Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
     ) as database:
-        assert database.schema_version == 3
+        assert database.schema_version == 4
         assert cast(str, database.pragma("journal_mode")).lower() == "wal"
         assert database.pragma("foreign_keys") == 1
         assert database.pragma("busy_timeout") == 5_000
@@ -119,7 +154,7 @@ def test_first_open_creates_exact_schema_and_pragmas_and_reopen_is_idempotent(
     with Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
     ) as reopened:
-        assert reopened.schema_version == 3
+        assert reopened.schema_version == 4
 
 
 def test_close_is_idempotent_and_operations_after_close_are_explicit(
@@ -170,7 +205,7 @@ def test_failed_migration_rolls_back_schema_and_version(
     database.close()
 
     with sqlite3.connect(paths.database_file) as connection:
-        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 3
+        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 4
         assert (
             connection.execute(
                 "SELECT count(*) FROM sqlite_master WHERE name='must_rollback'"
@@ -695,7 +730,7 @@ def test_two_database_instances_can_open_and_migrate_concurrently(
             database.close()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        assert list(executor.map(opener, range(2))) == [3, 3]
+        assert list(executor.map(opener, range(2))) == [4, 4]
 
 
 def test_open_rejects_schema_version_that_claims_missing_schema(

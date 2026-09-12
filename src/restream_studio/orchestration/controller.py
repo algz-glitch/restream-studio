@@ -195,8 +195,8 @@ class Controller:
         minimum_url_validity: float = 30.0,
         monitor_interval: float = 3.0,
     ) -> None:
-        if len(destinations) < 2:
-            raise ValueError("controller requires at least two destination supervisors")
+        if not destinations:
+            raise ValueError("controller requires at least one destination supervisor")
         identities = tuple(destination.identity for destination in destinations)
         if len(set(identities)) != len(identities):
             raise ValueError("destination identities must be unique")

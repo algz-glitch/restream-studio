@@ -18,31 +18,20 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from restream_studio.api.routes import ApiDependencies, ApiError, install_routes
 from restream_studio.config import AppPaths
-from restream_studio.domain import SourceState
-from restream_studio.orchestration.controller import ControllerSnapshot
 from restream_studio.persistence.database import Database
-
-
-class _IdleController:
-    async def initialize(self) -> None:
-        return None
-
-    async def start(self) -> None:
-        return None
-
-    async def stop(self) -> None:
-        return None
-
-    async def snapshot(self) -> ControllerSnapshot:
-        return ControllerSnapshot("https://live.douyin.com/unconfigured", False, SourceState.STOPPED, None, None, 0, ())
-
-    async def set_destination_enabled(self, identity: str, enabled: bool) -> None:
-        del identity, enabled
+from restream_studio.runtime import RuntimeManager
 
 
 def _default_dependencies() -> ApiDependencies:
     paths = AppPaths.create(Path.cwd() / "runtime")
-    return ApiDependencies(Database(paths.database_file, paths=paths), _IdleController())
+    database = Database(paths.database_file, paths=paths)
+    runtime = RuntimeManager(database)
+    return ApiDependencies(
+        database,
+        runtime,
+        reconnect_destination=runtime.reconnect_destination,
+        test_destination=runtime.test_destination,
+    )
 
 
 def _request_id(request: Request) -> str:
@@ -126,6 +115,7 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.session_token = secrets.token_urlsafe(32)
+        application.state.dependencies = deps
         deps.database.open()
         try:
             await deps.controller.initialize()
@@ -134,6 +124,9 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
             try:
                 await deps.controller.stop()
             finally:
+                deps.controller.clear()
+                application.state.session_token = ""
+                application.state.dependencies = None
                 deps.database.close()
 
     application = FastAPI(
@@ -160,6 +153,12 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
             token = request.headers.get("x-restream-session", "")
             if not mutation_is_authorized(origin, host, token, application.state.session_token):
                 return _error(request, 403, "request_forbidden", "Origin or session token is invalid")
+        if (
+            request.method in {"GET", "HEAD"}
+            and request.url.path == "/api/session"
+            and not _origin_matches_host(request.headers.get("origin", ""), host)
+        ):
+            return _error(request, 403, "request_forbidden", "Origin is invalid")
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers["Cache-Control"] = "no-store"

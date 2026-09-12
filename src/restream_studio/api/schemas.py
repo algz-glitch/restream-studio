@@ -61,7 +61,7 @@ class SourceUpdate(StrictModel):
 class DestinationUpdate(StrictModel):
     base_server: Annotated[StrictStr, Field(min_length=1, max_length=256)] | None = None
     stream_key: Annotated[SecretStr, Field(min_length=8, max_length=512)] | None = None
-    enabled: StrictBool = True
+    enabled: StrictBool | None = None
 
     @field_validator("base_server")
     @classmethod
@@ -129,6 +129,10 @@ class DestinationResponse(StrictModel):
 
 class ControlResponse(StrictModel):
     status: Literal["started", "stopped"]
+
+
+class SessionResponse(StrictModel):
+    session_token: str
 
 
 class ReconnectResponse(StrictModel):

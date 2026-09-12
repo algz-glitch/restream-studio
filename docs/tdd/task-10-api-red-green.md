@@ -101,4 +101,55 @@ RTMP(S) host validation now rejects all whitespace, malformed
 DNS labels, malformed or nonglobal IP literals, userinfo, controls, missing hosts, unsafe ports,
 and key-bearing paths. Pure schema/helper tests avoid network and lifecycle dependencies. Start
 validation now preserves the established error order: destination readiness first, then source
-configuration. The full file now collects 39 test cases.
+configuration. After the quality review additions, the full file collects 46 test cases.
+
+## Quality review closure
+
+The P0 quality review removes the placeholder controller. `RuntimeManager` now reads only complete
+database configuration and dynamically assembles `DouyinResolver`, the bounded media probe,
+credential-bearing destination adapters, `OutputSupervisor` instances, and a real `Controller`.
+No dummy stream key is synthesized. Default reconnect and short connection-test callbacks are the
+runtime methods; tests can still inject deterministic substitutes without platform access.
+
+Configuration PUT operations now hold one async write lock across persistence and runtime rebuild.
+They merge omitted destination fields, rebuild from the new source/server/key/enabled values, and
+restore the prior database snapshot plus runtime when application fails. A running controller is
+stopped before the replacement is exposed and the replacement resumes when the old runtime was
+running. Concurrent stale writes return 409, while a byte-for-byte semantic retry is idempotent.
+
+Migration 4 adds a checked JSON revision map to the existing singleton `app_settings` table.
+Source and each destination have independent persisted revisions. GET emits an ETag, PUT requires
+quoted `If-Match`, and successful semantic changes increment the persisted value. A reopen test
+proved source revision 7 and destination revision 3 survive database close/open.
+
+Real destinations perform asynchronous DNS resolution immediately before a test or FFmpeg
+connection and reject the operation if any returned address is loopback, private, link-local,
+reserved, or otherwise non-global. Explicit `local_test` accepts only loopback resolution, with
+`localhost` supported. DNS can change between validation and the child process connection; this
+TOCTOU residual remains bounded by revalidation on every reconnect and cannot be eliminated
+without pinning an address, which would change TLS/SNI and platform routing semantics. No fixed
+SNI is fabricated.
+
+`GET /api/session` is Host-checked, exact-origin checked, non-cacheable, and returns the generated
+session token only during an active lifespan. Shutdown clears the token, app dependency reference,
+and runtime references before closing SQLite; a later lifespan generates a different token. The
+API catch-all precedes static assets and covers GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE,
+and CONNECT with the same JSON 404.
+
+Additional focused evidence:
+
+```text
+14 pure schema/handler/security/runtime tests passed
+29 ffmpeg command regressions passed
+59 database tests passed, including persisted-revision reopen and stale transactional write
+ASGI lifecycle/session/etag/catchall: PASS
+ASGI persisted-write/runtime-apply rollback: PASS
+default RuntimeManager unconfigured/start guard: PASS
+RuntimeManager real Controller start/stop with offline injected resolver: PASS
+ruff: All checks passed
+mypy: Success, 40 source files
+```
+
+The full TestClient suite remains subject to the recorded managed-host event-loop socket-pair
+restriction. The direct ASGI checks use no platform network and the DNS policy test injects fixed
+answers. Production DNS/TCP functions were not invoked by tests.

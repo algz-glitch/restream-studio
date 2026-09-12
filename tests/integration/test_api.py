@@ -36,6 +36,7 @@ class FakeDatabase:
         self.events: list[EventRecord] = []
         self.opened = False
         self.closed = False
+        self.revisions: dict[str, int] = {}
 
     def open(self) -> FakeDatabase:
         self.opened = True
@@ -51,6 +52,11 @@ class FakeDatabase:
         from restream_studio.source import normalize_douyin_url
 
         self.source = SourceConfig(normalize_douyin_url(room_identity), preferred_quality, desired_running)
+
+    def delete_source(self) -> bool:
+        existed = self.source is not None
+        self.source = None
+        return existed
 
     def get_destination(self, kind: DestinationKind) -> DestinationConfig | None:
         item = self.destinations.get(kind)
@@ -83,6 +89,45 @@ class FakeDatabase:
     def list_events(self, *, limit: int = 100) -> list[EventRecord]:
         return self.events[:limit]
 
+    def delete_destination(self, kind: DestinationKind) -> bool:
+        return self.destinations.pop(kind, None) is not None
+
+    def get_api_revision(self, resource: str) -> int:
+        return self.revisions.get(resource, 0)
+
+    def set_api_revision(self, resource: str, revision: int) -> None:
+        self.revisions[resource] = revision
+
+    def set_source_revisioned(
+        self,
+        room_identity: str,
+        preferred_quality: str | None,
+        desired_running: bool,
+        *,
+        expected_revision: int,
+    ) -> int:
+        assert self.get_api_revision("source") == expected_revision
+        self.set_source(room_identity, preferred_quality, desired_running)
+        revision = expected_revision + 1
+        self.set_api_revision("source", revision)
+        return revision
+
+    def set_destination_revisioned(
+        self,
+        kind: DestinationKind,
+        base_server: str,
+        stream_key: str,
+        *,
+        enabled: bool,
+        expected_revision: int,
+    ) -> int:
+        resource = f"destination:{kind.name.lower() if kind is not DestinationKind.WECHAT else 'wechat_channels'}"
+        assert self.get_api_revision(resource) == expected_revision
+        self.set_destination(kind, base_server, stream_key, enabled=enabled)
+        revision = expected_revision + 1
+        self.set_api_revision(resource, revision)
+        return revision
+
 
 class FakeController:
     def __init__(self) -> None:
@@ -90,6 +135,7 @@ class FakeController:
         self.stopped = 0
         self.initialized = 0
         self.enabled_calls: list[tuple[str, bool]] = []
+        self.applied = 0
 
     async def initialize(self) -> None:
         self.initialized += 1
@@ -134,6 +180,12 @@ class FakeController:
     async def set_destination_enabled(self, identity: str, enabled: bool) -> None:
         self.enabled_calls.append((identity, enabled))
 
+    async def apply_configuration(self) -> None:
+        self.applied += 1
+
+    def clear(self) -> None:
+        return None
+
 
 @dataclass
 class Harness:
@@ -173,7 +225,11 @@ def app(harness: Harness) -> FastAPI:
 def client(app: FastAPI) -> Iterator[TestClient]:
     with TestClient(app, headers={"host": "localhost"}) as test_client:
         test_client.headers.update(
-            {"origin": "http://localhost", "x-restream-session": app.state.session_token}
+            {
+                "origin": "http://localhost",
+                "x-restream-session": app.state.session_token,
+                "if-match": '"0"',
+            }
         )
         yield test_client
 
@@ -459,3 +515,164 @@ def test_pure_start_precondition_orders_destination_before_source() -> None:
         "source_required",
         "A source configuration is required",
     )
+
+
+def test_destination_put_merges_omitted_enabled_and_secret(client: TestClient, harness: Harness) -> None:
+    first = client.put(
+        "/api/destinations/douyin",
+        json={"base_server": "rtmps://publish.invalid/live", "stream_key": SECRET, "enabled": True},
+    )
+    assert first.headers["etag"] == '"1"'
+    second = client.put(
+        "/api/destinations/douyin",
+        headers={"if-match": '"1"'},
+        json={"base_server": "rtmps://new-publish.invalid/live"},
+    )
+    assert second.status_code == 200
+    assert second.json()["enabled"] is True
+    assert harness.db.destinations[DestinationKind.DOUYIN]["stream_key"] == SECRET
+
+
+def test_put_requires_persisted_if_match(client: TestClient) -> None:
+    del client.headers["if-match"]
+    response = client.put("/api/source", json={"room_url": CANONICAL})
+    assert response.status_code == 428
+    assert response.json()["error"]["code"] == "precondition_required"
+
+
+def test_runtime_apply_failure_rolls_back_database_and_revision(
+    client: TestClient, harness: Harness
+) -> None:
+    client.put("/api/source", json={"room_url": CANONICAL})
+    old = harness.db.source
+    calls = 0
+
+    async def fail_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("internal path and secret must not escape")
+
+    harness.controller.apply_configuration = fail_once  # type: ignore[method-assign]
+    response = client.put(
+        "/api/source",
+        headers={"if-match": '"1"'},
+        json={"room_url": "https://live.douyin.com/999"},
+    )
+    assert response.status_code == 500
+    assert harness.db.source == old
+    assert harness.db.get_api_revision("source") == 1
+    assert "internal path" not in response.text
+
+
+def test_session_bootstrap_lifespan_reuse_and_api_catchall(app: FastAPI) -> None:
+    with TestClient(app, headers={"host": "localhost", "origin": "http://localhost"}) as first:
+        old_token = first.get("/api/session").json()["session_token"]
+        assert old_token
+        assert first.options(
+            "/api/missing",
+            headers={"x-restream-session": old_token},
+        ).status_code == 404
+        head = first.head("/api/missing")
+        assert head.status_code == 404
+        assert head.headers["content-type"].startswith("application/json")
+    assert app.state.session_token == ""
+    assert app.state.dependencies is None
+    with TestClient(app, headers={"host": "localhost", "origin": "http://localhost"}) as second:
+        new_token = second.get("/api/session").json()["session_token"]
+        assert new_token != old_token
+        rejected = second.put(
+            "/api/source",
+            headers={"x-restream-session": old_token, "if-match": '"0"'},
+            json={"room_url": CANONICAL},
+        )
+        assert rejected.status_code == 403
+
+
+def test_pure_default_factory_uses_runtime_manager() -> None:
+    from restream_studio.main import _default_dependencies
+    from restream_studio.runtime import RuntimeManager
+
+    dependencies = _default_dependencies()
+    assert isinstance(dependencies.controller, RuntimeManager)
+    assert dependencies.reconnect_destination == dependencies.controller.reconnect_destination
+    assert dependencies.test_destination == dependencies.controller.test_destination
+
+
+def test_pure_default_factory_wires_runtime_start_reconnect_and_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import restream_studio.main as main_module
+    from restream_studio.config import AppPaths
+
+    calls: list[str] = []
+    database = object()
+
+    class RuntimeSpy(FakeController):
+        def __init__(self, configured_database: object) -> None:
+            super().__init__()
+            assert configured_database is database
+
+        async def start(self) -> None:
+            calls.append("start")
+
+        async def reconnect_destination(self, kind: DestinationKind) -> None:
+            calls.append(f"reconnect:{kind.value}")
+
+        async def test_destination(self, kind: DestinationKind, server: str, key: str) -> bool:
+            del server, key
+            calls.append(f"test:{kind.value}")
+            return True
+
+    paths = AppPaths(Path("."), Path("."), Path("."), Path("."), Path("runtime.db"))
+    monkeypatch.setattr(AppPaths, "create", lambda value: paths)
+    monkeypatch.setattr(main_module, "Database", lambda *args, **kwargs: database)
+    monkeypatch.setattr(main_module, "RuntimeManager", RuntimeSpy)
+    dependencies = main_module._default_dependencies()
+
+    def finish(coroutine: Any) -> Any:
+        iterator = coroutine.__await__()
+        try:
+            iterator.send(None)
+        except StopIteration as stopped:
+            return stopped.value
+        raise AssertionError("spy coroutine unexpectedly suspended")
+
+    finish(dependencies.controller.start())
+    finish(dependencies.reconnect_destination(DestinationKind.DOUYIN))
+    assert finish(
+        dependencies.test_destination(
+            DestinationKind.DOUYIN, "rtmps://publish.invalid/live", SECRET
+        )
+    )
+    assert calls == ["start", "reconnect:DOUYIN", "test:DOUYIN"]
+
+
+def test_pure_dns_policy_checks_every_answer_and_allows_explicit_localhost() -> None:
+    from collections.abc import Coroutine
+
+    from restream_studio.runtime import RuntimeBuildError, validate_destination_dns
+
+    def run_immediate(value: Coroutine[object, object, tuple[str, ...]]) -> tuple[str, ...]:
+        iterator = value.__await__()
+        try:
+            iterator.send(None)
+        except StopIteration as stopped:
+            return cast(tuple[str, ...], stopped.value)
+        raise AssertionError("DNS policy unexpectedly suspended")
+
+    async def mixed_answers(host: str, port: int) -> tuple[str, ...]:
+        del host, port
+        return ("8.8.8.8", "127.0.0.1")
+
+    with pytest.raises(RuntimeBuildError):
+        run_immediate(
+            validate_destination_dns(
+                DestinationKind.DOUYIN,
+                "rtmps://publish.invalid/live",
+                resolver=mixed_answers,
+            )
+        )
+    assert run_immediate(
+        validate_destination_dns(DestinationKind.LOCAL_TEST, "rtmp://localhost/live")
+    ) == ("127.0.0.1", "::1")

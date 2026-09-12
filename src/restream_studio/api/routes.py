@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +15,7 @@ from restream_studio.orchestration.controller import ControllerSnapshot
 from restream_studio.persistence.database import (
     DestinationConfig,
     EventRecord,
+    RevisionConflictError,
     RuntimeDestination,
     SourceConfig,
 )
@@ -31,6 +30,7 @@ from .schemas import (
     EventResponse,
     EventsResponse,
     ReconnectResponse,
+    SessionResponse,
     SourceResponse,
     SourceUpdate,
     StartRequest,
@@ -57,6 +57,7 @@ class DatabasePort(Protocol):
     def close(self) -> None: ...
     def get_source(self) -> SourceConfig | None: ...
     def set_source(self, room_identity: str, preferred_quality: str | None, desired_running: bool) -> None: ...
+    def delete_source(self) -> bool: ...
     def get_destination(self, kind: DestinationKind) -> DestinationConfig | None: ...
     def get_destination_runtime(self, kind: DestinationKind) -> RuntimeDestination | None: ...
     def set_destination(
@@ -70,6 +71,26 @@ class DatabasePort(Protocol):
     ) -> None: ...
     def list_destinations(self) -> list[DestinationConfig]: ...
     def list_events(self, *, limit: int = 100) -> list[EventRecord]: ...
+    def delete_destination(self, kind: DestinationKind) -> bool: ...
+    def get_api_revision(self, resource: str) -> int: ...
+    def set_api_revision(self, resource: str, revision: int) -> None: ...
+    def set_source_revisioned(
+        self,
+        room_identity: str,
+        preferred_quality: str | None,
+        desired_running: bool,
+        *,
+        expected_revision: int,
+    ) -> int: ...
+    def set_destination_revisioned(
+        self,
+        kind: DestinationKind,
+        base_server: str,
+        stream_key: str,
+        *,
+        enabled: bool,
+        expected_revision: int,
+    ) -> int: ...
 
 
 class ControllerPort(Protocol):
@@ -78,6 +99,8 @@ class ControllerPort(Protocol):
     async def stop(self) -> None: ...
     async def snapshot(self) -> ControllerSnapshot: ...
     async def set_destination_enabled(self, identity: str, enabled: bool) -> None: ...
+    async def apply_configuration(self) -> None: ...
+    def clear(self) -> None: ...
 
 
 DestinationAction = Callable[[DestinationKind], Awaitable[None]]
@@ -102,9 +125,7 @@ class ApiDependencies:
     test_destination: DestinationTest = _unavailable_test
     local_test_mode: bool = False
     assets_dir: Path | None = None
-    write_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
-    revisions: dict[str, int] = field(default_factory=dict, repr=False)
-    fingerprints: dict[str, str] = field(default_factory=dict, repr=False)
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class ApiError(Exception):
@@ -134,18 +155,11 @@ def _revision(if_match: str | None) -> int | None:
     return int(raw)
 
 
-def _fingerprint(*values: object) -> str:
-    encoded = "\x1f".join(str(value) for value in values).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _check_write(deps: ApiDependencies, resource: str, expected: int | None, fingerprint: str) -> bool:
-    current = deps.revisions.get(resource, 0)
-    if expected is not None and expected != current:
-        if deps.fingerprints.get(resource) == fingerprint:
-            return False
-        raise ApiError(409, "write_conflict", "Configuration changed; reload and retry")
-    return deps.fingerprints.get(resource) != fingerprint
+def _required_revision(if_match: str | None) -> int:
+    revision = _revision(if_match)
+    if revision is None:
+        raise ApiError(428, "precondition_required", "If-Match revision is required")
+    return revision
 
 
 def start_precondition_error(
@@ -199,9 +213,17 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
             ],
         )
 
+    @router.get("/api/session", response_model=SessionResponse)
+    async def session(request: Request) -> SessionResponse:
+        token = str(getattr(request.app.state, "session_token", ""))
+        if not token:
+            raise ApiError(503, "session_unavailable", "Session is not initialized")
+        return SessionResponse(session_token=token)
+
     @router.get("/api/source", response_model=SourceResponse)
-    async def get_source() -> SourceResponse:
+    async def get_source(response: Response) -> SourceResponse:
         source = deps.database.get_source()
+        response.headers["ETag"] = f'"{deps.database.get_api_revision("source")}"'
         return SourceResponse(
             configured=source is not None,
             room_identity=source.room_identity if source else None,
@@ -214,28 +236,53 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
         response: Response,
         if_match: str | None = Header(default=None, max_length=24),
     ) -> SourceResponse:
-        fingerprint = _fingerprint(value.room_url, value.preferred_quality)
         resource = "source"
-        with deps.write_lock:
-            expected = _revision(if_match)
-            if _check_write(deps, resource, expected, fingerprint):
-                existing = deps.database.get_source()
-                deps.database.set_source(
-                    value.room_url,
-                    value.preferred_quality,
-                    existing.desired_running if existing else False,
-                )
-                deps.revisions[resource] = deps.revisions.get(resource, 0) + 1
-                deps.fingerprints[resource] = fingerprint
-            response.headers["ETag"] = f'"{deps.revisions.get(resource, 0)}"'
+        async with deps.write_lock:
+            expected = _required_revision(if_match)
+            revision = deps.database.get_api_revision(resource)
+            previous_revision = revision
+            existing = deps.database.get_source()
+            unchanged = existing is not None and (
+                existing.room_identity,
+                existing.preferred_quality,
+            ) == (value.room_url, value.preferred_quality)
+            if expected != revision and not unchanged:
+                raise ApiError(409, "write_conflict", "Configuration changed; reload and retry")
+            if not unchanged:
+                try:
+                    revision = deps.database.set_source_revisioned(
+                        value.room_url,
+                        value.preferred_quality,
+                        existing.desired_running if existing else False,
+                        expected_revision=revision,
+                    )
+                except RevisionConflictError as exc:
+                    raise ApiError(409, "write_conflict", "Configuration changed; reload and retry") from exc
+                try:
+                    await deps.controller.apply_configuration()
+                except Exception as exc:
+                    if existing is None:
+                        deps.database.delete_source()
+                    else:
+                        deps.database.set_source(
+                            existing.room_identity,
+                            existing.preferred_quality,
+                            existing.desired_running,
+                        )
+                    deps.database.set_api_revision(resource, previous_revision)
+                    await deps.controller.apply_configuration()
+                    raise ApiError(500, "configuration_apply_failed", "Configuration was not applied") from exc
+            response.headers["ETag"] = f'"{revision}"'
             source = deps.database.get_source()
         if source is None:
             raise ApiError(500, "internal_error", "Request could not be completed")
         return SourceResponse(configured=True, room_identity=source.room_identity, preferred_quality=source.preferred_quality)
 
     @router.get("/api/destinations/{kind}", response_model=DestinationResponse)
-    async def get_destination(kind: str) -> DestinationResponse:
-        return await _destination_response(deps, _kind(kind))
+    async def get_destination(kind: str, response: Response) -> DestinationResponse:
+        selected = _kind(kind)
+        response.headers["ETag"] = f'"{deps.database.get_api_revision(f"destination:{kind}")}"'
+        return await _destination_response(deps, selected)
 
     @router.put("/api/destinations/{kind}", response_model=DestinationResponse)
     async def put_destination(
@@ -246,11 +293,12 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
     ) -> DestinationResponse:
         selected = _kind(kind)
         resource = f"destination:{kind}"
-        with deps.write_lock:
+        async with deps.write_lock:
             current = deps.database.get_destination(selected)
             runtime = deps.database.get_destination_runtime(selected) if current else None
             server = value.base_server or (runtime.base_server if runtime else None)
             key = value.stream_key.get_secret_value() if value.stream_key else (runtime.stream_key if runtime else None)
+            enabled = value.enabled if value.enabled is not None else (current.enabled if current else True)
             if server is None or key is None:
                 raise ApiError(
                     422,
@@ -258,17 +306,44 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
                     "Destination configuration is incomplete",
                     {"body": "base_server and stream_key are required"},
                 )
-            fingerprint = _fingerprint(server, key, value.enabled)
-            expected = _revision(if_match)
-            if _check_write(deps, resource, expected, fingerprint):
-                deps.database.set_destination(selected, server, key, enabled=value.enabled)
-                deps.revisions[resource] = deps.revisions.get(resource, 0) + 1
-                deps.fingerprints[resource] = fingerprint
-            response.headers["ETag"] = f'"{deps.revisions.get(resource, 0)}"'
-        snapshot = await deps.controller.snapshot()
-        identity = next((item.identity for item in snapshot.outputs if item.destination is selected), None)
-        if identity is not None:
-            await deps.controller.set_destination_enabled(identity, value.enabled)
+            revision = deps.database.get_api_revision(resource)
+            previous_revision = revision
+            unchanged = current is not None and runtime is not None and (
+                runtime.base_server,
+                runtime.stream_key,
+                current.enabled,
+            ) == (server, key, enabled)
+            expected = _required_revision(if_match)
+            if expected != revision and not unchanged:
+                raise ApiError(409, "write_conflict", "Configuration changed; reload and retry")
+            if not unchanged:
+                try:
+                    revision = deps.database.set_destination_revisioned(
+                        selected,
+                        server,
+                        key,
+                        enabled=enabled,
+                        expected_revision=revision,
+                    )
+                except RevisionConflictError as exc:
+                    raise ApiError(409, "write_conflict", "Configuration changed; reload and retry") from exc
+                try:
+                    await deps.controller.apply_configuration()
+                except Exception as exc:
+                    if current is None or runtime is None:
+                        deps.database.delete_destination(selected)
+                    else:
+                        deps.database.set_destination(
+                            selected,
+                            runtime.base_server,
+                            runtime.stream_key,
+                            enabled=current.enabled,
+                            controller_identity=current.controller_identity,
+                        )
+                    deps.database.set_api_revision(resource, previous_revision)
+                    await deps.controller.apply_configuration()
+                    raise ApiError(500, "configuration_apply_failed", "Configuration was not applied") from exc
+            response.headers["ETag"] = f'"{revision}"'
         return await _destination_response(deps, selected)
 
     @router.post("/api/control/start", response_model=ControlResponse)
@@ -350,7 +425,21 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
             )
         return EventsResponse(items=items, next_cursor=items[-1].id if items else None)
 
-    @router.api_route("/api/{unmatched:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+    @router.api_route(
+        "/api/{unmatched:path}",
+        methods=[
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "HEAD",
+            "OPTIONS",
+            "TRACE",
+            "CONNECT",
+        ],
+        include_in_schema=False,
+    )
     async def api_not_found(unmatched: str, request: Request) -> None:
         del unmatched, request
         raise ApiError(404, "not_found", "Resource not found")

@@ -45,7 +45,7 @@ _PRESETS = {
 }
 
 
-def _destination_url(value: str) -> str:
+def _destination_url(value: str, *, allow_loopback: bool = False) -> str:
     if not isinstance(value, str) or not value or any(
         ord(character) < 32 or ord(character) == 127 for character in value
     ):
@@ -65,10 +65,10 @@ def _destination_url(value: str) -> str:
     try:
         address = ipaddress.ip_address(host.rstrip("."))
     except ValueError:
-        if host.casefold().rstrip(".") == "localhost":
+        if host.casefold().rstrip(".") == "localhost" and not allow_loopback:
             raise CommandValidationError("output URL host must be public") from None
     else:
-        if not address.is_global:
+        if not address.is_global and not (allow_loopback and address.is_loopback):
             raise CommandValidationError("output URL IP address must be public")
     return value
 
@@ -120,7 +120,9 @@ def build_ffmpeg_command(
         source = validate_input_url(source_url)
     except MediaProbeError as exc:
         raise CommandValidationError(str(exc)) from None
-    output = _destination_url(destination_url)
+    output = _destination_url(
+        destination_url, allow_loopback=destination is DestinationKind.LOCAL_TEST
+    )
     try:
         preset = _PRESETS[destination]
     except KeyError as exc:

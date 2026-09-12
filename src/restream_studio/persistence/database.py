@@ -28,6 +28,7 @@ _BUSY_TIMEOUT_MS: Final = 5_000
 _EVENT_LIMIT: Final = 5_000
 _SAFE_EVENT_NAME: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _SAFE_CONTROLLER_IDENTITY: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_API_RESOURCE: Final = re.compile(r"^(?:source|destination:(?:douyin|wechat_channels|local_test))$")
 _URL_IN_TEXT: Final = re.compile(r"(?i)\b(?:https?|rtmps?)://[^\s\"'<>]+")
 _SECRET_ASSIGNMENT: Final = re.compile(
     r"(?i)\b(stream[_-]?key|token|password|passwd|secret|authorization|cookie)"
@@ -67,6 +68,10 @@ class DestinationSecretError(DatabaseError, ValueError):
 
 class PathPolicyError(DatabaseError, ValueError):
     """Raised when standby media is outside trusted local roots."""
+
+
+class RevisionConflictError(DatabaseError):
+    """Raised when a persisted API revision precondition is stale."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,7 +353,18 @@ def _migration_3(connection: sqlite3.Connection) -> None:
         )
 
 
-MIGRATIONS: tuple[Migration, ...] = (_migration_1, _migration_2, _migration_3)
+def _migration_4(connection: sqlite3.Connection) -> None:
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings'"
+    ).fetchone() is None:
+        raise DatabaseCorruptError("Database schema is incomplete")
+    connection.execute(
+        "ALTER TABLE app_settings ADD COLUMN api_revisions_json TEXT NOT NULL "
+        "DEFAULT '{}' CHECK(json_valid(api_revisions_json))"
+    )
+
+
+MIGRATIONS: tuple[Migration, ...] = (_migration_1, _migration_2, _migration_3, _migration_4)
 
 
 class Database:
@@ -544,6 +560,7 @@ class Database:
                 "backoff_initial_seconds",
                 "backoff_max_seconds",
                 "updated_at",
+                "api_revisions_json",
             },
             "events": {"id", "created_at", "level", "event_type", "payload_json"},
         }
@@ -768,6 +785,117 @@ class Database:
                 "DELETE FROM destination_config WHERE kind=?", (_storage_kind(kind),)
             )
             return cursor.rowcount == 1
+
+    def delete_source(self) -> bool:
+        with self.transaction() as connection:
+            return connection.execute("DELETE FROM source_config WHERE singleton_id=1").rowcount == 1
+
+    def get_api_revision(self, resource: str) -> int:
+        _validate_api_resource(resource)
+        with self._lock:
+            row = self._require_connection().execute(
+                "SELECT api_revisions_json FROM app_settings WHERE singleton_id=1"
+            ).fetchone()
+        if row is None:
+            return 0
+        revisions = _parse_api_revisions(row[0])
+        return revisions.get(resource, 0)
+
+    def set_api_revision(self, resource: str, revision: int) -> None:
+        _validate_api_resource(resource)
+        if not 0 <= revision <= 2_147_483_647:
+            raise ValueError("API revision is out of bounds")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT api_revisions_json FROM app_settings WHERE singleton_id=1"
+            ).fetchone()
+            revisions = _parse_api_revisions(row[0]) if row is not None else {}
+            revisions[resource] = revision
+            encoded = json.dumps(revisions, separators=(",", ":"), sort_keys=True)
+            connection.execute(
+                "INSERT INTO app_settings(singleton_id, standby_file, backoff_initial_seconds, "
+                "backoff_max_seconds, updated_at, api_revisions_json) VALUES(1,NULL,2.0,30.0,?,?) "
+                "ON CONFLICT(singleton_id) DO UPDATE SET api_revisions_json=excluded.api_revisions_json, "
+                "updated_at=excluded.updated_at",
+                (_now(), encoded),
+            )
+
+    def set_source_revisioned(
+        self,
+        room_identity: str,
+        preferred_quality: str | None,
+        desired_running: bool,
+        *,
+        expected_revision: int,
+    ) -> int:
+        canonical = normalize_douyin_url(room_identity)
+        quality = preferred_quality.strip() if preferred_quality is not None else None
+        quality = quality or None
+        with self.transaction() as connection:
+            revision = self._advance_api_revision(connection, "source", expected_revision)
+            connection.execute(
+                "INSERT INTO source_config(singleton_id, room_identity, preferred_quality, "
+                "desired_running, updated_at) VALUES(1,?,?,?,?) "
+                "ON CONFLICT(singleton_id) DO UPDATE SET room_identity=excluded.room_identity, "
+                "preferred_quality=excluded.preferred_quality, desired_running=excluded.desired_running, "
+                "updated_at=excluded.updated_at",
+                (canonical, quality, int(desired_running), _now()),
+            )
+        return revision
+
+    def set_destination_revisioned(
+        self,
+        kind: DestinationKind,
+        base_server: str,
+        stream_key: str,
+        *,
+        enabled: bool,
+        expected_revision: int,
+    ) -> int:
+        server = _validate_base_server(base_server)
+        secret = _validate_plaintext_secret(stream_key)
+        try:
+            encrypted = self._encrypt_secret(secret)
+        except Exception as exc:
+            raise DestinationSecretError("Unable to encrypt destination secret") from exc
+        if not encrypted or encrypted == secret:
+            raise DestinationSecretError("Secret encryption returned invalid ciphertext")
+        resource = f"destination:{_storage_kind(kind)}"
+        with self.transaction() as connection:
+            revision = self._advance_api_revision(connection, resource, expected_revision)
+            storage_kind = _storage_kind(kind)
+            connection.execute(
+                "INSERT INTO destination_config(kind, controller_identity, base_server, "
+                "encrypted_stream_key, enabled, updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(kind) DO UPDATE SET base_server=excluded.base_server, "
+                "encrypted_stream_key=excluded.encrypted_stream_key, enabled=excluded.enabled, "
+                "updated_at=excluded.updated_at",
+                (storage_kind, storage_kind, server, encrypted, int(enabled), _now()),
+            )
+        return revision
+
+    def _advance_api_revision(
+        self, connection: sqlite3.Connection, resource: str, expected: int
+    ) -> int:
+        _validate_api_resource(resource)
+        row = connection.execute(
+            "SELECT api_revisions_json FROM app_settings WHERE singleton_id=1"
+        ).fetchone()
+        revisions = _parse_api_revisions(row[0]) if row is not None else {}
+        current = revisions.get(resource, 0)
+        if current != expected:
+            raise RevisionConflictError("API revision precondition is stale")
+        revision = current + 1
+        revisions[resource] = revision
+        encoded = json.dumps(revisions, separators=(",", ":"), sort_keys=True)
+        connection.execute(
+            "INSERT INTO app_settings(singleton_id, standby_file, backoff_initial_seconds, "
+            "backoff_max_seconds, updated_at, api_revisions_json) VALUES(1,NULL,2.0,30.0,?,?) "
+            "ON CONFLICT(singleton_id) DO UPDATE SET api_revisions_json=excluded.api_revisions_json, "
+            "updated_at=excluded.updated_at",
+            (_now(), encoded),
+        )
+        return revision
 
     def set_app_settings(self, settings: AppSettings) -> None:
         _validate_backoff(settings)
@@ -1076,6 +1204,32 @@ def _validate_plaintext_secret(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DestinationSecretError("Destination secret must not be empty")
     return value
+
+
+def _validate_api_resource(resource: str) -> None:
+    if _SAFE_API_RESOURCE.fullmatch(resource) is None:
+        raise ValueError("API revision resource is invalid")
+
+
+def _parse_api_revisions(value: object) -> dict[str, int]:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        raise DatabaseCorruptError("Persisted API revisions are invalid") from None
+    if not isinstance(parsed, dict):
+        raise DatabaseCorruptError("Persisted API revisions are invalid")
+    result: dict[str, int] = {}
+    for key, revision in parsed.items():
+        if (
+            not isinstance(key, str)
+            or _SAFE_API_RESOURCE.fullmatch(key) is None
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not 0 <= revision <= 2_147_483_647
+        ):
+            raise DatabaseCorruptError("Persisted API revisions are invalid")
+        result[key] = revision
+    return result
 
 
 def _validate_base_server(value: str) -> str:

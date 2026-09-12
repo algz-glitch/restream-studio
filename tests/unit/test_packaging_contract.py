@@ -30,22 +30,46 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
         "PYTHON_LINT",
         "PYTHON_TYPES",
         "PYTHON_TESTS",
-        "FRONTEND_DEPS",
         "FRONTEND_TYPES",
         "FRONTEND_LINT",
         "FRONTEND_TESTS",
         "FRONTEND_BUILD",
         "LOCAL_RTMP_E2E",
-        "PYINSTALLER_PACKAGE",
-        "PACKAGE_CONTENTS",
         "PACKAGE_SMOKE",
     )
-    for label in labels:
-        assert re.search(rf"Invoke-Gate\s+-Name\s+['\"]{label}['\"]", script)
+    invoked_labels = tuple(
+        re.findall(r"Invoke-Gate\s+-Name\s+['\"]([A-Z0-9_]+)['\"]", script)
+    )
+    assert invoked_labels == labels
+    assert "FRONTEND_DEPS=PASS" not in script
+    assert "FRONTEND_DEPS=FAIL" not in script
+    assert "FRONTEND_DEPS blocker:" in script
+    frontend_types = script.index("Invoke-Gate -Name 'FRONTEND_TYPES'")
+    frontend_lint = script.index("Invoke-Gate -Name 'FRONTEND_LINT'")
+    assert frontend_types < script.index("npm dependency closure is not reproducible") < frontend_lint
+    package_smoke = script.index("Invoke-Gate -Name 'PACKAGE_SMOKE'")
+    assert package_smoke < script.index("& $Package -Clean")
+    assert package_smoke < script.index("Assert-Distribution", package_smoke)
+    assert package_smoke < script.index("Test-PackageHealth", package_smoke)
     assert "TcpListener" in script
     assert "Invoke-RestMethod" in script
     assert "/health" in script
     assert "exit 1" in script
+
+
+def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
+    script = _read("scripts/dev.ps1")
+    assert "frontend\\node_modules\\vite\\bin\\vite.js" in script
+    assert "--strictPort" in script
+    assert "TcpClient" in script
+    assert "Vite readiness timed out" in script
+    assert "Vite exited before readiness" in script
+    assert "backend exited with code" in script
+    assert "Vite exited with code" in script
+    assert "Stop-Process -Id $Process.Id -Force" in script
+    assert "Stop-ExactProcess -Process $frontend" in script
+    assert "Stop-ExactProcess -Process $backend" in script
+    assert script.count("finally") >= 2
 
 
 def test_package_builds_frontend_first_and_uses_directory_distribution() -> None:

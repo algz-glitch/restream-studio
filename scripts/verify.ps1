@@ -11,7 +11,7 @@ $Distribution = Join-Path $Root 'dist\RestreamStudio'
 
 function Invoke-External {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
-    & $FilePath @Arguments
+    & $FilePath @Arguments | ForEach-Object { [Console]::Error.WriteLine([string]$_) }
     if ($LASTEXITCODE -ne 0) { throw "$FilePath exited with code $LASTEXITCODE" }
 }
 
@@ -110,23 +110,10 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     [Console]::Error.WriteLine('Python virtual environment is missing')
     exit 1
 }
-$NpmCommand = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-if ($null -eq $NpmCommand) {
-    Write-Output 'FRONTEND_DEPS=FAIL'
-    [Console]::Error.WriteLine('npm is unavailable')
-    exit 1
-}
-$Npm = $NpmCommand.Source
+$Npm = ''
 
 Push-Location $Root
 try {
-    Invoke-Gate -Name 'FRONTEND_DEPS' -Action {
-        if (-not (Test-Path -LiteralPath (Join-Path $Root 'package-lock.json') -PathType Leaf)) {
-            throw 'package-lock.json is missing; npm dependency closure is not reproducible'
-        }
-        Invoke-External $Npm @('ci', '--ignore-scripts', '--no-audit', '--no-fund')
-    }
     Invoke-Gate -Name 'PYTHON_LINT' -Action {
         Invoke-External $Python @('-m', 'ruff', 'check', 'src', 'tests', 'scripts')
     }
@@ -136,7 +123,22 @@ try {
     Invoke-Gate -Name 'PYTHON_TESTS' -Action {
         Invoke-External $Python @('-m', 'pytest', 'tests')
     }
-    Invoke-Gate -Name 'FRONTEND_TYPES' -Action { Invoke-External $Npm @('run', 'typecheck') }
+    Invoke-Gate -Name 'FRONTEND_TYPES' -Action {
+        try {
+            $NpmCommand = Get-Command npm.cmd -CommandType Application -ErrorAction Stop |
+                Select-Object -First 1
+            $script:Npm = $NpmCommand.Source
+            if (-not (Test-Path -LiteralPath (Join-Path $Root 'package-lock.json') -PathType Leaf)) {
+                throw 'package-lock.json is missing; npm dependency closure is not reproducible'
+            }
+            Invoke-External $Npm @('ci', '--ignore-scripts', '--no-audit', '--no-fund')
+        }
+        catch {
+            [Console]::Error.WriteLine("FRONTEND_DEPS blocker: $($_.Exception.Message)")
+            throw
+        }
+        Invoke-External $Npm @('run', 'typecheck')
+    }
     Invoke-Gate -Name 'FRONTEND_LINT' -Action { Invoke-External $Npm @('run', 'lint') }
     Invoke-Gate -Name 'FRONTEND_TESTS' -Action { Invoke-External $Npm @('test') }
     Invoke-Gate -Name 'FRONTEND_BUILD' -Action { Invoke-External $Npm @('run', 'frontend:build') }
@@ -147,11 +149,11 @@ try {
             (Join-Path $PSScriptRoot 'e2e-local.ps1')
         )
     }
-    Invoke-Gate -Name 'PYINSTALLER_PACKAGE' -Action {
-        & $Package -Clean
+    Invoke-Gate -Name 'PACKAGE_SMOKE' -Action {
+        & $Package -Clean | ForEach-Object { [Console]::Error.WriteLine([string]$_) }
         if ($LASTEXITCODE -ne 0) { throw "package script exited with code $LASTEXITCODE" }
+        Assert-Distribution
+        Test-PackageHealth
     }
-    Invoke-Gate -Name 'PACKAGE_CONTENTS' -Action { Assert-Distribution }
-    Invoke-Gate -Name 'PACKAGE_SMOKE' -Action { Test-PackageHealth }
 }
 finally { Pop-Location }

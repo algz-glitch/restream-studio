@@ -109,6 +109,7 @@
     "screenshots": {
       "type": "array",
       "minItems": 7,
+      "maxItems": 7,
       "items": { "$ref": "#/$defs/screenshot" }
     },
     "signoff": {
@@ -249,10 +250,10 @@
         "platform_audio_audible"
       ],
       "properties": {
-        "status": { "$ref": "#/$defs/nonEmpty" },
-        "bitrate_kbps": { "type": "number", "minimum": 0 },
-        "dropped_frames": { "type": "integer", "minimum": 0 },
-        "reconnect_count": { "type": "integer", "minimum": 0 },
+        "status": { "const": "LIVE" },
+        "bitrate_kbps": { "type": "number", "exclusiveMinimum": 0 },
+        "dropped_frames": { "const": 0 },
+        "reconnect_count": { "const": 0 },
         "platform_video_visible": { "const": true },
         "platform_audio_audible": { "const": true }
       }
@@ -276,7 +277,7 @@
         "minute": { "type": "integer", "minimum": 1, "maximum": 30 },
         "captured_at_utc": { "$ref": "#/$defs/utc" },
         "application_status": { "$ref": "#/$defs/nonEmpty" },
-        "source_status": { "$ref": "#/$defs/nonEmpty" },
+        "source_status": { "const": "LIVE" },
         "douyin": { "$ref": "#/$defs/targetMinute" },
         "wechat_channels": { "$ref": "#/$defs/targetMinute" },
         "cpu_percent": { "type": "number", "minimum": 0 },
@@ -307,7 +308,17 @@
         "reviewed_by"
       ],
       "properties": {
-        "step": { "$ref": "#/$defs/nonEmpty" },
+        "step": {
+          "enum": [
+            "initial-douyin-preview",
+            "initial-wechat-channels-preview",
+            "douyin-stop-isolation",
+            "wechat-channels-stop-isolation",
+            "dual-platform-standby",
+            "recovery-second-probe",
+            "platform-end-state"
+          ]
+        },
         "relative_path": { "$ref": "#/$defs/safeReference" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "captured_at_utc": { "$ref": "#/$defs/utc" },

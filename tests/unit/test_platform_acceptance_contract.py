@@ -17,12 +17,23 @@ SCHEMA = ROOT / "docs" / "acceptance" / "platform-result.schema.json"
 VALIDATOR = ROOT / "scripts" / "validate_platform_acceptance.py"
 
 
-def _observation(second: int) -> dict[str, Any]:
+SCREENSHOT_STEPS = (
+    "initial-douyin-preview",
+    "initial-wechat-channels-preview",
+    "douyin-stop-isolation",
+    "wechat-channels-stop-isolation",
+    "dual-platform-standby",
+    "recovery-second-probe",
+    "platform-end-state",
+)
+
+
+def _observation(captured_at_utc: str, *, status: str = "LIVE") -> dict[str, Any]:
     return {
-        "status": "LIVE",
+        "status": status,
         "video_visible": True,
         "audio_audible": True,
-        "observed_at_utc": f"2026-09-12T00:00:{second:02d}Z",
+        "observed_at_utc": captured_at_utc,
         "observed_by": "acceptance-verifier",
     }
 
@@ -82,8 +93,8 @@ def _accepted_result() -> dict[str, Any]:
             },
         },
         "initial_preview": {
-            "douyin": _observation(5),
-            "wechat_channels": _observation(6),
+            "douyin": _observation("2026-09-12T00:00:05Z"),
+            "wechat_channels": _observation("2026-09-12T00:00:06Z"),
         },
         "stop_isolation": [
             {
@@ -113,8 +124,10 @@ def _accepted_result() -> dict[str, Any]:
             "restored_at_utc": "2026-09-12T00:32:05Z",
             "duration_seconds": 65,
             "standby": {
-                "douyin": {**_observation(7), "status": "STANDBY"},
-                "wechat_channels": {**_observation(8), "status": "STANDBY"},
+                "douyin": _observation("2026-09-12T00:32:01Z", status="STANDBY"),
+                "wechat_channels": _observation(
+                    "2026-09-12T00:32:02Z", status="STANDBY"
+                ),
             },
             "consecutive_probes": 2,
             "recovery_probes": [
@@ -122,30 +135,45 @@ def _accepted_result() -> dict[str, Any]:
                     "captured_at_utc": "2026-09-12T00:32:10Z",
                     "source_live": True,
                     "targets": {
-                        "douyin": _observation(10),
-                        "wechat_channels": _observation(11),
+                        "douyin": _observation("2026-09-12T00:32:10Z"),
+                        "wechat_channels": _observation("2026-09-12T00:32:10Z"),
                     },
                 },
                 {
                     "captured_at_utc": "2026-09-12T00:32:20Z",
                     "source_live": True,
                     "targets": {
-                        "douyin": _observation(20),
-                        "wechat_channels": _observation(21),
+                        "douyin": _observation("2026-09-12T00:32:20Z"),
+                        "wechat_channels": _observation("2026-09-12T00:32:20Z"),
                     },
                 },
             ],
         },
         "screenshots": [
             {
-                "step": f"step-{index}",
-                "relative_path": f"screenshots/step-{index}.png",
+                "step": step,
+                "relative_path": f"screenshots/{step}.png",
                 "sha256": f"{index:x}" * 64,
-                "captured_at_utc": "2026-09-12T00:35:00Z",
+                "captured_at_utc": captured_at_utc,
                 "redacted": True,
                 "reviewed_by": "redaction-reviewer",
             }
-            for index in range(1, 8)
+            for index, (step, captured_at_utc) in enumerate(
+                zip(
+                    SCREENSHOT_STEPS,
+                    (
+                        "2026-09-12T00:00:07Z",
+                        "2026-09-12T00:00:08Z",
+                        "2026-09-12T00:00:15Z",
+                        "2026-09-12T00:00:35Z",
+                        "2026-09-12T00:32:03Z",
+                        "2026-09-12T00:32:20Z",
+                        "2026-09-12T00:38:00Z",
+                    ),
+                    strict=True,
+                ),
+                start=1,
+            )
         ],
         "signoff": {
             "account_holder": {
@@ -196,6 +224,19 @@ def test_platform_acceptance_positive_contract_is_executable() -> None:
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
 
     completed = _run_validator(_accepted_result())
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "PLATFORM_ACCEPTED"
+    assert completed.stderr == ""
+
+
+def test_platform_acceptance_accepts_inclusive_time_and_minute_interval_boundaries() -> None:
+    result = _accepted_result()
+    result["started_at_utc"] = "2026-09-12T00:00:05Z"
+    result["completed_at_utc"] = "2026-09-12T00:39:45Z"
+    result["minute_samples"][1]["captured_at_utc"] = "2026-09-12T00:01:45Z"
+
+    completed = _run_validator(result)
 
     assert completed.returncode == 0
     assert completed.stdout.strip() == "PLATFORM_ACCEPTED"
@@ -256,6 +297,123 @@ def test_platform_acceptance_positive_contract_is_executable() -> None:
     ],
 )
 def test_platform_acceptance_rejects_false_duplicate_or_missing_fields(
+    mutate: Callable[[dict[str, Any]], object],
+    expected_error: str,
+) -> None:
+    result = _accepted_result()
+    mutate(result)
+
+    completed = _run_validator(result)
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert expected_error in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_error"),
+    [
+        (
+            lambda result: result.update(started_at_utc="2026-09-12T00:00:06Z"),
+            "started_at_utc",
+        ),
+        (
+            lambda result: result.update(completed_at_utc="2026-09-12T00:39:44Z"),
+            "completed_at_utc",
+        ),
+        (
+            lambda result: result["source_interruption"]["recovery_probes"][0].update(
+                captured_at_utc="2026-09-12T00:32:05Z"
+            ),
+            "recovery_probes[0]",
+        ),
+        (
+            lambda result: result["source_interruption"]["recovery_probes"][1].update(
+                captured_at_utc="2026-09-12T00:32:10Z"
+            ),
+            "recovery_probes[1]",
+        ),
+        (
+            lambda result: result["minute_samples"][1].update(
+                captured_at_utc="2026-09-12T00:01:44Z"
+            ),
+            "minute_samples[1].captured_at_utc",
+        ),
+        (
+            lambda result: result["minute_samples"][1].update(
+                captured_at_utc="2026-09-12T00:02:16Z"
+            ),
+            "minute_samples[1].captured_at_utc",
+        ),
+        (
+            lambda result: result["minute_samples"][29].update(
+                captured_at_utc="2026-09-12T00:29:59Z"
+            ),
+            "minute_samples",
+        ),
+        (
+            lambda result: result["minute_samples"][2].update(source_status="STANDBY"),
+            "minute_samples[2].source_status",
+        ),
+        (
+            lambda result: result["minute_samples"][3]["douyin"].update(status="STANDBY"),
+            "minute_samples[3].douyin.status",
+        ),
+        (
+            lambda result: result["minute_samples"][4]["wechat_channels"].update(
+                bitrate_kbps=0
+            ),
+            "minute_samples[4].wechat_channels.bitrate_kbps",
+        ),
+        (
+            lambda result: result["minute_samples"][5]["douyin"].update(dropped_frames=1),
+            "minute_samples[5].douyin.dropped_frames",
+        ),
+        (
+            lambda result: result["minute_samples"][6]["douyin"].update(reconnect_count=1),
+            "minute_samples[6].douyin.reconnect_count",
+        ),
+        (
+            lambda result: result["initial_preview"]["douyin"].update(status="STANDBY"),
+            "initial_preview.douyin.status",
+        ),
+        (
+            lambda result: result["source_interruption"]["standby"]["douyin"].update(
+                status="LIVE"
+            ),
+            "source_interruption.standby.douyin.status",
+        ),
+        (
+            lambda result: result["source_interruption"]["recovery_probes"][1]["targets"][
+                "wechat_channels"
+            ].update(status="STANDBY"),
+            "recovery_probes[1].targets.wechat_channels.status",
+        ),
+        (
+            lambda result: result["screenshots"][6].update(step="dual-platform-standby"),
+            "screenshots",
+        ),
+        (
+            lambda result: result["screenshots"][6].update(
+                relative_path=result["screenshots"][0]["relative_path"]
+            ),
+            "screenshots[6].relative_path",
+        ),
+        (
+            lambda result: result["screenshots"][0].update(
+                relative_path="screenshots/https" + "://redacted.invalid.png"
+            ),
+            "result",
+        ),
+        (
+            lambda result: result["source_interruption"]["standby"]["douyin"].update(
+                observed_at_utc="2026-09-12T00:40:01Z"
+            ),
+            "completed_at_utc",
+        ),
+    ],
+)
+def test_platform_acceptance_rejects_p1_evidence_gaps(
     mutate: Callable[[dict[str, Any]], object],
     expected_error: str,
 ) -> None:

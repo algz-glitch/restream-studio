@@ -16,6 +16,15 @@ from typing import Any, NoReturn
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "docs" / "acceptance" / "platform-result.schema.json"
 TARGETS = ("douyin", "wechat_channels")
+SCREENSHOT_STEPS = (
+    "initial-douyin-preview",
+    "initial-wechat-channels-preview",
+    "douyin-stop-isolation",
+    "wechat-channels-stop-isolation",
+    "dual-platform-standby",
+    "recovery-second-probe",
+    "platform-end-state",
+)
 FORBIDDEN_FIELD_NAMES = {
     "authorization",
     "cookie",
@@ -186,11 +195,13 @@ def _cross_validate(result: dict[str, Any]) -> None:
     ]
     for index, (previous, current) in enumerate(pairwise(minute_times), start=1):
         interval = (current - previous).total_seconds()
-        if interval <= 0 or interval > 75:
+        if interval < 45 or interval > 75:
             _reject(
                 f"result.minute_samples[{index}].captured_at_utc",
-                "must follow the prior sample by no more than 75 seconds",
+                "must follow the prior sample by 45 to 75 seconds",
             )
+    if (minute_times[-1] - minute_times[0]).total_seconds() < 29 * 60:
+        _reject("result.minute_samples", "30 samples must cover at least 29 minutes")
 
     isolated_targets = [item["stopped_target"] for item in result["stop_isolation"]]
     if sorted(isolated_targets) != sorted(TARGETS):
@@ -224,6 +235,11 @@ def _cross_validate(result: dict[str, Any]) -> None:
         _parse_utc(probe["captured_at_utc"], f"result.source_interruption.recovery_probes[{i}]")
         for i, probe in enumerate(probes)
     ]
+    if probe_times[0] <= interruption_end:
+        _reject(
+            "result.source_interruption.recovery_probes[0]",
+            "successful recovery probes must occur after source restoration",
+        )
     for index, (previous, current) in enumerate(pairwise(probe_times), start=1):
         if (current - previous).total_seconds() < 10:
             _reject(
@@ -231,20 +247,95 @@ def _cross_validate(result: dict[str, Any]) -> None:
                 "successful probes must be at least 10 seconds apart",
             )
 
+    for target in TARGETS:
+        if result["initial_preview"][target]["status"] != "LIVE":
+            _reject(f"result.initial_preview.{target}.status", "must equal LIVE")
+        if interruption["standby"][target]["status"] != "STANDBY":
+            _reject(f"result.source_interruption.standby.{target}.status", "must equal STANDBY")
+    for probe_index, probe in enumerate(probes):
+        for target in TARGETS:
+            if probe["targets"][target]["status"] != "LIVE":
+                _reject(
+                    f"result.source_interruption.recovery_probes[{probe_index}]"
+                    f".targets.{target}.status",
+                    "must equal LIVE",
+                )
+
+    screenshot_steps = [item["step"] for item in result["screenshots"]]
+    if sorted(screenshot_steps) != sorted(SCREENSHOT_STEPS):
+        _reject("result.screenshots", "must contain each of the seven required steps exactly once")
+    screenshot_paths = [
+        item["relative_path"].replace("\\", "/").casefold() for item in result["screenshots"]
+    ]
+    for index, path in enumerate(screenshot_paths):
+        if screenshot_paths.index(path) != index:
+            _reject(f"result.screenshots[{index}].relative_path", "must be unique")
+
     started = _parse_utc(result["started_at_utc"], "result.started_at_utc")
     completed = _parse_utc(result["completed_at_utc"], "result.completed_at_utc")
-    terminal_times = probe_times + [
-        _parse_utc(result["rollback"]["verified_at_utc"], "result.rollback.verified_at_utc"),
-        _parse_utc(
-            result["signoff"]["account_holder"]["signed_at_utc"],
-            "result.signoff.account_holder.signed_at_utc",
+    evidence_times = [
+        *minute_times,
+        *probe_times,
+        interruption_start,
+        interruption_end,
+        *(
+            _parse_utc(
+                result["initial_preview"][target]["observed_at_utc"],
+                f"result.initial_preview.{target}.observed_at_utc",
+            )
+            for target in TARGETS
         ),
-        _parse_utc(
-            result["signoff"]["acceptance_verifier"]["signed_at_utc"],
-            "result.signoff.acceptance_verifier.signed_at_utc",
+        *(
+            timestamp
+            for index, item in enumerate(result["stop_isolation"])
+            for timestamp in (
+                _parse_utc(
+                    item["stopped_at_utc"],
+                    f"result.stop_isolation[{index}].stopped_at_utc",
+                ),
+                _parse_utc(
+                    item["resumed_at_utc"],
+                    f"result.stop_isolation[{index}].resumed_at_utc",
+                ),
+            )
+        ),
+        *(
+            _parse_utc(
+                interruption["standby"][target]["observed_at_utc"],
+                f"result.source_interruption.standby.{target}.observed_at_utc",
+            )
+            for target in TARGETS
+        ),
+        *(
+            _parse_utc(
+                probe["targets"][target]["observed_at_utc"],
+                f"result.source_interruption.recovery_probes[{probe_index}]"
+                f".targets.{target}.observed_at_utc",
+            )
+            for probe_index, probe in enumerate(probes)
+            for target in TARGETS
+        ),
+        *(
+            _parse_utc(
+                screenshot["captured_at_utc"],
+                f"result.screenshots[{index}].captured_at_utc",
+            )
+            for index, screenshot in enumerate(result["screenshots"])
+        ),
+        _parse_utc(result["rollback"]["verified_at_utc"], "result.rollback.verified_at_utc"),
+        *(
+            _parse_utc(
+                result["signoff"][role]["signed_at_utc"],
+                f"result.signoff.{role}.signed_at_utc",
+            )
+            for role in ("account_holder", "acceptance_verifier")
         ),
     ]
-    if completed <= started or any(timestamp > completed for timestamp in terminal_times):
+    if completed <= started:
+        _reject("result.completed_at_utc", "must follow result.started_at_utc")
+    if any(timestamp < started for timestamp in evidence_times):
+        _reject("result.started_at_utc", "must not follow any required acceptance evidence")
+    if any(timestamp > completed for timestamp in evidence_times):
         _reject("result.completed_at_utc", "must follow all required acceptance evidence")
 
 

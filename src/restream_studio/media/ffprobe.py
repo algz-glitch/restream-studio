@@ -44,6 +44,17 @@ class MediaProbeOutputTooLargeError(MediaProbeError):
     pass
 
 
+def _monotonic() -> float:
+    return asyncio.get_running_loop().time()
+
+
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - _monotonic()
+    if remaining <= 0:
+        raise MediaProbeTimeoutError("media probe timed out")
+    return remaining
+
+
 def validate_input_url(value: str) -> str:
     if not isinstance(value, str) or not value or any(
         ord(character) < 32 or ord(character) == 127 for character in value
@@ -314,12 +325,18 @@ async def probe_media(
     validated_url = validate_input_url(url)
     if timeout <= 0 or max_output_bytes <= 0 or max_stream_bytes <= 0:
         raise ValueError("timeout and output limits must be positive")
-    await _validate_resolved_host(validated_url)
+    deadline = _monotonic() + timeout
+    try:
+        await asyncio.wait_for(
+            _validate_resolved_host(validated_url), timeout=_remaining_timeout(deadline)
+        )
+    except TimeoutError as exc:
+        raise MediaProbeTimeoutError("media probe timed out") from exc
     stdout = await _execute_ffprobe(
         executable,
         validated_url,
         ("-show_streams",),
-        timeout,
+        _remaining_timeout(deadline),
         max_output_bytes,
         max_stream_bytes,
     )
@@ -337,7 +354,7 @@ async def probe_media(
                 "-read_intervals",
                 "%+6",
             ),
-            timeout,
+            _remaining_timeout(deadline),
             max_output_bytes,
             max_stream_bytes,
         )

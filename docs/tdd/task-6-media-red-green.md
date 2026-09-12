@@ -92,3 +92,19 @@ test and the separately executed local FFmpeg smoke. The build and diff-check ev
 recorded in the completion report. Standard `npm run build` reached wheel construction but
 the managed host denied writes inside pip/setuptools-created temporary directories; this is
 reported as an environment failure rather than a successful build.
+
+## Final timeout-budget review
+
+RED added two regressions. A resolver coroutine that never completes was wrapped by an outer
+50 ms test guard and failed with the guard's raw `TimeoutError`, proving DNS resolution was
+outside the configured media-probe timeout. A deterministic clock then showed both ffprobe
+stages receiving a fresh 10-second timeout (`[10.0, 10.0]`) after DNS had already consumed
+two seconds.
+
+GREEN creates one monotonic deadline after argument validation. DNS resolution is bounded by
+the current remainder and maps expiration to the URL-free `MediaProbeTimeoutError("media probe
+timed out")`. The stream-metadata probe receives the post-DNS remainder. The optional GOP
+probe receives only what remains after metadata parsing; if the deadline is exhausted, it is
+skipped conservatively and the parsed media result retains `gop_seconds=None`. Focused final
+evidence: `28 passed, 1 deselected` in `tests/unit/test_ffprobe.py`, where the deselection is
+the separately established local FFmpeg smoke.

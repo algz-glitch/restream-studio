@@ -207,6 +207,65 @@ async def test_dns_uses_async_getaddrinfo(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_dns_hang_uses_probe_timeout_without_spawning_or_leaking_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def hang(host: str, port: int) -> tuple[str, ...]:
+        await asyncio.Event().wait()
+        return ()
+
+    spawned = False
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        nonlocal spawned
+        spawned = True
+        return Process([payload()])
+
+    monkeypatch.setattr("restream_studio.media.ffprobe._resolve_host_addresses", hang)
+    monkeypatch.setattr("restream_studio.media.ffprobe.asyncio.create_subprocess_exec", spawn)
+    with pytest.raises(MediaProbeTimeoutError, match="media probe timed out") as error:
+        await asyncio.wait_for(
+            probe_media("https://media.example.test/live?token=SECRET", timeout=0.001),
+            timeout=0.05,
+        )
+    assert "SECRET" not in str(error.value)
+    assert not spawned
+
+
+@pytest.mark.asyncio
+async def test_one_deadline_uses_remaining_budget_and_skips_gop_when_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    timeouts: list[float] = []
+
+    monkeypatch.setattr(
+        "restream_studio.media.ffprobe._monotonic", lambda: clock[0], raising=False
+    )
+
+    async def resolve(url: str) -> None:
+        clock[0] += 2.0
+
+    async def execute(
+        executable: str,
+        url: str,
+        options: tuple[str, ...],
+        timeout: float,
+        max_output_bytes: int,
+        max_stream_bytes: int,
+    ) -> bytes:
+        timeouts.append(timeout)
+        clock[0] += timeout
+        return payload()
+
+    monkeypatch.setattr("restream_studio.media.ffprobe._validate_resolved_host", resolve)
+    monkeypatch.setattr("restream_studio.media.ffprobe._execute_ffprobe", execute)
+    result = await probe_media("https://media.example.test/live", timeout=10.0)
+    assert timeouts == [pytest.approx(8.0)]
+    assert result.gop_seconds is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("avg", "real", "fps"), [("0/0", "25/1", 25), ("0", "30/1", 30), ("bad", "24/1", 24)])
 async def test_bad_average_rate_falls_back(monkeypatch: pytest.MonkeyPatch, avg: str, real: str, fps: float) -> None:
     install(monkeypatch, Process([payload(avg_frame_rate=avg, r_frame_rate=real)]))

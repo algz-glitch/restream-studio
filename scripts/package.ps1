@@ -130,4 +130,9 @@ $Executable = Join-Path $OutputDirectory 'RestreamStudio\RestreamStudio.exe'
 if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
     throw "PyInstaller directory package is missing: $Executable"
 }
+$Distribution = Split-Path -Parent $Executable
+Copy-Item -LiteralPath (Join-Path $Root 'packaging\Enable-Localhost.ps1') `
+    -Destination (Join-Path $Distribution 'Enable-Localhost.ps1') -Force
+Copy-Item -LiteralPath (Join-Path $Root 'packaging\Enable-Localhost.cmd') `
+    -Destination (Join-Path $Distribution 'Enable-Localhost.cmd') -Force
 Write-Output "PACKAGE_PATH=$([IO.Path]::GetDirectoryName($Executable))"

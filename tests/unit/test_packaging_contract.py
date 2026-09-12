@@ -16,12 +16,27 @@ def _read(relative: str) -> str:
 def test_windows_packaging_files_exist() -> None:
     required = (
         "packaging/restream-studio.spec",
+        "packaging/Enable-Localhost.ps1",
+        "packaging/Enable-Localhost.cmd",
         "scripts/dev.ps1",
         "scripts/verify.ps1",
         "scripts/package.ps1",
         "README.md",
     )
     assert all((ROOT / item).is_file() for item in required)
+
+
+def test_packaged_loopback_setup_is_program_scoped_and_loopback_only() -> None:
+    script = _read("packaging/Enable-Localhost.ps1")
+    assert "WindowsBuiltInRole]::Administrator" in script
+    assert "-Verb RunAs" in script
+    assert "-Program $resolvedExecutable" in script
+    assert "-Direction Inbound" in script
+    assert "-Protocol TCP" in script
+    assert "-LocalAddress '127.0.0.1'" in script
+    assert "-RemoteAddress '127.0.0.1'" in script
+    assert "-Profile Any" in script
+    assert "RemoteAddress -notcontains '127.0.0.1'" in script
 
 
 def test_npm_lock_is_complete_for_windows_x64() -> None:

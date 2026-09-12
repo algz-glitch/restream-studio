@@ -61,6 +61,8 @@ function Wait-LocalPortReleased {
 function Assert-Distribution {
     $required = @(
         'RestreamStudio.exe',
+        'Enable-Localhost.ps1',
+        'Enable-Localhost.cmd',
         '_internal\restream_studio\static\index.html',
         '_internal\ffmpeg.exe',
         '_internal\ffprobe.exe',

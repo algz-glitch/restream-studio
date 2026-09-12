@@ -255,7 +255,11 @@ def client(app: FastAPI) -> Iterator[TestClient]:
 
 
 def test_health_is_minimal_and_status_is_safe(client: TestClient) -> None:
-    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "app": "restream-studio",
+        "version": "0.1.0",
+    }
     response = client.get("/api/status")
     assert response.status_code == 200
     assert response.json()["source_state"] == "STOPPED"
@@ -460,7 +464,11 @@ def test_frontend_mount_is_optional_and_does_not_shadow_api(tmp_path: Path, harn
     app = create_app(lambda: ApiDependencies(harness.db, harness.controller, assets_dir=tmp_path))
     with TestClient(app, headers={"host": "localhost"}) as client:
         assert client.get("/").text == "SPA"
-        assert client.get("/health").json() == {"status": "ok"}
+        assert client.get("/health").json() == {
+            "status": "ok",
+            "app": "restream-studio",
+            "version": "0.1.0",
+        }
         assert client.get("/api/missing").status_code == 404
         assert "error" in client.get("/api/missing").json()
 

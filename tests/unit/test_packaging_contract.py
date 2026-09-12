@@ -90,6 +90,12 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
     assert "TcpListener" in script
     assert "Invoke-RestMethod" in script
     assert "/health" in script
+    assert "restream-studio" in script
+    assert "0.1.0" in script
+    assert "Restream Studio" in script
+    assert "WaitForExit" in script
+    assert "Test-LocalPortAvailable" in script
+    assert "packaged port was not released" in script
     assert "exit 1" in script
 
 
@@ -98,10 +104,26 @@ def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
     root_vite = "node_modules\\vite\\bin\\vite.js"
     frontend_vite = "frontend\\node_modules\\vite\\bin\\vite.js"
     assert script.index(root_vite) < script.index(frontend_vite)
-    assert "Test-Path -LiteralPath $candidate -PathType Leaf" in script
+    assert "Test-Path -LiteralPath $_ -PathType Leaf" in script
     assert "Select-Object -First 1" in script
     assert "--strictPort" in script
-    assert "TcpClient" in script
+    assert "$FrontendRoot = Join-Path $Root 'frontend'" in script
+    assert "-WorkingDirectory $FrontendRoot" in script
+    assert "Invoke-WebRequest" in script
+    assert "Restream Studio" in script
+    assert "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in script
+    assert "AssignProcessToJobObject" in script
+    assert "$ProcessJob.AddProcess($frontend)" in script
+    assert "$ProcessJob.AddProcess($backend)" in script
+    assert "$ProcessJob.Dispose()" in script
+    for environment_name, old_value in (
+        ("FFMPEG_PATH", "$oldFFmpeg"),
+        ("FFPROBE_PATH", "$oldFFprobe"),
+        ("RESTREAM_STUDIO_DATA_DIR", "$oldData"),
+    ):
+        assert f"GetEnvironmentVariable('{environment_name}')" in script
+        assert f"SetEnvironmentVariable('{environment_name}', {old_value})" in script
+    assert "WaitForExit" in script
     assert "Vite readiness timed out" in script
     assert "Vite exited before readiness" in script
     assert "backend exited with code" in script
@@ -109,7 +131,9 @@ def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
     assert "Stop-Process -Id $Process.Id -Force" in script
     assert "Stop-ExactProcess -Process $frontend" in script
     assert "Stop-ExactProcess -Process $backend" in script
-    assert script.count("finally") >= 2
+    cleanup = script.rindex("\nfinally {")
+    assert cleanup < script.index("Stop-ExactProcess -Process $frontend", cleanup)
+    assert cleanup < script.index("Stop-ExactProcess -Process $backend", cleanup)
 
 
 def test_package_builds_frontend_first_and_uses_directory_distribution() -> None:

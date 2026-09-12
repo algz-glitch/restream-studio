@@ -37,6 +37,27 @@ function Get-DynamicPort {
     finally { $listener.Stop() }
 }
 
+function Test-LocalPortAvailable {
+    param([Parameter(Mandatory)][int]$Port)
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
+    try {
+        $listener.Start()
+        return $true
+    }
+    catch { return $false }
+    finally { $listener.Stop() }
+}
+
+function Wait-LocalPortReleased {
+    param([Parameter(Mandatory)][int]$Port, [int]$TimeoutSeconds = 10)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        if (Test-LocalPortAvailable -Port $Port) { return $true }
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
+
 function Assert-Distribution {
     $required = @(
         'RestreamStudio.exe',
@@ -89,7 +110,15 @@ function Test-PackageHealth {
             try {
                 $health = Invoke-RestMethod -Method Get `
                     -Uri "http://127.0.0.1:$port/health" -TimeoutSec 2
-                if ($health.status -eq 'ok') { return }
+                $homepage = Invoke-WebRequest -Method Get -UseBasicParsing `
+                    -Uri "http://127.0.0.1:$port/" -TimeoutSec 2
+                if (
+                    $health.status -eq 'ok' -and
+                    $health.app -eq 'restream-studio' -and
+                    $health.version -eq '0.1.0' -and
+                    $homepage.StatusCode -eq 200 -and
+                    $homepage.Content -match '<title>\s*Restream Studio\s*</title>'
+                ) { return }
             }
             catch { Start-Sleep -Milliseconds 250 }
         }
@@ -101,6 +130,12 @@ function Test-PackageHealth {
         if ($null -ne $process) {
             $process.Refresh()
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            if (-not $process.WaitForExit(10000)) {
+                throw 'packaged executable did not exit after Stop-Process'
+            }
+            if (-not (Wait-LocalPortReleased -Port $port)) {
+                throw "packaged port was not released: $port"
+            }
         }
     }
 }

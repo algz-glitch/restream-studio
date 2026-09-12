@@ -10,6 +10,7 @@ from typing import Final, Protocol
 
 from fastapi import APIRouter, Header, Query, Request, Response
 
+from restream_studio import __version__
 from restream_studio.domain import DestinationKind
 from restream_studio.orchestration.controller import ControllerSnapshot
 from restream_studio.persistence.database import (
@@ -199,7 +200,11 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
 
     @router.get("/health", include_in_schema=False)
     async def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "app": "restream-studio",
+            "version": __version__,
+        }
 
     @router.get("/api/status", response_model=StatusResponse)
     async def status() -> StatusResponse:

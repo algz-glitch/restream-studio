@@ -244,7 +244,7 @@ app = create_app()
 
 def run() -> None:
     uvicorn.run(
-        "restream_studio.main:app",
+        app,
         host="127.0.0.1",
         port=_server_port(),
         proxy_headers=False,

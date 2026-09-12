@@ -156,10 +156,8 @@ Controller save matches enabled identities against `controller_identity`, never 
 
 For direct v1 upgrades, migration 2 now retains the legacy `enabled_destinations_json` in a
 migration-only table before removing the duplicate source column. Migration 3 validates and
-deduplicates that list, maps known kind identities directly and remaining identities
-deterministically by destination order, restores enabled flags, and removes the migration table in
-the same transaction. Existing v2 databases preserve their current enabled flags and receive
-kind-based default identities.
+deduplicates that list and maps only identities that explicitly resolve to a known kind. Existing
+v2 databases preserve their current enabled flags and receive kind-based default identities.
 
 Import now accepts `desired_running` and destination `enabled` only when `type(value) is bool`.
 Explicit strings, integers, and null are rejected during full-payload validation before the single
@@ -175,6 +173,38 @@ Final commands and results are recorded after implementation formatting:
 tests/unit/test_database.py: 50 passed
 tests/unit/test_database.py + tests/integration/test_controller.py: 80 passed
 synchronous regression: 218 passed, 1 deselected
+Ruff: All checks passed
+mypy: Success, no issues found in 34 source files
+git diff --check: clean
+```
+
+## Fail-closed migration final review
+
+Two final regressions were written first. RED showed that an explicit empty
+`controller_identity` silently became the kind default, and a v1 source containing only the
+unknown identity `secondary` was guessed as the first destination:
+
+```text
+2 failed, 50 deselected in 0.35s
+```
+
+Migration 3 no longer assigns unknown legacy identities by row order. It enables only identities
+with an explicit, deterministic mapping to a supported destination kind. Unknown, malformed, or
+conflicting identities leave unmatched destinations disabled and insert one structured
+`migration_reconciliation_required` warning event containing only scope, required flag, and
+unmapped count. No legacy identity or credential is copied into that event. A two-destination v1
+fixture containing only `secondary` verifies that both outputs remain disabled.
+
+`set_destination()` now treats only `None` as the request for a kind-based default identity. An
+explicit empty string reaches the normal identity validator and fails before encryption or any
+database write.
+
+Final verification:
+
+```text
+tests/unit/test_database.py: 52 passed
+tests/unit/test_database.py + tests/integration/test_controller.py: 82 passed
+synchronous regression: 220 passed, 1 deselected
 Ruff: All checks passed
 mypy: Success, no issues found in 34 source files
 git diff --check: clean

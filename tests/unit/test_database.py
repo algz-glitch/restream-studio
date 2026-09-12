@@ -562,6 +562,17 @@ def test_controller_store_round_trips_configured_destination_identities(db: Data
     assert db.get_destination(DestinationKind.WECHAT).controller_identity == "secondary"  # type: ignore[union-attr]
 
 
+def test_explicit_empty_controller_identity_is_rejected_instead_of_defaulted(db: Database) -> None:
+    with pytest.raises(ValueError, match="identity"):
+        db.set_destination(
+            DestinationKind.DOUYIN,
+            "rtmp://one.test/app",
+            "one",
+            controller_identity="",
+        )
+    assert db.get_destination(DestinationKind.DOUYIN) is None
+
+
 def test_busy_database_has_distinct_error_and_is_not_reported_corrupt(
     paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
 ) -> None:
@@ -645,7 +656,7 @@ def test_open_rejects_non_contiguous_schema_version_history(
         database.open()
 
 
-def test_v1_migration_discards_duplicate_enabled_json_and_preserves_destination_rows(
+def test_v1_migration_preserves_only_explicit_known_kind_identities(
     paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
 ) -> None:
     with sqlite3.connect(paths.database_file) as connection:
@@ -654,7 +665,7 @@ def test_v1_migration_discards_duplicate_enabled_json_and_preserves_destination_
         connection.execute("INSERT INTO schema_version VALUES(1, 'now')")
         connection.execute(
             "INSERT INTO source_config VALUES(1, 'https://live.douyin.com/legacy', NULL, 1, "
-            "'[\"primary\",\"secondary\"]', 'now')"
+            "'[\"douyin\",\"wechat_channels\"]', 'now')"
         )
         connection.execute(
             "INSERT INTO destination_config VALUES('douyin', 'rtmp://one.test/app', "
@@ -676,7 +687,49 @@ def test_v1_migration_discards_duplicate_enabled_json_and_preserves_destination_
         restored = run(migrated.load("https://live.douyin.com/legacy"))
         assert "enabled_destinations_json" not in columns
         assert restored is not None
-        assert restored.enabled_destinations == ("primary", "secondary")
+        assert restored.enabled_destinations == ("douyin", "wechat_channels")
+
+
+def test_v1_unknown_secondary_identity_fails_closed_and_requires_reconciliation(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    with sqlite3.connect(paths.database_file) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        database_module.MIGRATIONS[0](connection)
+        connection.execute("INSERT INTO schema_version VALUES(1, 'now')")
+        connection.execute(
+            "INSERT INTO source_config VALUES(1, 'https://live.douyin.com/legacy-unknown', "
+            "NULL, 1, '[\"secondary\"]', 'now')"
+        )
+        connection.execute(
+            "INSERT INTO destination_config VALUES('douyin', 'rtmp://one.test/app', "
+            "'cipher:eno', 1, 'now')"
+        )
+        connection.execute(
+            "INSERT INTO destination_config VALUES('wechat_channels', 'rtmp://two.test/app', "
+            "'cipher:owt', 1, 'now')"
+        )
+        connection.commit()
+
+    with Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    ) as migrated:
+        restored = run(migrated.load("https://live.douyin.com/legacy-unknown"))
+        events = migrated.list_events(limit=10)
+        destinations = migrated.list_destinations()
+
+    assert restored is not None and restored.enabled_destinations == ()
+    assert [(item.kind, item.enabled) for item in destinations] == [
+        (DestinationKind.DOUYIN, False),
+        (DestinationKind.WECHAT, False),
+    ]
+    assert len(events) == 1
+    assert events[0].event_type == "migration_reconciliation_required"
+    assert events[0].payload == {
+        "required": True,
+        "scope": "destination_identity",
+        "unmapped_count": 1,
+    }
 
 
 @pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])

@@ -221,6 +221,7 @@ def _migration_3(connection: sqlite3.Connection) -> None:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_migration_v1_state'"
     ).fetchone()
     legacy_enabled: list[str] | None = None
+    reconciliation_count = 0
     if legacy_table is not None:
         legacy_row = connection.execute(
             "SELECT enabled_json FROM _migration_v1_state LIMIT 1"
@@ -235,6 +236,9 @@ def _migration_3(connection: sqlite3.Connection) -> None:
                 for item in parsed
             ):
                 legacy_enabled = list(dict.fromkeys(parsed))
+            else:
+                legacy_enabled = []
+                reconciliation_count = 1
 
     identities = {str(row[0]): str(row[0]) for row in rows}
     enabled = {str(row[0]): bool(row[3]) for row in rows}
@@ -244,14 +248,12 @@ def _migration_3(connection: sqlite3.Connection) -> None:
         enabled = {kind: False for kind in available}
         for identity in legacy_enabled:
             preferred = _legacy_kind(identity)
-            target = preferred if preferred in available and preferred not in assigned else None
-            if target is None:
-                target = next((kind for kind in available if kind not in assigned), None)
-            if target is None:
-                break
-            identities[target] = identity
-            enabled[target] = True
-            assigned.add(target)
+            if preferred is None or preferred not in available or preferred in assigned:
+                reconciliation_count += 1
+                continue
+            identities[preferred] = identity
+            enabled[preferred] = True
+            assigned.add(preferred)
 
     connection.execute("ALTER TABLE destination_config RENAME TO destination_config_v2")
     connection.execute(
@@ -275,6 +277,24 @@ def _migration_3(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE destination_config_v2")
     if legacy_table is not None:
         connection.execute("DROP TABLE _migration_v1_state")
+    if reconciliation_count:
+        payload = json.dumps(
+            {
+                "required": True,
+                "scope": "destination_identity",
+                "unmapped_count": reconciliation_count,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        connection.execute(
+            "INSERT INTO events(created_at, level, event_type, payload_json) VALUES(?,?,?,?)",
+            (_now(), "WARNING", "migration_reconciliation_required", payload),
+        )
+        connection.execute(
+            "DELETE FROM events WHERE id <= (SELECT coalesce(max(id), 0) - ? FROM events)",
+            (_EVENT_LIMIT,),
+        )
 
 
 MIGRATIONS: tuple[Migration, ...] = (_migration_1, _migration_2, _migration_3)
@@ -589,6 +609,11 @@ class Database:
         controller_identity: str | None = None,
     ) -> None:
         server = _validate_base_server(base_server)
+        storage_kind = _storage_kind(kind)
+        identity = _validate_controller_identity(
+            storage_kind if controller_identity is None else controller_identity
+        )
+        replace_identity = controller_identity is not None
         secret = _validate_plaintext_secret(stream_key)
         try:
             encrypted = self._encrypt_secret(secret)
@@ -596,9 +621,6 @@ class Database:
             raise DestinationSecretError("Unable to encrypt destination secret") from exc
         if not encrypted or encrypted == secret:
             raise DestinationSecretError("Secret encryption returned invalid ciphertext")
-        storage_kind = _storage_kind(kind)
-        identity = _validate_controller_identity(controller_identity or storage_kind)
-        replace_identity = controller_identity is not None
         with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO destination_config(kind, controller_identity, base_server, "

@@ -35,7 +35,7 @@ describe('播控台', () => {
   it('已有推流密钥只显示固定掩码且输入值为空', async () => {
     installApi(); render(<App />)
     expect(await screen.findAllByText('已保存：********')).toHaveLength(2)
-    for (const item of screen.getAllByLabelText('推流密钥')) expect(item).toHaveValue('')
+    for (const item of screen.getAllByLabelText(/^推流密钥/)) expect(item).toHaveValue('')
   })
 
   it('校验源字段、保存 canonical 回显且请求期间禁用', async () => {
@@ -140,7 +140,7 @@ describe('播控台', () => {
     installApi({ '/api/status': { ...status, source_state: raw, outputs: [{ ...status.outputs[0], status: raw }] } })
     render(<App />)
     const badges = await screen.findAllByText(label)
-    expect(badges[0].previousElementSibling).toHaveAttribute('aria-hidden', 'true')
+    for (const badge of badges) expect(badge.querySelector('.status__shape')).toHaveAttribute('aria-hidden', 'true')
   })
 
   it('监控指标使用原生表格表头和数据单元格', async () => {
@@ -202,12 +202,15 @@ describe('播控台', () => {
       if (path === '/api/status') {
         signals.push(init?.signal as AbortSignal)
         statusCalls += 1
-        if (statusCalls === 2) return new Promise<Response>(() => undefined)
+        // Keep subsequent requests pending to verify cancellation on hide and unmount.
+        if (statusCalls >= 2) return new Promise<Response>(() => undefined)
       }
       const map: Record<string, unknown> = { '/api/session': { session_token: 't' }, '/api/source': source, '/api/destinations/douyin': destinations.douyin, '/api/destinations/wechat_channels': destinations.wechat_channels, '/api/status': status, '/api/events?limit=50&cursor=0': events }
       return json(map[path], path.includes('/source') || path.includes('/destinations/') ? { headers: { ETag: '"1"' } } : {})
     })
-    const view = render(<App />); await screen.findByText('离线')
+    const view = render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getAllByText('离线').length).toBeGreaterThan(0)
     await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
     expect(signals).toHaveLength(2)
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' }); document.dispatchEvent(new Event('visibilitychange'))
@@ -232,7 +235,7 @@ describe('播控台', () => {
     render(<App />)
 
     expect(await screen.findByRole('region', { name: '抖音输出' })).toBeVisible()
-    expect(screen.getByRole('region', { name: '运行监控' })).toBeVisible()
+    expect(screen.getByRole('region', { name: '传输监控' })).toBeVisible()
     expect(screen.getByRole('region', { name: '运行日志' })).toBeVisible()
     expect(screen.getByText('来源加载失败。')).toBeVisible()
     expect(screen.queryByText('private backend detail')).not.toBeInTheDocument()

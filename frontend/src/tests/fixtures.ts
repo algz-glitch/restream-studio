@@ -1,3 +1,5 @@
+import { vi } from 'vitest'
+
 export const source = { configured: true, room_identity: 'https://live.douyin.com/123456', preferred_quality: 'origin' }
 export const destinations = {
   douyin: { kind: 'douyin', configured: true, masked_stream_key: '********', enabled: true, status: 'LIVE' },

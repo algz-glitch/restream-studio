@@ -356,8 +356,14 @@ class AsyncProcess:
                     try:
                         await asyncio.wait_for(process.wait(), timeout=timeout)
                     except TimeoutError:
-                        self._was_killed = True
-                        await self.kill()
+                        if process.returncode is None:
+                            self._was_killed = True
+                            await self.kill()
+                        else:
+                            # A surviving descendant can keep inherited pipes open after the
+                            # parent exits normally. Close the tree without misreporting the
+                            # already-successful parent as force-killed.
+                            await self._cleanup_process_tree()
                         await process.wait()
                 await self._cleanup_process_tree()
                 await self._finalize_reader()

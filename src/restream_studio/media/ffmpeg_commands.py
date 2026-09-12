@@ -117,7 +117,10 @@ def build_ffmpeg_command(
 ) -> FfmpegCommand:
     """Build exactly one shell-free output command."""
     try:
-        source = validate_input_url(source_url)
+        source = validate_input_url(
+            source_url,
+            allow_local_test=destination is DestinationKind.LOCAL_TEST,
+        )
     except MediaProbeError as exc:
         raise CommandValidationError(str(exc)) from None
     output = _destination_url(
@@ -131,17 +134,21 @@ def build_ffmpeg_command(
         executable,
         "-hide_banner",
         "-nostdin",
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_at_eof",
-        "1",
-        "-reconnect_delay_max",
-        "5",
-        "-i",
-        source,
     ]
+    if urlsplit(source).scheme.casefold() in {"http", "https"}:
+        args.extend(
+            (
+                "-reconnect",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_at_eof",
+                "1",
+                "-reconnect_delay_max",
+                "5",
+            )
+        )
+    args.extend(("-i", source))
     if _can_copy(probe, preset):
         args.extend(("-c", "copy"))
     else:

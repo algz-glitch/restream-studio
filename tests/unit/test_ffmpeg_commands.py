@@ -163,6 +163,20 @@ def test_output_command_enables_machine_readable_progress_on_stderr() -> None:
     assert progress_index < command.argv.index("-f")
 
 
+def test_local_test_command_allows_explicit_loopback_source_and_destination() -> None:
+    command = build_ffmpeg_command(
+        "rtmp://127.0.0.1:1935/source/main",
+        "rtmp://127.0.0.1:1935/target/douyin",
+        DestinationKind.LOCAL_TEST,
+        compatible_probe(),
+    )
+
+    assert "rtmp://127.0.0.1:1935/source/main" in command.argv
+    assert "rtmp://127.0.0.1:1935/target/douyin" in command.argv
+    assert "-reconnect" not in command.argv
+    assert "-reconnect_streamed" not in command.argv
+
+
 @pytest.mark.parametrize(
     "destination",
     [

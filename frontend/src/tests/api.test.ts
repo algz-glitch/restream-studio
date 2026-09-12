@@ -61,4 +61,11 @@ describe('ApiClient', () => {
     expect(isAbortError(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(true)
     expect(isAbortError(new Error('network failed'))).toBe(false)
   })
+
+  it('不依赖错误原型并拒绝非取消值', () => {
+    expect(isAbortError({ name: 'AbortError' })).toBe(true)
+    for (const value of [null, undefined, 'AbortError', 0, {}, { name: 'TypeError' }]) {
+      expect(isAbortError(value)).toBe(false)
+    }
+  })
 })

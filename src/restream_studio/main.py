@@ -32,6 +32,13 @@ def _bundled_path(relative: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _frontend_assets_dir() -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and isinstance(bundle_root, str):
+        return Path(bundle_root) / "restream_studio" / "static"
+    return Path(__file__).resolve().parent / "static"
+
+
 def _server_port() -> int:
     raw = os.environ.get("RESTREAM_STUDIO_PORT", "8000")
     try:
@@ -69,7 +76,7 @@ def _default_dependencies() -> ApiDependencies:
         runtime,
         reconnect_destination=runtime.reconnect_destination,
         test_destination=runtime.test_destination,
-        assets_dir=Path(__file__).resolve().parent / "static",
+        assets_dir=_frontend_assets_dir(),
     )
 
 

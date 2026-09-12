@@ -29,6 +29,7 @@ def test_local_rtmp_assets_delegate_application_orchestration_to_python() -> Non
     assert "target/douyin:" in config
     assert "target/wechat:" in config
     assert config.count("source: publisher") == 3
+    assert "moq: no" in config
 
     assert "e2e_local_harness.py" in script
     assert "Start-LiveTarget" not in script

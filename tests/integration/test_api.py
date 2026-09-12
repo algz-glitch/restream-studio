@@ -5,6 +5,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -488,6 +489,8 @@ def test_frontend_build_is_served_with_referenced_assets(harness: Harness) -> No
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     application = create_app(
         lambda: ApiDependencies(harness.db, harness.controller, assets_dir=assets_dir)
@@ -686,6 +689,19 @@ def test_pure_default_factory_points_to_packaged_frontend_assets() -> None:
     assert dependencies.assets_dir == Path(main_module.__file__).resolve().parent / "static"
 
 
+def test_pure_frontend_assets_resolve_from_frozen_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import restream_studio.main as main_module
+
+    expected = tmp_path / "restream_studio" / "static"
+    expected.mkdir(parents=True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+
+    assert main_module._frontend_assets_dir() == expected
+
+
 def test_pure_default_factory_wires_runtime_start_reconnect_and_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -694,11 +710,21 @@ def test_pure_default_factory_wires_runtime_start_reconnect_and_test(
 
     calls: list[str] = []
     database = object()
+    monkeypatch.delenv("FFMPEG_PATH", raising=False)
+    monkeypatch.delenv("FFPROBE_PATH", raising=False)
 
     class RuntimeSpy(FakeController):
-        def __init__(self, configured_database: object) -> None:
+        def __init__(
+            self,
+            configured_database: object,
+            *,
+            ffmpeg_executable: str,
+            ffprobe_executable: str,
+        ) -> None:
             super().__init__()
             assert configured_database is database
+            assert ffmpeg_executable == "ffmpeg"
+            assert ffprobe_executable == "ffprobe"
 
         async def start(self) -> None:
             calls.append("start")

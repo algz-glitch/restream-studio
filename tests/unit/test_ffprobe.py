@@ -255,7 +255,8 @@ async def test_one_deadline_uses_remaining_budget_and_skips_gop_when_exhausted(
         "restream_studio.media.ffprobe._monotonic", lambda: clock[0], raising=False
     )
 
-    async def resolve(url: str) -> None:
+    async def resolve(url: str, *, allow_local_test: bool) -> None:
+        assert allow_local_test is False
         clock[0] += 2.0
 
     async def execute(

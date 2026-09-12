@@ -101,7 +101,7 @@ function actionValidator(expectedKind: DestinationKind, action: 'reconnect' | 't
 }
 
 export function isAbortError(value: unknown): boolean {
-  return value instanceof Error && value.name === 'AbortError'
+  return isRecord(value) && value.name === 'AbortError'
 }
 
 export class ApiError extends Error {

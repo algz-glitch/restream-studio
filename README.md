@@ -72,6 +72,10 @@ powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
 
 `package.ps1` 强制先执行 `npm ci` 和前端构建，再运行 PyInstaller 目录打包。分发内容包括前端 assets、ffmpeg/ffprobe、默认待机媒体、licenses 和 metadata；不复制 fixtures、`.env`、数据库、cookies、keys、`.git` 或 logs，更不会复制用户密钥。`verify.ps1` 任一门禁失败都会输出该项 `=FAIL` 并立即非零退出。
 
+依赖锁门禁会检查所有实际 npm 包均包含 `version`、官方 registry `resolved` 与 SHA-512
+`integrity`，并确认 Windows x64 所需的 esbuild/Rollup 可选运行时存在。可在不访问网络的
+前提下运行 `npm ci --dry-run --offline --ignore-scripts` 检查当前锁与缓存的安装闭包。
+
 ## 已知限制
 
 - 当前自动化不代替真实平台验收，也不能保证平台长期开放 RTMP 权限或接口行为不变。

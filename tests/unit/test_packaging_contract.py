@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -21,6 +22,41 @@ def test_windows_packaging_files_exist() -> None:
         "README.md",
     )
     assert all((ROOT / item).is_file() for item in required)
+
+
+def test_npm_lock_is_complete_for_windows_x64() -> None:
+    lock = json.loads(_read("package-lock.json"))
+    packages = lock["packages"]
+    workspace_paths = {"", *packages[""]["workspaces"]}
+
+    incomplete = {
+        path: [field for field in ("version", "resolved", "integrity") if not metadata.get(field)]
+        for path, metadata in packages.items()
+        if path not in workspace_paths and not metadata.get("link")
+        if any(not metadata.get(field) for field in ("version", "resolved", "integrity"))
+    }
+    assert incomplete == {}
+
+    for path, metadata in packages.items():
+        if path in workspace_paths or metadata.get("link"):
+            continue
+        assert metadata["resolved"].startswith("https://registry.npmjs.org/")
+        assert metadata["integrity"].startswith("sha512-")
+
+    windows_runtime_packages = {
+        "node_modules/@esbuild/win32-x64": ("win32", "x64"),
+        "node_modules/@rollup/rollup-win32-x64-msvc": ("win32", "x64"),
+    }
+    for path, (operating_system, cpu) in windows_runtime_packages.items():
+        metadata = packages[path]
+        assert operating_system in metadata["os"]
+        assert cpu in metadata["cpu"]
+        assert metadata["optional"] is True
+
+
+def test_root_test_script_does_not_repeat_vitest_run_flag() -> None:
+    package = json.loads(_read("package.json"))
+    assert package["scripts"]["test"] == "npm --prefix frontend run test"
 
 
 def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:

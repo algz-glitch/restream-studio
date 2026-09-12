@@ -96,3 +96,27 @@ the pre-existing partial Rollup tree. `npm install --package-lock-only --offline
 `ENOTCACHED` for `@testing-library/jest-dom`. The incomplete shrinkwrap was deleted and is not part
 of the commit. Fresh short checks passed for Ruff, mypy, and the build-pipeline contract test; the
 frontend-dependent checks remain blocked by the same incomplete dependency tree.
+
+## Dependency-lock follow-up
+
+The official npm cache was later sufficient to produce a complete Windows x64 lock, but npm also
+emitted 23 empty nested Rollup entries for optional non-Windows packages. A clean offline
+regeneration was attempted first and remained blocked on registry metadata absent from the cache;
+the follow-up therefore removed only those entries whose metadata was exactly
+`{ "dev": true, "optional": true }`. No version, tarball URL, or integrity value was synthesized.
+
+The packaging contract now rejects every non-workspace, non-link lock entry missing `version`,
+`resolved`, or `integrity`, restricts tarballs to the official npm registry with SHA-512 integrity,
+and requires the esbuild and Rollup Windows x64 runtime packages. It also prevents the root test
+script from forwarding Vitest's `--run` flag twice.
+
+Fresh verification on this host:
+
+```text
+lock/package script contract tests          PASS (2 passed)
+npm ci --dry-run --offline --ignore-scripts PASS (up to date)
+npm run typecheck                           PASS
+npm run lint                                PASS
+npm test                                    ENVIRONMENT BLOCKED: child_process spawn esbuild EPERM
+npm run build                               ENVIRONMENT BLOCKED: child_process spawn esbuild EPERM
+```

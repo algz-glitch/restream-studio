@@ -239,3 +239,36 @@ Ruff: All checks passed
 mypy: Success, no issues found in 34 source files
 git diff --check: clean
 ```
+
+## Legacy event migration redaction review
+
+The v1 migration regression was added before changing production code. Its fixture stores one
+valid legacy payload containing plaintext `stream_key`/`token` assignments and a sensitive
+structured field, plus one malformed payload containing plaintext. RED failed in migration 2
+because the raw `INSERT SELECT` copied malformed JSON into the v2 JSON-validity constraint:
+
+```text
+1 failed, 56 deselected in 0.31s
+MigrationError: Migration 2 failed
+```
+
+Migration 2 now reads legacy events individually. Object payloads pass through the same recursive
+`redact()` and conservative free-text/URL sanitization used by the current event API before being
+serialized into the replacement table. Invalid JSON and non-object JSON are replaced with the
+secret-free `{reason: invalid_legacy_payload, redacted: true}` marker; no malformed source text is
+retained. Legacy event metadata is also allowlisted, and SQLite secure deletion scrubs pages freed
+when the old event table is dropped.
+
+The GREEN regression verifies all four fixture secrets are absent from `list_events()`,
+`dump_text()`, and the database plus sidecar file bytes after close.
+
+Final verification:
+
+```text
+focused v1 event migration: 1 passed, 56 deselected
+tests/unit/test_database.py: 57 passed
+tests/unit/test_database.py + tests/integration/test_controller.py: 87 passed
+synchronous regression: 225 passed, 1 deselected
+Ruff: All checks passed (three pre-existing inaccessible-directory warnings)
+mypy: Success, no issues found in 34 source files
+```

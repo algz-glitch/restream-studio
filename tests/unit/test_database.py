@@ -809,6 +809,64 @@ def test_v1_unknown_secondary_identity_fails_closed_and_requires_reconciliation(
     }
 
 
+def test_v1_event_migration_rewrites_plaintext_and_malformed_payloads_without_residue(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    secrets = ("HISTORY-SECRET", "TOKEN-SECRET", "FIELD-SECRET", "MALFORMED-SECRET")
+    with sqlite3.connect(paths.database_file) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        database_module.MIGRATIONS[0](connection)
+        connection.execute("INSERT INTO schema_version VALUES(1, 'now')")
+        connection.execute(
+            "INSERT INTO events(created_at, level, event_type, payload_json) VALUES(?,?,?,?)",
+            (
+                "2026-01-01T00:00:00+00:00",
+                "ERROR",
+                "legacy_credentials",
+                json.dumps(
+                    {
+                        "message": "stream_key=HISTORY-SECRET token=TOKEN-SECRET",
+                        "stream_key": "FIELD-SECRET",
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO events(created_at, level, event_type, payload_json) VALUES(?,?,?,?)",
+            (
+                "2026-01-01T00:00:01+00:00",
+                "ERROR",
+                "legacy_malformed",
+                "{password: MALFORMED-SECRET",
+            ),
+        )
+        connection.commit()
+
+    with Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    ) as migrated:
+        events = migrated.list_events(limit=10)
+        dumped = migrated.dump_text()
+
+    assert events[0].payload == {
+        "message": "stream_key=*** token=***",
+        "stream_key": "***",
+    }
+    assert events[1].payload == {
+        "reason": "invalid_legacy_payload",
+        "redacted": True,
+    }
+    rendered = json.dumps([event.payload for event in events]) + dumped
+    database_bytes = b"".join(
+        path.read_bytes()
+        for path in paths.data_dir.glob(f"{paths.database_file.name}*")
+        if path.is_file()
+    )
+    for secret in secrets:
+        assert secret not in rendered
+        assert secret.encode() not in database_bytes
+
+
 @pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])
 def test_import_rejects_non_boolean_desired_running_atomically(
     db: Database, invalid: object

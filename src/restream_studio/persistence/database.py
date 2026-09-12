@@ -113,6 +113,47 @@ class EventRecord:
 Migration = Callable[[sqlite3.Connection], None]
 
 
+def _safe_legacy_event_payload(raw_payload: object) -> str:
+    placeholder: dict[str, object] = {
+        "reason": "invalid_legacy_payload",
+        "redacted": True,
+    }
+    try:
+        parsed = json.loads(str(raw_payload))
+        if not isinstance(parsed, dict):
+            raise TypeError("Legacy event payload is not an object")
+        safe_payload = _remove_event_urls(redact(parsed))
+        if not isinstance(safe_payload, dict):
+            raise TypeError("Redacted legacy event payload is not an object")
+        return json.dumps(
+            safe_payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        return json.dumps(placeholder, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _safe_legacy_event_metadata(row: sqlite3.Row) -> tuple[str, str, str]:
+    created_at = str(row[1])
+    try:
+        timestamp = datetime.fromisoformat(created_at)
+        if timestamp.tzinfo is None or len(created_at) > 64:
+            raise ValueError("Legacy event timestamp is invalid")
+    except ValueError:
+        created_at = _now()
+
+    level = str(row[2]).upper()
+    if level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        level = "WARNING"
+    event_type = str(row[3])
+    if _SAFE_EVENT_NAME.fullmatch(event_type) is None:
+        event_type = "legacy_event"
+    return created_at, level, event_type
+
+
 def _migration_1(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -149,6 +190,8 @@ def _migration_1(connection: sqlite3.Connection) -> None:
 
 
 def _migration_2(connection: sqlite3.Connection) -> None:
+    # Scrub pages released when legacy tables containing unredacted diagnostics are dropped.
+    connection.execute("PRAGMA secure_delete=ON")
     connection.execute("CREATE TABLE _migration_v1_state(enabled_json TEXT NOT NULL)")
     connection.execute(
         "INSERT INTO _migration_v1_state(enabled_json) "
@@ -206,7 +249,15 @@ def _migration_2(connection: sqlite3.Connection) -> None:
         "level TEXT NOT NULL, event_type TEXT NOT NULL, "
         "payload_json TEXT NOT NULL CHECK(json_valid(payload_json)))"
     )
-    connection.execute("INSERT INTO events SELECT * FROM events_v1")
+    legacy_events = connection.execute(
+        "SELECT id, created_at, level, event_type, payload_json FROM events_v1 ORDER BY id"
+    ).fetchall()
+    for row in legacy_events:
+        created_at, level, event_type = _safe_legacy_event_metadata(row)
+        connection.execute(
+            "INSERT INTO events(id, created_at, level, event_type, payload_json) VALUES(?,?,?,?,?)",
+            (row[0], created_at, level, event_type, _safe_legacy_event_payload(row[4])),
+        )
     connection.execute("DROP TABLE events_v1")
     connection.execute("CREATE INDEX idx_events_created_id ON events(created_at, id)")
 

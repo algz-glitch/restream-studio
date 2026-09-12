@@ -159,7 +159,7 @@ function Assert-PortsReleased {
     param([Parameter(Mandatory)][int[]]$Ports)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.Elapsed.TotalSeconds -lt 10) {
-        if (($Ports | Where-Object { -not (Get-PortAvailable -Port $_) }).Count -eq 0) {
+        if (@($Ports | Where-Object { -not (Get-PortAvailable -Port $_) }).Count -eq 0) {
             return
         }
         Start-Sleep -Milliseconds 100
@@ -251,10 +251,15 @@ catch {
 }
 finally {
     if ($null -ne $MediaMtx) {
-        $MediaMtx.Refresh()
-        if (-not $MediaMtx.HasExited) {
-            Stop-Process -Id $MediaMtx.Id -Force -ErrorAction SilentlyContinue
-            [void]$MediaMtx.WaitForExit(5000)
+        try {
+            $MediaMtx.Refresh()
+            if (-not $MediaMtx.HasExited) {
+                Stop-Process -Id $MediaMtx.Id -Force -ErrorAction SilentlyContinue
+                [void]$MediaMtx.WaitForExit(5000)
+            }
+        }
+        finally {
+            $MediaMtx.Dispose()
         }
     }
     Assert-PortsReleased -Ports @(1935, 9997)

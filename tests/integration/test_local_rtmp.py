@@ -40,6 +40,7 @@ def test_local_rtmp_assets_delegate_application_orchestration_to_python() -> Non
     assert "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in script
     assert "AssignProcessToJobObject" in script
     assert "Assert-PortsReleased" in script
+    assert "@($Ports | Where-Object" in script
 
 
 def test_harness_uses_production_runtime_database_probe_and_command_paths() -> None:

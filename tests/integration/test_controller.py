@@ -672,6 +672,23 @@ def test_unexpected_resolver_and_run_exceptions_are_safe_and_do_not_kill_monitor
     assert first.stop_count == second.stop_count == 1
 
 
+def test_third_party_exception_message_is_never_exposed_in_snapshot() -> None:
+    class ThirdPartyFailure(Exception):
+        pass
+
+    message = "TOPSECRET stream-key=hunter2 token=plain-secret arbitrary customer text"
+    controller, _, _, _, _ = make_controller(FakeResolver([ThirdPartyFailure(message)]))
+
+    drive(controller.poll_once())
+
+    snapshot = drive(controller.snapshot())
+    assert snapshot.source_state is SourceState.ERROR
+    assert snapshot.error_detail == "unexpected_error"
+    assert "TOPSECRET" not in repr(snapshot)
+    assert "hunter2" not in repr(snapshot)
+    assert "plain-secret" not in repr(snapshot)
+
+
 def test_run_keeps_monitoring_when_error_backoff_itself_raises_once() -> None:
     class FlakySleeper(FakeSleeper):
         async def sleep(self, delay: float) -> None:
@@ -730,6 +747,39 @@ def test_stop_awaits_done_task_and_retrieves_its_exception(
     assert task.retrieved is True
     assert snapshot.desired_running is False
     assert snapshot.source_state is SourceState.STOPPED
+
+
+def test_stale_paused_save_cannot_overwrite_newer_desired_state() -> None:
+    class PauseOnce:
+        def __await__(self) -> Any:
+            yield "old-save-paused"
+
+    class RacingStore(FakeStore):
+        calls = 0
+
+        async def save(self, state: PersistedControllerState) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                await PauseOnce()
+            self.saved.append(state)
+
+    class NoopAsyncLock:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    store = RacingStore()
+    controller, _, _, _, _ = make_controller(FakeResolver([]), store=store)
+    controller._persistence_lock = NoopAsyncLock()  # type: ignore[assignment]
+    old_save = controller.set_destination_enabled("primary", False)
+    assert old_save.send(None) == "old-save-paused"
+
+    drive(controller.set_destination_enabled("primary", True))
+    drive(old_save)
+
+    assert store.saved[-1].enabled_destinations == ("primary", "secondary")
 
 
 def test_standby_rejects_network_urls_and_path_traversal() -> None:

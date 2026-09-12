@@ -19,7 +19,6 @@ from restream_studio.domain import (
     ResolvedStream,
     SourceState,
 )
-from restream_studio.security import redact
 from restream_studio.source import (
     LiveSourceResolver,
     ResolverNetworkError,
@@ -30,7 +29,6 @@ from restream_studio.source import (
 
 _SOURCE_BACKOFF: Final = (2.0, 5.0, 10.0, 20.0, 30.0)
 _SAFE_IDENTIFIER: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_URL_IN_TEXT: Final = re.compile(r"(?i)\b(?:https?|rtmps?)://\S+")
 
 
 class Clock(Protocol):
@@ -246,8 +244,11 @@ class Controller:
         self._state_lock = asyncio.Lock()
         self._cycle_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._persistence_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._lifecycle_generation = 0
+        self._persistence_version = 0
+        self._persisted_version = -1
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -286,6 +287,8 @@ class Controller:
             if self._task is not None and not self._task.done():
                 return
             async with self._state_lock:
+                if not self._desired_running:
+                    self._persistence_version += 1
                 self._desired_running = True
                 self._lifecycle_generation += 1
                 if self._state is SourceState.STOPPED:
@@ -301,6 +304,8 @@ class Controller:
             task = self._task
             task_error_detail: str | None = None
             async with self._state_lock:
+                if self._desired_running:
+                    self._persistence_version += 1
                 self._desired_running = False
                 self._lifecycle_generation += 1
             if task is not None and task is not asyncio.current_task():
@@ -417,6 +422,7 @@ class Controller:
             if self._enabled[identity] is enabled:
                 return
             self._enabled[identity] = enabled
+            self._persistence_version += 1
             self._output_generations[identity] += 1
             if not enabled:
                 self._inputs[identity] = OutputInput.NONE
@@ -702,15 +708,26 @@ class Controller:
     async def _persist(self) -> None:
         if self._state_store is None:
             return
-        async with self._state_lock:
-            state = PersistedControllerState(
-                room_identity=self._source.room_identity,
-                desired_running=self._desired_running,
-                enabled_destinations=tuple(
-                    identity for identity, enabled in self._enabled.items() if enabled
-                ),
-            )
-        await self._state_store.save(state)
+        repair_stale_write = False
+        async with self._persistence_lock:
+            while True:
+                async with self._state_lock:
+                    version = self._persistence_version
+                    if not repair_stale_write and version <= self._persisted_version:
+                        return
+                    state = PersistedControllerState(
+                        room_identity=self._source.room_identity,
+                        desired_running=self._desired_running,
+                        enabled_destinations=tuple(
+                            identity for identity, enabled in self._enabled.items() if enabled
+                        ),
+                    )
+                await self._state_store.save(state)
+                async with self._state_lock:
+                    if version == self._persistence_version:
+                        self._persisted_version = max(self._persisted_version, version)
+                        return
+                    repair_stale_write = True
 
     async def _active_generation(self) -> int | None:
         async with self._state_lock:
@@ -758,15 +775,21 @@ class Controller:
 
     @staticmethod
     def _safe_error(error: Exception) -> str:
-        try:
-            redacted = str(redact(str(error)))
-            without_urls = _URL_IN_TEXT.sub("<url>", redacted)
-            bounded = "".join(character for character in without_urls if character.isprintable())[
-                :160
-            ]
-        except Exception:  # noqa: BLE001 - exception formatting must never kill monitoring
-            return error.__class__.__name__
-        return bounded or error.__class__.__name__
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, ConnectionError):
+            return "network_error"
+        if isinstance(error, PermissionError):
+            return "permission_error"
+        if isinstance(error, OSError):
+            return "io_error"
+        if isinstance(error, ValueError):
+            return "invalid_value"
+        if isinstance(error, LookupError):
+            return "lookup_error"
+        if isinstance(error, RuntimeError):
+            return "runtime_error"
+        return "unexpected_error"
 
     @staticmethod
     def _retrieve_task_exception(task: asyncio.Task[None]) -> None:

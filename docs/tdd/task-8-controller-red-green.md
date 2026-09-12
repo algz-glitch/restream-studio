@@ -184,3 +184,37 @@ Ruff: All checks passed
 mypy: Success, no issues found in 30 source files
 165 synchronous regression tests passed, 1 deselected, in 0.22s
 ```
+
+## Final quality re-review closure
+
+Two focused regressions were written before implementation. RED was recorded as:
+
+```text
+2 failed in 0.23s
+```
+
+The first failure showed an arbitrary third-party message containing `TOPSECRET`, a stream key,
+and a plaintext token entering `ControllerSnapshot.error_detail`. The second interleaved an old
+paused save with a newer desired-state save and proved that the old completion became the final
+stored value.
+
+GREEN replaces exception-message publication with a strict exception-type whitelist that emits
+only fixed diagnostics (`timeout`, `network_error`, `permission_error`, `io_error`,
+`invalid_value`, `lookup_error`, `runtime_error`, or `unexpected_error`). No third-party exception
+text or sensitive field is copied to public state. This controller emits no internal exception
+log; any future internal logging must continue to use the existing redaction boundary.
+
+Persistence now has a dedicated `asyncio.Lock`, monotonic in-memory versioning, and stale-write
+repair. The writer snapshots the latest desired state under the state lock, performs the external
+save without holding that lock, verifies its version afterward, and rewrites the newest state if a
+concurrent mutation made the completed write stale. A queued writer skips only after the newest
+version is confirmed persisted.
+
+Final verification:
+
+```text
+29 focused Task 8 tests passed in 0.06s
+Ruff: All checks passed
+mypy: Success, no issues found in 30 source files
+167 synchronous regression tests passed, 1 deselected, in 0.22s
+```

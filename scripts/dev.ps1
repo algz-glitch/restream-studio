@@ -6,7 +6,10 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $LockFile = Join-Path $Root 'package-lock.json'
-$ViteScript = Join-Path $Root 'frontend\node_modules\vite\bin\vite.js'
+$ViteCandidates = @(
+    (Join-Path $Root 'node_modules\vite\bin\vite.js')
+    (Join-Path $Root 'frontend\node_modules\vite\bin\vite.js')
+)
 $FrontendPort = 5173
 
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
@@ -64,7 +67,11 @@ Push-Location $Root
 try {
     & $Npm ci --ignore-scripts --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE" }
-    if (-not (Test-Path -LiteralPath $ViteScript -PathType Leaf)) {
+    $ViteScript = $ViteCandidates | Where-Object {
+        $candidate = $_
+        Test-Path -LiteralPath $candidate -PathType Leaf
+    } | Select-Object -First 1
+    if ($null -eq $ViteScript) {
         throw 'Vite entry point is missing after npm ci'
     }
     $frontend = Start-Process -FilePath $Node `

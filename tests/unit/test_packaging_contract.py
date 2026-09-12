@@ -95,7 +95,11 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
 
 def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
     script = _read("scripts/dev.ps1")
-    assert "frontend\\node_modules\\vite\\bin\\vite.js" in script
+    root_vite = "node_modules\\vite\\bin\\vite.js"
+    frontend_vite = "frontend\\node_modules\\vite\\bin\\vite.js"
+    assert script.index(root_vite) < script.index(frontend_vite)
+    assert "Test-Path -LiteralPath $candidate -PathType Leaf" in script
+    assert "Select-Object -First 1" in script
     assert "--strictPort" in script
     assert "TcpClient" in script
     assert "Vite readiness timed out" in script

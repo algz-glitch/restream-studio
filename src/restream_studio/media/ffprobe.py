@@ -55,7 +55,7 @@ def _remaining_timeout(deadline: float) -> float:
     return remaining
 
 
-def validate_input_url(value: str) -> str:
+def validate_input_url(value: str, *, allow_local_test: bool = False) -> str:
     if not isinstance(value, str) or not value or any(
         ord(character) < 32 or ord(character) == 127 for character in value
     ):
@@ -66,22 +66,33 @@ def validate_input_url(value: str) -> str:
         port = parsed.port
     except ValueError:
         raise MediaProbeError("media URL is malformed") from None
-    if parsed.scheme.lower() not in {"http", "https"} or not host:
+    scheme = parsed.scheme.lower()
+    allowed_schemes = {"http", "https", "rtmp"} if allow_local_test else {"http", "https"}
+    if scheme not in allowed_schemes or not host:
         raise MediaProbeError("media URL must use HTTP or HTTPS")
     if parsed.username is not None or parsed.password is not None:
         raise MediaProbeError("media URL must not contain userinfo")
     if port is not None and not 1 <= port <= 65535:
         raise MediaProbeError("media URL port is malformed")
     lowered_host = host.casefold().rstrip(".")
-    if lowered_host == "localhost":
+    if lowered_host == "localhost" and not allow_local_test:
         raise MediaProbeError("media URL host must be public")
     try:
         address = ipaddress.ip_address(lowered_host)
     except ValueError:
         pass
     else:
-        if not address.is_global:
+        if allow_local_test and scheme == "rtmp" and not address.is_loopback:
+            raise MediaProbeError("local test media URL must use loopback")
+        if not allow_local_test and not address.is_global:
             raise MediaProbeError("media URL IP address must be public")
+    if allow_local_test and scheme == "rtmp" and lowered_host != "localhost":
+        try:
+            address = ipaddress.ip_address(lowered_host)
+        except ValueError:
+            raise MediaProbeError("local test media URL must use loopback") from None
+        if not address.is_loopback:
+            raise MediaProbeError("local test media URL must use loopback")
     return value
 
 
@@ -208,22 +219,28 @@ async def _resolve_host_addresses(host: str, port: int) -> tuple[str, ...]:
     return addresses
 
 
-async def _validate_resolved_host(url: str) -> None:
+async def _validate_resolved_host(url: str, *, allow_local_test: bool = False) -> None:
     parsed = urlsplit(url)
     host = cast(str, parsed.hostname)
     try:
-        ipaddress.ip_address(host.rstrip("."))
+        address = ipaddress.ip_address(host.rstrip("."))
+        if allow_local_test and not address.is_loopback:
+            raise MediaProbeError("local test media URL must use loopback")
         return
     except ValueError:
         pass
     addresses = await _resolve_host_addresses(
-        host, parsed.port or (443 if parsed.scheme == "https" else 80)
+        host, parsed.port or (443 if parsed.scheme == "https" else 1935 if parsed.scheme == "rtmp" else 80)
     )
     try:
         has_non_public = any(not ipaddress.ip_address(address).is_global for address in addresses)
     except ValueError:
         raise MediaProbeError("media URL host resolution returned malformed addresses") from None
-    if has_non_public:
+    if allow_local_test and any(
+        not ipaddress.ip_address(address).is_loopback for address in addresses
+    ):
+        raise MediaProbeError("local test media URL host must resolve only to loopback")
+    if not allow_local_test and has_non_public:
         raise MediaProbeError("media URL host must resolve only to public addresses")
 
 
@@ -279,12 +296,13 @@ async def _execute_ffprobe(
     max_output_bytes: int,
     max_stream_bytes: int,
 ) -> bytes:
+    protocol_whitelist = "rtmp,tcp" if urlsplit(url).scheme.lower() == "rtmp" else "http,https,tcp,tls,crypto"
     argv = (
         executable,
         "-v",
         "error",
         "-protocol_whitelist",
-        "http,https,tcp,tls,crypto",
+        protocol_whitelist,
         "-max_redirects",
         "0",
         *options,
@@ -320,15 +338,17 @@ async def probe_media(
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
     executable: str = "ffprobe",
+    allow_local_test: bool = False,
 ) -> MediaProbe:
-    """Probe one HTTP(S) input without a shell and return immutable metadata."""
-    validated_url = validate_input_url(url)
+    """Probe one validated input without a shell and return immutable metadata."""
+    validated_url = validate_input_url(url, allow_local_test=allow_local_test)
     if timeout <= 0 or max_output_bytes <= 0 or max_stream_bytes <= 0:
         raise ValueError("timeout and output limits must be positive")
     deadline = _monotonic() + timeout
     try:
         await asyncio.wait_for(
-            _validate_resolved_host(validated_url), timeout=_remaining_timeout(deadline)
+            _validate_resolved_host(validated_url, allow_local_test=allow_local_test),
+            timeout=_remaining_timeout(deadline),
         )
     except TimeoutError as exc:
         raise MediaProbeTimeoutError("media probe timed out") from exc

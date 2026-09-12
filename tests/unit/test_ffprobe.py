@@ -15,7 +15,19 @@ from restream_studio.media.ffprobe import (
     _parse_gop_seconds,
     _parse_probe,
     probe_media,
+    validate_input_url,
 )
+
+
+def test_validate_input_url_allows_only_explicit_loopback_rtmp_test_source() -> None:
+    url = "rtmp://127.0.0.1:1935/source/main"
+
+    with pytest.raises(MediaProbeError, match="HTTP or HTTPS"):
+        validate_input_url(url)
+
+    assert validate_input_url(url, allow_local_test=True) == url
+    with pytest.raises(MediaProbeError, match="loopback"):
+        validate_input_url("rtmp://192.168.1.8/live/main", allow_local_test=True)
 
 
 def payload(**changes: object) -> bytes:

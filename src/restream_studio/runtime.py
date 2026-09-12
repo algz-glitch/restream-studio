@@ -80,8 +80,16 @@ async def validate_destination_dns(
 
 
 class _Probe:
+    def __init__(self, *, executable: str = "ffprobe", allow_local_test: bool = False) -> None:
+        self._executable = executable
+        self._allow_local_test = allow_local_test
+
     async def probe(self, url: str) -> MediaProbe:
-        return await probe_media(url)
+        return await probe_media(
+            url,
+            executable=self._executable,
+            allow_local_test=self._allow_local_test,
+        )
 
 
 class _DestinationAdapter:
@@ -90,12 +98,16 @@ class _DestinationAdapter:
         config: RuntimeDestination,
         *,
         dns_validator: Callable[[DestinationKind, str], Awaitable[tuple[str, ...]]],
+        ffmpeg_executable: str = "ffmpeg",
+        allow_local_test: bool = False,
     ) -> None:
         self.identity = config.controller_identity
         self.destination = config.kind
         self._server = config.base_server
         self._key = config.stream_key
         self._dns_validator = dns_validator
+        self._ffmpeg_executable = ffmpeg_executable
+        self._allow_local_test = allow_local_test
         self._supervisor: OutputSupervisor | None = None
         self._last_command: FfmpegCommand | None = None
         self._state = OutputState.STOPPED
@@ -110,7 +122,16 @@ class _DestinationAdapter:
 
     def prepare_live(self, source_url: str, probe: MediaProbe) -> FfmpegCommand:
         target = f"{self._server.rstrip('/')}/{self._key}"
-        return build_ffmpeg_command(source_url, target, self.destination, probe)
+        command_destination = (
+            DestinationKind.LOCAL_TEST if self._allow_local_test else self.destination
+        )
+        return build_ffmpeg_command(
+            source_url,
+            target,
+            command_destination,
+            probe,
+            executable=self._ffmpeg_executable,
+        )
 
     def prepare_standby(self, standby: StandbyMedia) -> FfmpegCommand:
         del standby
@@ -119,7 +140,10 @@ class _DestinationAdapter:
     async def restart(self, command: object) -> None:
         if not isinstance(command, FfmpegCommand):
             raise RuntimeBuildError("output command is invalid")
-        await self._dns_validator(self.destination, self._server)
+        validation_destination = (
+            DestinationKind.LOCAL_TEST if self._allow_local_test else self.destination
+        )
+        await self._dns_validator(validation_destination, self._server)
         await self.stop()
         self._last_command = command
         self._supervisor = OutputSupervisor(
@@ -145,12 +169,22 @@ class RuntimeManager:
         database: Database,
         *,
         resolver_factory: Callable[[], LiveSourceResolver] = DouyinResolver,
-        probe_factory: Callable[[], MediaProbePort] = _Probe,
+        probe_factory: Callable[[], MediaProbePort] | None = None,
         destination_tester: DestinationTester | None = None,
+        ffmpeg_executable: str = "ffmpeg",
+        ffprobe_executable: str = "ffprobe",
+        allow_local_test: bool = False,
     ) -> None:
         self._database = database
         self._resolver_factory = resolver_factory
-        self._probe_factory = probe_factory
+        self._probe_factory = probe_factory or (
+            lambda: _Probe(
+                executable=ffprobe_executable,
+                allow_local_test=allow_local_test,
+            )
+        )
+        self._ffmpeg_executable = ffmpeg_executable
+        self._allow_local_test = allow_local_test
         self._destination_tester = destination_tester or DestinationTester(
             dns_validator=validate_destination_dns
         )
@@ -180,7 +214,10 @@ class RuntimeManager:
             if source is not None and destinations:
                 for item in destinations:
                     new_adapters[item.kind] = _DestinationAdapter(
-                        item, dns_validator=validate_destination_dns
+                        item,
+                        dns_validator=validate_destination_dns,
+                        ffmpeg_executable=self._ffmpeg_executable,
+                        allow_local_test=self._allow_local_test,
                     )
                 configured = tuple(
                     ConfiguredDestination(item.controller_identity, new_adapters[item.kind], item.enabled)

@@ -1,42 +1,22 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
+import socket
 import subprocess
-from collections.abc import Coroutine
 from pathlib import Path
-from types import ModuleType
-from typing import Any, cast
+from time import monotonic, sleep
 
 import pytest
 
-from restream_studio.domain import DestinationKind, MediaProbe
-from restream_studio.orchestration import ConfiguredDestination, Controller
-from restream_studio.outputs import OutputSupervisor
+from restream_studio.persistence import Database
+from restream_studio.runtime import RuntimeManager
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "tools" / "mediamtx" / "mediamtx.yml"
 SCRIPT = ROOT / "scripts" / "e2e-local.ps1"
 HARNESS = ROOT / "scripts" / "e2e_local_harness.py"
 RESULT = ROOT / "artifacts" / "e2e-local" / "result.json"
-
-
-def load_harness() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("e2e_local_harness", HARNESS)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def drive[T](coroutine: Coroutine[Any, Any, T]) -> T:
-    """Drive fake-only coroutines without constructing the blocked host event loop."""
-    try:
-        while True:
-            coroutine.send(None)
-    except StopIteration as stopped:
-        return cast(T, stopped.value)
 
 
 def test_local_rtmp_assets_delegate_application_orchestration_to_python() -> None:
@@ -57,73 +37,41 @@ def test_local_rtmp_assets_delegate_application_orchestration_to_python() -> Non
     assert "required tool is unavailable: mediamtx" in script
     assert "Stop-Process -Name" not in script
     assert "taskkill /IM" not in script
+    assert "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in script
+    assert "AssignProcessToJobObject" in script
+    assert "Assert-PortsReleased" in script
 
 
-def test_harness_imports_real_controller_and_supervisor_types() -> None:
-    harness = load_harness()
+def test_harness_uses_production_runtime_database_probe_and_command_paths() -> None:
+    source = HARNESS.read_text(encoding="utf-8")
 
-    assert harness.Controller is Controller
-    assert harness.ConfiguredDestination is ConfiguredDestination
-    assert harness.OutputSupervisor is OutputSupervisor
-
-
-def test_harness_destination_adapter_delegates_process_lifecycle_to_supervisor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    harness = load_harness()
-    calls: list[tuple[DestinationKind, tuple[str, ...]]] = []
-
-    class SupervisorSpy:
-        def __init__(
-            self,
-            destination: DestinationKind,
-            argv: tuple[str, ...],
-            **_: object,
-        ) -> None:
-            calls.append((destination, argv))
-            self.state = harness.OutputState.STOPPED
-
-        async def start(self) -> None:
-            self.state = harness.OutputState.LIVE
-
-        async def stop(self) -> None:
-            self.state = harness.OutputState.STOPPED
-
-    monkeypatch.setattr(harness, "OutputSupervisor", SupervisorSpy)
-    adapter = harness.LocalRtmpDestinationAdapter(
-        identity="douyin",
-        destination=DestinationKind.DOUYIN,
-        target_url="rtmp://127.0.0.1:1935/target/douyin",
-        ffmpeg="ffmpeg",
-    )
-    probe = MediaProbe("h264", "aac", 640, 360, 30.0)
-
-    drive(adapter.restart(adapter.prepare_live("rtmp://127.0.0.1:1935/source/main", probe)))
-    drive(adapter.stop())
-
-    assert len(calls) == 1
-    assert calls[0][0] is DestinationKind.DOUYIN
-    assert calls[0][1][0] == "ffmpeg"
-    assert "rtmp://127.0.0.1:1935/target/douyin" in calls[0][1]
+    assert "RuntimeManager" in source
+    assert "Database" in source
+    assert "probe_media" in source
+    assert "LocalMediaProbe" not in source
+    assert "LocalRtmpDestinationAdapter" not in source
+    assert "ConfiguredDestination" not in source
+    assert "build_ffmpeg_command" not in source
 
 
-def test_harness_builds_real_controller_with_two_configured_destinations() -> None:
-    harness = load_harness()
-    controller = harness.build_controller(
+def test_harness_runtime_factory_returns_production_objects() -> None:
+    import scripts.e2e_local_harness as harness
+
+    runtime_dir = ROOT / "artifacts" / "pytest-runtime-factory"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    database_file = runtime_dir / "restream-studio-e2e.sqlite3"
+    database_file.unlink(missing_ok=True)
+    runtime, database = harness.build_runtime(
+        runtime_dir=runtime_dir,
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
-        standby_after_seconds=61.0,
     )
-
-    assert isinstance(controller, Controller)
-    configured = controller._destinations
-    assert len(configured) == 2
-    assert all(isinstance(item, ConfiguredDestination) for item in configured)
-    assert [item.identity for item in configured] == ["douyin", "wechat"]
-    assert [item.supervisor.destination for item in configured] == [
-        DestinationKind.DOUYIN,
-        DestinationKind.WECHAT,
-    ]
+    try:
+        assert isinstance(runtime, RuntimeManager)
+        assert isinstance(database, Database)
+    finally:
+        database.close()
+        database_file.unlink(missing_ok=True)
 
 
 def test_artifacts_are_ignored() -> None:
@@ -142,7 +90,7 @@ def test_artifacts_are_ignored() -> None:
     reason="set RUN_LOCAL_RTMP_E2E=1 to run the 60-second local RTMP acceptance",
 )
 def test_dual_target_restream_recovers_end_to_end() -> None:
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [
             "powershell",
             "-NoProfile",
@@ -154,9 +102,15 @@ def test_dual_target_restream_recovers_end_to_end() -> None:
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=240,
-        check=False,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=240)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        _wait_for_ports_released((1935, 9997), timeout=10.0)
+        pytest.fail(f"local RTMP acceptance timed out\n{stdout}{stderr}")
+    completed = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
     evidence = json.loads(RESULT.read_text(encoding="utf-8"))
@@ -165,9 +119,8 @@ def test_dual_target_restream_recovers_end_to_end() -> None:
     assert [check["name"] for check in evidence["checks"]] == [
         "initial_dual_target",
         "target_isolation",
-        "standby_after_source_loss",
-        "recovery_probe_1",
-        "recovery_probe_2",
+        "source_loss_detected",
+        "recovered_live",
     ]
     assert all(check["passed"] is True for check in evidence["checks"])
     assert len(evidence["application_snapshots"]) >= 5
@@ -180,3 +133,26 @@ def test_dual_target_restream_recovers_end_to_end() -> None:
     assert "rtmp://" not in serialized
     assert "stream_key" not in serialized.casefold()
     assert "pid" not in serialized.casefold()
+    assert "room_identity" not in serialized.casefold()
+    assert evidence["source_probe"]["decision"] in {"copy", "transcode"}
+    assert evidence["source_probe"]["frame_rate"] > 0
+
+
+def _wait_for_ports_released(ports: tuple[int, ...], *, timeout: float) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if all(_port_available(port) for port in ports):
+            return
+        sleep(0.1)
+    pytest.fail(f"local ports were not released: {ports}")
+
+
+def _port_available(port: int) -> bool:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", port))
+    except OSError:
+        return False
+    finally:
+        listener.close()
+    return True

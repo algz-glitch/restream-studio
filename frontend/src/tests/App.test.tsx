@@ -67,6 +67,45 @@ describe('播控台', () => {
     expect(await screen.findByText('配置已被其他操作更新，已刷新，请重新检查后保存。')).toBeVisible()
   })
 
+  it('来源冲突后的刷新失败只显示固定脱敏错误', async () => {
+    let sourceReads = 0
+    const baseFetch = installApi({
+      'PUT /api/source': json({ error: { code: 'write_conflict', message: 'changed', fields: {}, request_id: 'r' } }, { status: 409 }),
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/source' && (init?.method ?? 'GET') === 'GET' && sourceReads++ > 0) {
+        return json({ error: { code: 'refresh_failed', message: 'C:\\private\\source token=secret', fields: {}, request_id: 'r' } }, { status: 500 })
+      }
+      return baseFetch(input, init)
+    }))
+    const user = userEvent.setup(); render(<App />)
+    const input = await screen.findByLabelText('抖音直播间地址')
+    await user.clear(input); await user.type(input, 'https://live.douyin.com/654321')
+    await user.click(screen.getByRole('button', { name: '保存来源' }))
+    expect(await screen.findByText('配置冲突后刷新失败，请重试。')).toBeVisible()
+    expect(screen.queryByText(/private|token=secret/)).not.toBeInTheDocument()
+  })
+
+  it('输出冲突后的刷新失败只显示固定脱敏错误', async () => {
+    let destinationReads = 0
+    const baseFetch = installApi({
+      'PUT /api/destinations/douyin': json({ error: { code: 'write_conflict', message: 'changed', fields: {}, request_id: 'r' } }, { status: 412 }),
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/destinations/douyin' && (init?.method ?? 'GET') === 'GET' && destinationReads++ > 0) {
+        return json({ error: { code: 'refresh_failed', message: 'stream_key=private-output-key', fields: {}, request_id: 'r' } }, { status: 500 })
+      }
+      return baseFetch(input, init)
+    }))
+    const user = userEvent.setup(); render(<App />)
+    const card = await screen.findByRole('region', { name: '抖音输出' })
+    await user.click(within(card).getByRole('button', { name: '保存输出' }))
+    expect(await within(card).findByText('配置冲突后刷新失败，请重试。')).toBeVisible()
+    expect(screen.queryByText(/private-output-key/)).not.toBeInTheDocument()
+  })
+
   it('两个目标操作独立：单独重连不阻塞另一张卡', async () => {
     let resolveReconnect: ((value: Response) => void) | undefined
     installApi({ 'POST /api/destinations/douyin/reconnect': new Promise<Response>((resolve) => { resolveReconnect = resolve }) })
@@ -102,6 +141,14 @@ describe('播控台', () => {
     render(<App />)
     const badges = await screen.findAllByText(label)
     expect(badges[0].previousElementSibling).toHaveAttribute('aria-hidden', 'true')
+  })
+
+  it('监控指标使用原生表格表头和数据单元格', async () => {
+    installApi(); render(<App />)
+    const table = await screen.findByRole('table', { name: '来源与输出实时指标' })
+    expect(within(table).getAllByRole('columnheader')).toHaveLength(8)
+    expect(within(table).getAllByRole('row')).toHaveLength(4)
+    expect(within(table).getAllByRole('cell').length).toBeGreaterThanOrEqual(24)
   })
 
   it('开始与停止调用真实 API，只有活跃输出时停止需要可聚焦确认', async () => {
@@ -148,19 +195,26 @@ describe('播控台', () => {
   it('页面隐藏时停止轮询，再显示立即刷新，并取消旧请求避免过期响应覆盖', async () => {
     vi.useFakeTimers()
     const signals: AbortSignal[] = []
+    let statusCalls = 0
     const mock = installApi()
     mock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = typeof input === 'string' ? input : input.toString()
-      if (path === '/api/status') signals.push(init?.signal as AbortSignal)
+      if (path === '/api/status') {
+        signals.push(init?.signal as AbortSignal)
+        statusCalls += 1
+        if (statusCalls === 2) return new Promise<Response>(() => undefined)
+      }
       const map: Record<string, unknown> = { '/api/session': { session_token: 't' }, '/api/source': source, '/api/destinations/douyin': destinations.douyin, '/api/destinations/wechat_channels': destinations.wechat_channels, '/api/status': status, '/api/events?limit=50&cursor=0': events }
       return json(map[path], path.includes('/source') || path.includes('/destinations/') ? { headers: { ETag: '"1"' } } : {})
     })
     const view = render(<App />); await screen.findByText('离线')
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+    expect(signals).toHaveLength(2)
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' }); document.dispatchEvent(new Event('visibilitychange'))
     await act(async () => { await vi.advanceTimersByTimeAsync(4000) })
-    expect(signals).toHaveLength(1); expect(signals[0].aborted).toBe(true)
+    expect(signals).toHaveLength(2); expect(signals[1].aborted).toBe(true)
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange'))
-    await act(async () => { await Promise.resolve() }); expect(signals.length).toBeGreaterThan(1)
+    await act(async () => { await Promise.resolve() }); expect(signals).toHaveLength(3)
     const latest = signals.at(-1); view.unmount(); expect(latest?.aborted).toBe(true)
   })
 
@@ -241,6 +295,27 @@ describe('播控台', () => {
     expect(stop).toHaveFocus()
   })
 
+  it('停止确认对话框循环焦点并隐藏主内容，关闭后恢复', async () => {
+    installApi({ '/api/status': { ...status, desired_running: true, outputs: [{ ...status.outputs[0], status: 'LIVE' }] } })
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: '停止全部' }))
+    const main = screen.getByRole('main', { hidden: true })
+    const dialog = screen.getByRole('dialog', { name: '停止全部输出？' })
+    const cancel = within(dialog).getByRole('button', { name: '继续监控' })
+    const confirm = within(dialog).getByRole('button', { name: '确认停止' })
+    expect(main).toHaveAttribute('inert')
+    expect(main).toHaveAttribute('aria-hidden', 'true')
+    expect(confirm).toHaveFocus()
+    await user.tab()
+    expect(cancel).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(confirm).toHaveFocus()
+    await user.click(cancel)
+    expect(screen.getByRole('main')).not.toHaveAttribute('inert')
+    expect(screen.getByRole('main')).not.toHaveAttribute('aria-hidden')
+  })
+
   it('可见时严格每 2 秒轮询一次状态', async () => {
     vi.useFakeTimers()
     const mock = installApi()
@@ -252,6 +327,30 @@ describe('播控台', () => {
     expect(countStatus()).toBe(1)
     await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     expect(countStatus()).toBe(2)
+  })
+
+  it('慢状态请求完成后才等待 2 秒再轮询且不会被定时器中止', async () => {
+    vi.useFakeTimers()
+    let resolveStatus: ((value: Response) => void) | undefined
+    const signals: AbortSignal[] = []
+    const baseFetch = installApi({ '/api/status': new Promise<Response>((resolve) => { resolveStatus = resolve }) })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/status') signals.push(init?.signal as AbortSignal)
+      return baseFetch(input, init)
+    }))
+    render(<App />)
+    await act(async () => { await Promise.resolve() })
+    expect(signals).toHaveLength(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000) })
+    expect(signals).toHaveLength(1)
+    expect(signals[0].aborted).toBe(false)
+    resolveStatus?.(json(status))
+    await act(async () => { await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1999) })
+    expect(signals).toHaveLength(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(signals).toHaveLength(2)
   })
 
   it('日志请求用 sequence 阻止忽略 abort 的旧响应覆盖新响应', async () => {

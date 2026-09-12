@@ -4,12 +4,14 @@
   "private": true,
   "workspaces": ["frontend"],
   "scripts": {
-    "build": "npm --prefix frontend run build",
+    "build": "npm run frontend:build && npm run backend:wheel",
+    "frontend:build": "npm --prefix frontend run build",
     "lint": "npm --prefix frontend run lint",
     "test": "npm --prefix frontend run test -- --run",
     "typecheck": "npm --prefix frontend run typecheck",
     "verify": "npm run typecheck && npm run lint && npm test && npm run build",
-    "backend:build": ".venv\\Scripts\\python.exe -m pip wheel . --no-deps --wheel-dir dist",
+    "backend:build": "npm run backend:wheel",
+    "backend:wheel": ".venv\\Scripts\\python.exe -m pip wheel . --no-deps --wheel-dir dist",
     "backend:lint": ".venv\\Scripts\\python.exe -m ruff check .",
     "backend:test": ".venv\\Scripts\\python.exe -m pytest",
     "backend:typecheck": ".venv\\Scripts\\python.exe -m mypy src tests"

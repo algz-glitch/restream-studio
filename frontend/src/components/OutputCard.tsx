@@ -31,7 +31,13 @@ export function OutputCard({ destination, api, onChange }: Props) {
     } catch (cause) {
       if (isAbortError(cause)) return
       if (cause instanceof ApiError && [409, 412].includes(cause.status) && type === 'save') {
-        const fresh = await api.getDestination(destination.kind, request.current.signal); onChange(fresh.data); setFeedback('配置已更新，已刷新，请重新检查。')
+        try {
+          const fresh = await api.getDestination(destination.kind, request.current.signal)
+          onChange(fresh.data)
+          setFeedback('配置已更新，已刷新，请重新检查。')
+        } catch (refreshCause) {
+          if (!isAbortError(refreshCause)) setError('配置冲突后刷新失败，请重试。')
+        }
       } else setError(type === 'save' ? '保存失败，请重试。' : '操作失败，请重试。')
     } finally { setBusy(null) }
   }

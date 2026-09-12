@@ -12,6 +12,7 @@
 !.env.example
 /runtime/
 /artifacts/
+/test-tmp-task11/
 
 # Secrets and session data
 /stream-keys.json

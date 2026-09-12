@@ -32,7 +32,13 @@ export function SourceCard({ source, api, onChange }: Props) {
     } catch (cause) {
       if (isAbortError(cause)) return
       if (cause instanceof ApiError && [409, 412].includes(cause.status)) {
-        const fresh = await api.getSource(request.current.signal); onChange(fresh.data); setNotice('配置已被其他操作更新，已刷新，请重新检查后保存。')
+        try {
+          const fresh = await api.getSource(request.current.signal)
+          onChange(fresh.data)
+          setNotice('配置已被其他操作更新，已刷新，请重新检查后保存。')
+        } catch (refreshCause) {
+          if (!isAbortError(refreshCause)) setError('配置冲突后刷新失败，请重试。')
+        }
       } else if (cause instanceof ApiError && cause.fields.room_url) setError('直播间地址未通过校验。')
       else setError('来源保存失败，请重试。')
     } finally { setBusy(false) }

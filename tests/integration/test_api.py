@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import shutil
+import subprocess
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -460,6 +463,44 @@ def test_frontend_mount_is_optional_and_does_not_shadow_api(tmp_path: Path, harn
         assert client.get("/health").json() == {"status": "ok"}
         assert client.get("/api/missing").status_code == 404
         assert "error" in client.get("/api/missing").json()
+
+
+def test_frontend_build_is_served_with_referenced_assets(harness: Harness) -> None:
+    root = Path(__file__).resolve().parents[2]
+    assets_dir = root / "src" / "restream_studio" / "static"
+    npm = shutil.which("npm")
+    assert npm is not None
+    subprocess.run(
+        [
+            npm,
+            "run",
+            "frontend:build",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    application = create_app(
+        lambda: ApiDependencies(harness.db, harness.controller, assets_dir=assets_dir)
+    )
+    with TestClient(application, headers={"host": "localhost"}) as client:
+        index = client.get("/")
+        assert index.status_code == 200
+        referenced_assets = re.findall(r'(?:src|href)="(/assets/[^"]+)"', index.text)
+        assert referenced_assets
+        for asset in referenced_assets:
+            response = client.get(asset)
+            assert response.status_code == 200
+            assert response.content
+
+
+def test_root_build_pipeline_builds_frontend_then_backend_wheel() -> None:
+    root = Path(__file__).resolve().parents[2]
+    scripts = json.loads((root / "package.json").read_text(encoding="utf-8"))["scripts"]
+    assert scripts["build"] == "npm run frontend:build && npm run backend:wheel"
+    assert scripts["frontend:build"] == "npm --prefix frontend run build"
+    assert "pip wheel" in scripts["backend:wheel"]
 
 
 def test_concurrent_put_same_body_is_idempotent_and_stale_different_body_conflicts(

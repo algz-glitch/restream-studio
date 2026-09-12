@@ -267,27 +267,32 @@ input:focus-visible,select:focus-visible,.button:focus-visible {
 .lower-grid>.panel {
   margin-top:0
 }
-.monitor-table {
+.monitor-scroll {
   overflow-x:auto
 }
-.monitor-row {
-  position:relative;
-  display:grid;
-  grid-template-columns:minmax(110px,1.3fr) 90px 80px repeat(5,minmax(64px,1fr));
-  gap:12px;
-  align-items:center;
+.monitor-table {
+  width:100%;
   min-width:800px;
-  padding:12px 4px;
-  border-top:1px solid var(--border);
+  border-collapse:collapse;
   font-size:13px
 }
-.monitor-head {
+.monitor-table th,
+.monitor-table td {
+  padding:12px 4px;
+  border-top:1px solid var(--border);
+  text-align:left;
+  vertical-align:middle
+}
+.monitor-table th {
   border:0;
   color:var(--muted);
-  font-size:12px
+  font-size:12px;
+  font-weight:500
 }
 .row-error {
-  grid-column:1/-1
+  display:block;
+  margin-top:4px;
+  color:var(--danger)
 }
 .mono {
   font-family:ui-monospace,SFMono-Regular,Consolas,monospace
@@ -458,7 +463,7 @@ input:focus-visible,select:focus-visible,.button:focus-visible {
   .output-grid {
     gap:12px
   }
-  .monitor-table {
+  .monitor-scroll {
     margin:0 -16px;
     padding:0 16px
   }

@@ -1,0 +1,7 @@
+{
+  "project": "Restream Studio",
+  "framework": "vite-react-typescript",
+  "devCommand": "npm --prefix frontend run dev",
+  "url": "http://127.0.0.1:5173",
+  "surface": "frontend/src/App.tsx"
+}

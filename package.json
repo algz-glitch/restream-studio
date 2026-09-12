@@ -2,11 +2,16 @@
   "name": "restream-studio",
   "version": "0.1.0",
   "private": true,
+  "workspaces": ["frontend"],
   "scripts": {
-    "build": ".venv\\Scripts\\python.exe -m pip wheel . --no-deps --wheel-dir dist",
-    "lint": ".venv\\Scripts\\python.exe -m ruff check .",
-    "test": ".venv\\Scripts\\python.exe -m pytest",
-    "typecheck": ".venv\\Scripts\\python.exe -m mypy src tests",
-    "verify": "npm run lint && npm run typecheck && npm test"
+    "build": "npm --prefix frontend run build",
+    "lint": "npm --prefix frontend run lint",
+    "test": "npm --prefix frontend run test -- --run",
+    "typecheck": "npm --prefix frontend run typecheck",
+    "verify": "npm run typecheck && npm run lint && npm test && npm run build",
+    "backend:build": ".venv\\Scripts\\python.exe -m pip wheel . --no-deps --wheel-dir dist",
+    "backend:lint": ".venv\\Scripts\\python.exe -m ruff check .",
+    "backend:test": ".venv\\Scripts\\python.exe -m pytest",
+    "backend:typecheck": ".venv\\Scripts\\python.exe -m mypy src tests"
   }
 }

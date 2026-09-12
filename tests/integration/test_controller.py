@@ -5,10 +5,12 @@ from collections import deque
 from collections.abc import Coroutine
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from restream_studio.config import AppPaths
 from restream_studio.domain import (
     DestinationKind,
     MediaProbe,
@@ -21,10 +23,12 @@ from restream_studio.orchestration.controller import (
     ConfiguredSource,
     Controller,
     ControllerSnapshot,
+    ControllerStateStore,
     OutputFailure,
     PersistedControllerState,
     StandbyMedia,
 )
+from restream_studio.persistence.database import Database
 from restream_studio.source import (
     LiveSourceResolver,
     ResolverNetworkError,
@@ -180,7 +184,7 @@ def make_controller(
     *,
     probe: FakeProbe | None = None,
     clock: FakeClock | None = None,
-    store: FakeStore | None = None,
+    store: ControllerStateStore | None = None,
 ) -> tuple[Controller, FakeClock, FakeSleeper, FakeSupervisor, FakeSupervisor]:
     clock = clock or FakeClock()
     sleeper = FakeSleeper(clock)
@@ -200,6 +204,42 @@ def make_controller(
         state_store=store,
     )
     return controller, clock, sleeper, douyin, wechat
+
+
+def test_real_controller_store_round_trips_primary_secondary_identities(tmp_path: Path) -> None:
+    paths = AppPaths.create(tmp_path / "controller-store")
+    encrypt = lambda value: "cipher:" + value[::-1]
+    decrypt = lambda value: value.removeprefix("cipher:")[::-1]
+    with Database(
+        paths.database_file,
+        paths=paths,
+        encrypt_secret=encrypt,
+        decrypt_secret=decrypt,
+    ) as database:
+        database.set_destination(
+            DestinationKind.DOUYIN,
+            "rtmp://one.test/app",
+            "one",
+            controller_identity="primary",
+        )
+        database.set_destination(
+            DestinationKind.WECHAT,
+            "rtmp://two.test/app",
+            "two",
+            controller_identity="secondary",
+        )
+        first, _, _, _, _ = make_controller(FakeResolver([]), store=database)
+        drive(first.initialize())
+        drive(first.set_destination_enabled("secondary", False))
+
+        second, _, _, _, _ = make_controller(FakeResolver([]), store=database)
+        drive(second.initialize())
+        restored = drive(second.snapshot())
+
+    assert [(item.identity, item.enabled) for item in restored.outputs] == [
+        ("primary", True),
+        ("secondary", False),
+    ]
 
 
 def test_offline_source_stays_monitoring_without_starting_outputs() -> None:

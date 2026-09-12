@@ -141,3 +141,41 @@ Final review verification:
 Ruff: All checks passed
 mypy: Success, no issues found in 34 source files
 ```
+
+## Identity and import re-review closure
+
+The final two findings were reproduced before production changes. The focused RED run reported
+13 failures: both database and real-controller tests rejected the missing
+`controller_identity` API, v1 migration returned no enabled identities, and all ten string,
+integer, or null pseudo-boolean imports were accepted.
+
+Schema v3 adds a unique, non-empty, non-secret `controller_identity` to each of the three strict
+destination-kind rows. New rows default to the persisted kind identity; explicit identities such
+as `primary` and `secondary` survive public DTO/export, controller save, and controller load.
+Controller save matches enabled identities against `controller_identity`, never against kind.
+
+For direct v1 upgrades, migration 2 now retains the legacy `enabled_destinations_json` in a
+migration-only table before removing the duplicate source column. Migration 3 validates and
+deduplicates that list, maps known kind identities directly and remaining identities
+deterministically by destination order, restores enabled flags, and removes the migration table in
+the same transaction. Existing v2 databases preserve their current enabled flags and receive
+kind-based default identities.
+
+Import now accepts `desired_running` and destination `enabled` only when `type(value) is bool`.
+Explicit strings, integers, and null are rejected during full-payload validation before the single
+write transaction, leaving source and destination rows unchanged.
+
+The real Task 8 `Controller` is exercised with `ConfiguredDestination("primary", ...)` and
+`ConfiguredDestination("secondary", ...)` against the SQLite store: disable, save, fresh
+controller initialize, and snapshot all preserve the two configured identities.
+
+Final commands and results are recorded after implementation formatting:
+
+```text
+tests/unit/test_database.py: 50 passed
+tests/unit/test_database.py + tests/integration/test_controller.py: 80 passed
+synchronous regression: 218 passed, 1 deselected
+Ruff: All checks passed
+mypy: Success, no issues found in 34 source files
+git diff --check: clean
+```

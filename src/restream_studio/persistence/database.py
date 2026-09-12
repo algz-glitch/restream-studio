@@ -27,6 +27,7 @@ from restream_studio.source import normalize_douyin_url
 _BUSY_TIMEOUT_MS: Final = 5_000
 _EVENT_LIMIT: Final = 5_000
 _SAFE_EVENT_NAME: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_SAFE_CONTROLLER_IDENTITY: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _URL_IN_TEXT: Final = re.compile(r"(?i)\b(?:https?|rtmps?)://[^\s\"'<>]+")
 _SECRET_ASSIGNMENT: Final = re.compile(
     r"(?i)\b(stream[_-]?key|token|password|passwd|secret|authorization|cookie)"
@@ -78,6 +79,7 @@ class SourceConfig:
 @dataclass(frozen=True, slots=True)
 class DestinationConfig:
     kind: DestinationKind
+    controller_identity: str
     base_server: str
     enabled: bool
     configured: bool
@@ -86,6 +88,7 @@ class DestinationConfig:
 @dataclass(frozen=True, slots=True)
 class RuntimeDestination:
     kind: DestinationKind
+    controller_identity: str
     base_server: str
     stream_key: str = dataclass_field(repr=False)
     enabled: bool = True
@@ -146,6 +149,11 @@ def _migration_1(connection: sqlite3.Connection) -> None:
 
 
 def _migration_2(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE TABLE _migration_v1_state(enabled_json TEXT NOT NULL)")
+    connection.execute(
+        "INSERT INTO _migration_v1_state(enabled_json) "
+        "SELECT enabled_destinations_json FROM source_config WHERE singleton_id=1"
+    )
     connection.execute("ALTER TABLE source_config RENAME TO source_config_v1")
     connection.execute(
         "CREATE TABLE source_config ("
@@ -203,7 +211,73 @@ def _migration_2(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX idx_events_created_id ON events(created_at, id)")
 
 
-MIGRATIONS: tuple[Migration, ...] = (_migration_1, _migration_2)
+def _migration_3(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT kind, base_server, encrypted_stream_key, enabled, updated_at "
+        "FROM destination_config "
+        "ORDER BY CASE kind WHEN 'douyin' THEN 1 WHEN 'wechat_channels' THEN 2 ELSE 3 END"
+    ).fetchall()
+    legacy_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_migration_v1_state'"
+    ).fetchone()
+    legacy_enabled: list[str] | None = None
+    if legacy_table is not None:
+        legacy_row = connection.execute(
+            "SELECT enabled_json FROM _migration_v1_state LIMIT 1"
+        ).fetchone()
+        if legacy_row is not None:
+            try:
+                parsed = json.loads(str(legacy_row[0]))
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list) and all(
+                isinstance(item, str) and _SAFE_CONTROLLER_IDENTITY.fullmatch(item) is not None
+                for item in parsed
+            ):
+                legacy_enabled = list(dict.fromkeys(parsed))
+
+    identities = {str(row[0]): str(row[0]) for row in rows}
+    enabled = {str(row[0]): bool(row[3]) for row in rows}
+    if legacy_enabled is not None:
+        available = [str(row[0]) for row in rows]
+        assigned: set[str] = set()
+        enabled = {kind: False for kind in available}
+        for identity in legacy_enabled:
+            preferred = _legacy_kind(identity)
+            target = preferred if preferred in available and preferred not in assigned else None
+            if target is None:
+                target = next((kind for kind in available if kind not in assigned), None)
+            if target is None:
+                break
+            identities[target] = identity
+            enabled[target] = True
+            assigned.add(target)
+
+    connection.execute("ALTER TABLE destination_config RENAME TO destination_config_v2")
+    connection.execute(
+        "CREATE TABLE destination_config ("
+        "kind TEXT PRIMARY KEY CHECK(kind IN ('douyin','wechat_channels','local_test')), "
+        "controller_identity TEXT NOT NULL UNIQUE "
+        "CHECK(length(trim(controller_identity)) BETWEEN 1 AND 128), "
+        "base_server TEXT NOT NULL CHECK("
+        "(lower(base_server) LIKE 'rtmp://%' OR lower(base_server) LIKE 'rtmps://%') AND "
+        "instr(base_server, '?') = 0 AND instr(base_server, '#') = 0 AND instr(base_server, '@') = 0), "
+        "encrypted_stream_key TEXT NOT NULL CHECK(length(encrypted_stream_key) > 0), "
+        "enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)), updated_at TEXT NOT NULL)"
+    )
+    for row in rows:
+        kind = str(row[0])
+        connection.execute(
+            "INSERT INTO destination_config(kind, controller_identity, base_server, "
+            "encrypted_stream_key, enabled, updated_at) VALUES(?,?,?,?,?,?)",
+            (kind, identities[kind], row[1], row[2], int(enabled[kind]), row[4]),
+        )
+    connection.execute("DROP TABLE destination_config_v2")
+    if legacy_table is not None:
+        connection.execute("DROP TABLE _migration_v1_state")
+
+
+MIGRATIONS: tuple[Migration, ...] = (_migration_1, _migration_2, _migration_3)
 
 
 class Database:
@@ -387,6 +461,7 @@ class Database:
             },
             "destination_config": {
                 "kind",
+                "controller_identity",
                 "base_server",
                 "encrypted_stream_key",
                 "enabled",
@@ -434,6 +509,7 @@ class Database:
             "json_valid(payload_json)",
             "backoff_initial_seconds between 1.0 and 60.0",
             "encrypted_stream_key",
+            "controller_identity text not null unique",
             "desired_running in (0, 1)",
         )
         if (
@@ -510,6 +586,7 @@ class Database:
         stream_key: str,
         *,
         enabled: bool = True,
+        controller_identity: str | None = None,
     ) -> None:
         server = _validate_base_server(base_server)
         secret = _validate_plaintext_secret(stream_key)
@@ -520,13 +597,26 @@ class Database:
         if not encrypted or encrypted == secret:
             raise DestinationSecretError("Secret encryption returned invalid ciphertext")
         storage_kind = _storage_kind(kind)
+        identity = _validate_controller_identity(controller_identity or storage_kind)
+        replace_identity = controller_identity is not None
         with self.transaction() as connection:
             connection.execute(
-                "INSERT INTO destination_config(kind, base_server, encrypted_stream_key, enabled, updated_at) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(kind) DO UPDATE SET base_server=excluded.base_server, "
+                "INSERT INTO destination_config(kind, controller_identity, base_server, "
+                "encrypted_stream_key, enabled, updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(kind) DO UPDATE SET "
+                "controller_identity=CASE WHEN ? THEN excluded.controller_identity "
+                "ELSE destination_config.controller_identity END, base_server=excluded.base_server, "
                 "encrypted_stream_key=excluded.encrypted_stream_key, enabled=excluded.enabled, "
                 "updated_at=excluded.updated_at",
-                (storage_kind, server, encrypted, int(enabled), _now()),
+                (
+                    storage_kind,
+                    identity,
+                    server,
+                    encrypted,
+                    int(enabled),
+                    _now(),
+                    int(replace_identity),
+                ),
             )
 
     def update_destination_key(self, kind: DestinationKind, stream_key: str) -> None:
@@ -550,7 +640,7 @@ class Database:
         if row is None:
             return None
         server, enabled = _validated_destination_row(row)
-        return DestinationConfig(kind, server, enabled, bool(row[2]))
+        return DestinationConfig(kind, str(row[1]), server, enabled, bool(row[3]))
 
     def get_destination_runtime(self, kind: DestinationKind) -> RuntimeDestination | None:
         row = self._destination_row(kind)
@@ -558,19 +648,20 @@ class Database:
             return None
         server, enabled = _validated_destination_row(row)
         try:
-            secret = self._decrypt_secret(str(row[2]))
+            secret = self._decrypt_secret(str(row[3]))
         except Exception as exc:
             raise DestinationSecretError("Unable to decrypt destination secret") from exc
         if not secret.strip():
             raise DestinationSecretError("Decrypted destination secret is empty")
-        return RuntimeDestination(kind, server, secret, enabled)
+        return RuntimeDestination(kind, str(row[1]), server, secret, enabled)
 
     def _destination_row(self, kind: DestinationKind) -> sqlite3.Row | None:
         with self._lock:
             row = (
                 self._require_connection()
                 .execute(
-                    "SELECT kind, base_server, encrypted_stream_key, enabled FROM destination_config WHERE kind=?",
+                    "SELECT kind, controller_identity, base_server, encrypted_stream_key, enabled "
+                    "FROM destination_config WHERE kind=?",
                     (_storage_kind(kind),),
                 )
                 .fetchone()
@@ -582,7 +673,8 @@ class Database:
             rows = (
                 self._require_connection()
                 .execute(
-                    "SELECT kind, base_server, encrypted_stream_key, enabled FROM destination_config "
+                    "SELECT kind, controller_identity, base_server, encrypted_stream_key, enabled "
+                    "FROM destination_config "
                     "ORDER BY CASE kind WHEN 'douyin' THEN 1 WHEN 'wechat_channels' THEN 2 ELSE 3 END"
                 )
                 .fetchall()
@@ -594,7 +686,7 @@ class Database:
             except KeyError as exc:
                 raise DatabaseCorruptError("Persisted destination kind is invalid") from exc
             server, enabled = _validated_destination_row(row)
-            destinations.append(DestinationConfig(kind, server, enabled, bool(row[2])))
+            destinations.append(DestinationConfig(kind, str(row[1]), server, enabled, bool(row[3])))
         return destinations
 
     def delete_destination(self, kind: DestinationKind) -> bool:
@@ -727,6 +819,7 @@ class Database:
                 "destinations": [
                     {
                         "kind": _storage_kind(item.kind),
+                        "controller_identity": item.controller_identity,
                         "base_server": item.base_server,
                         "enabled": item.enabled,
                         "configured": item.configured,
@@ -749,9 +842,10 @@ class Database:
             if quality_value is not None and not isinstance(quality_value, str):
                 raise ValueError("Preferred quality must be a string or null")
             quality = quality_value.strip() if quality_value else None
-            source_write = (canonical, quality, bool(source.get("desired_running", False)))
+            desired_running = _json_bool(source, "desired_running", default=False)
+            source_write = (canonical, quality, desired_running)
 
-        destination_writes: list[tuple[str, str, bool]] = []
+        destination_writes: list[tuple[str, str | None, str, bool]] = []
         destinations = value.get("destinations")
         if isinstance(destinations, list):
             for item in destinations:
@@ -763,9 +857,20 @@ class Database:
                 existing = self._destination_row(kind)
                 if existing is None:
                     continue
-                server = _validate_base_server(str(item.get("base_server", existing[1])))
+                server = _validate_base_server(str(item.get("base_server", existing[2])))
+                identity_value = item.get("controller_identity")
+                identity = (
+                    _validate_controller_identity(str(identity_value))
+                    if identity_value is not None
+                    else None
+                )
                 destination_writes.append(
-                    (_storage_kind(kind), server, bool(item.get("enabled", existing[3])))
+                    (
+                        _storage_kind(kind),
+                        identity,
+                        server,
+                        _json_bool(item, "enabled", default=bool(existing[4])),
+                    )
                 )
 
         settings_write: AppSettings | None = None
@@ -794,10 +899,11 @@ class Database:
                     "desired_running=excluded.desired_running, updated_at=excluded.updated_at",
                     (*source_write, _now()),
                 )
-            for storage_kind, server, enabled in destination_writes:
+            for storage_kind, identity, server, enabled in destination_writes:
                 connection.execute(
-                    "UPDATE destination_config SET base_server=?, enabled=?, updated_at=? WHERE kind=?",
-                    (server, int(enabled), _now(), storage_kind),
+                    "UPDATE destination_config SET controller_identity=coalesce(?, controller_identity), "
+                    "base_server=?, enabled=?, updated_at=? WHERE kind=?",
+                    (identity, server, int(enabled), _now(), storage_kind),
                 )
             if settings_write is not None:
                 connection.execute(
@@ -816,8 +922,7 @@ class Database:
 
     async def save(self, state: PersistedControllerState) -> None:
         canonical = normalize_douyin_url(state.room_identity)
-        enabled = {_normalize_enabled_identity(item) for item in state.enabled_destinations}
-        enabled.discard(None)
+        enabled = {_validate_controller_identity(item) for item in state.enabled_destinations}
         with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO source_config(singleton_id, room_identity, preferred_quality, desired_running, "
@@ -826,11 +931,11 @@ class Database:
                 "desired_running=excluded.desired_running, updated_at=excluded.updated_at",
                 (canonical, int(state.desired_running), _now()),
             )
-            for storage_kind in _STORAGE_TO_KIND:
-                connection.execute(
-                    "UPDATE destination_config SET enabled=?, updated_at=? WHERE kind=?",
-                    (int(storage_kind in enabled), _now(), storage_kind),
-                )
+            connection.execute(
+                "UPDATE destination_config SET enabled=CASE WHEN controller_identity IN "
+                f"({','.join('?' for _ in enabled) or 'NULL'}) THEN 1 ELSE 0 END, updated_at=?",
+                (*sorted(enabled), _now()),
+            )
 
     async def load(self, room_identity: str) -> PersistedControllerState | None:
         canonical = normalize_douyin_url(room_identity)
@@ -842,7 +947,7 @@ class Database:
                 (canonical,),
             ).fetchone()
             enabled_rows = connection.execute(
-                "SELECT kind FROM destination_config WHERE enabled=1 "
+                "SELECT controller_identity FROM destination_config WHERE enabled=1 "
                 "ORDER BY CASE kind WHEN 'douyin' THEN 1 WHEN 'wechat_channels' THEN 2 ELSE 3 END"
             ).fetchall()
         if row is None:
@@ -919,15 +1024,16 @@ def _validate_backoff(settings: AppSettings) -> None:
 
 def _validated_destination_row(row: sqlite3.Row) -> tuple[str, bool]:
     try:
-        server = _validate_base_server(str(row[1]))
-        if row[3] not in (0, 1) or not isinstance(row[2], str) or not row[2]:
+        _validate_controller_identity(str(row[1]))
+        server = _validate_base_server(str(row[2]))
+        if row[4] not in (0, 1) or not isinstance(row[3], str) or not row[3]:
             raise ValueError("invalid destination fields")
     except (TypeError, ValueError) as exc:
         raise DatabaseCorruptError("Persisted destination configuration is invalid") from exc
-    return server, bool(row[3])
+    return server, bool(row[4])
 
 
-def _normalize_enabled_identity(value: str) -> str | None:
+def _legacy_kind(value: str) -> str | None:
     normalized = value.strip().lower()
     aliases = {
         "douyin": "douyin",
@@ -936,6 +1042,22 @@ def _normalize_enabled_identity(value: str) -> str | None:
         "local_test": "local_test",
     }
     return aliases.get(normalized)
+
+
+def _validate_controller_identity(value: str) -> str:
+    candidate = value.strip()
+    if _SAFE_CONTROLLER_IDENTITY.fullmatch(candidate) is None:
+        raise ValueError("Controller identity is malformed")
+    return candidate
+
+
+def _json_bool(value: Mapping[object, object], key: str, *, default: bool) -> bool:
+    if key not in value:
+        return default
+    candidate = value[key]
+    if type(candidate) is not bool:
+        raise TypeError(f"{key} must be a JSON boolean")
+    return candidate
 
 
 def _is_busy(exc: sqlite3.OperationalError) -> bool:

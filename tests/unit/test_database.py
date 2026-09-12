@@ -97,7 +97,7 @@ def test_first_open_creates_exact_schema_and_pragmas_and_reopen_is_idempotent(
     with Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
     ) as database:
-        assert database.schema_version == 2
+        assert database.schema_version == 3
         assert cast(str, database.pragma("journal_mode")).lower() == "wal"
         assert database.pragma("foreign_keys") == 1
         assert database.pragma("busy_timeout") == 5_000
@@ -119,7 +119,7 @@ def test_first_open_creates_exact_schema_and_pragmas_and_reopen_is_idempotent(
     with Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
     ) as reopened:
-        assert reopened.schema_version == 2
+        assert reopened.schema_version == 3
 
 
 def test_close_is_idempotent_and_operations_after_close_are_explicit(
@@ -170,7 +170,7 @@ def test_failed_migration_rolls_back_schema_and_version(
     database.close()
 
     with sqlite3.connect(paths.database_file) as connection:
-        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 2
+        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT count(*) FROM sqlite_master WHERE name='must_rollback'"
@@ -533,6 +533,35 @@ def test_controller_load_builds_enabled_set_from_destination_rows(db: Database) 
     assert restored.enabled_destinations == ("douyin", "local_test")
 
 
+def test_controller_store_round_trips_configured_destination_identities(db: Database) -> None:
+    db.set_destination(
+        DestinationKind.DOUYIN,
+        "rtmp://one.test/app",
+        "one",
+        enabled=True,
+        controller_identity="primary",
+    )
+    db.set_destination(
+        DestinationKind.WECHAT,
+        "rtmp://two.test/app",
+        "two",
+        enabled=True,
+        controller_identity="secondary",
+    )
+    run(
+        db.save(
+            PersistedControllerState("https://live.douyin.com/identity-room", True, ("primary",))
+        )
+    )
+
+    restored = run(db.load("https://live.douyin.com/identity-room"))
+
+    assert restored is not None
+    assert restored.enabled_destinations == ("primary",)
+    assert db.get_destination(DestinationKind.DOUYIN).controller_identity == "primary"  # type: ignore[union-attr]
+    assert db.get_destination(DestinationKind.WECHAT).controller_identity == "secondary"  # type: ignore[union-attr]
+
+
 def test_busy_database_has_distinct_error_and_is_not_reported_corrupt(
     paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
 ) -> None:
@@ -578,7 +607,7 @@ def test_two_database_instances_can_open_and_migrate_concurrently(
             database.close()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        assert list(executor.map(opener, range(2))) == [2, 2]
+        assert list(executor.map(opener, range(2))) == [3, 3]
 
 
 def test_open_rejects_schema_version_that_claims_missing_schema(
@@ -590,7 +619,7 @@ def test_open_rejects_schema_version_that_claims_missing_schema(
         )
         connection.executemany(
             "INSERT INTO schema_version VALUES(?, 'now')",
-            [(1,), (2,)],
+            [(1,), (2,), (3,)],
         )
     database = Database(
         paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
@@ -625,11 +654,15 @@ def test_v1_migration_discards_duplicate_enabled_json_and_preserves_destination_
         connection.execute("INSERT INTO schema_version VALUES(1, 'now')")
         connection.execute(
             "INSERT INTO source_config VALUES(1, 'https://live.douyin.com/legacy', NULL, 1, "
-            "'not-json', 'now')"
+            "'[\"primary\",\"secondary\"]', 'now')"
         )
         connection.execute(
             "INSERT INTO destination_config VALUES('douyin', 'rtmp://one.test/app', "
-            "'cipher:eno', 1, 'now')"
+            "'cipher:eno', 0, 'now')"
+        )
+        connection.execute(
+            "INSERT INTO destination_config VALUES('wechat_channels', 'rtmp://two.test/app', "
+            "'cipher:owt', 0, 'now')"
         )
         connection.commit()
 
@@ -642,7 +675,51 @@ def test_v1_migration_discards_duplicate_enabled_json_and_preserves_destination_
         }
         restored = run(migrated.load("https://live.douyin.com/legacy"))
         assert "enabled_destinations_json" not in columns
-        assert restored is not None and restored.enabled_destinations == ("douyin",)
+        assert restored is not None
+        assert restored.enabled_destinations == ("primary", "secondary")
+
+
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])
+def test_import_rejects_non_boolean_desired_running_atomically(
+    db: Database, invalid: object
+) -> None:
+    db.set_source("https://live.douyin.com/original-bool", None, True)
+    with pytest.raises((TypeError, ValueError), match="desired_running"):
+        db.import_config(
+            {
+                "source": {
+                    "room_identity": "https://live.douyin.com/replacement-bool",
+                    "desired_running": invalid,
+                }
+            }
+        )
+    assert db.get_source().room_identity == "https://live.douyin.com/original-bool"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])
+def test_import_rejects_non_boolean_destination_enabled_and_rolls_back_source(
+    db: Database, invalid: object
+) -> None:
+    db.set_source("https://live.douyin.com/original-enabled", None, True)
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "one", enabled=True)
+    with pytest.raises((TypeError, ValueError), match="enabled"):
+        db.import_config(
+            {
+                "source": {
+                    "room_identity": "https://live.douyin.com/replacement-enabled",
+                    "desired_running": False,
+                },
+                "destinations": [
+                    {
+                        "kind": "douyin",
+                        "base_server": "rtmp://updated.test/app",
+                        "enabled": invalid,
+                    }
+                ],
+            }
+        )
+    assert db.get_source().room_identity == "https://live.douyin.com/original-enabled"  # type: ignore[union-attr]
+    assert db.get_destination(DestinationKind.DOUYIN).enabled is True  # type: ignore[union-attr]
 
 
 def test_tampered_settings_destination_and_event_json_fail_closed(
@@ -700,8 +777,9 @@ def test_close_racing_reads_only_surfaces_typed_closed_error(
         executor.submit(database.close).result()
         future.result()
 
-    assert errors
     assert all(isinstance(error, DatabaseClosedError) for error in errors)
+    with pytest.raises(DatabaseClosedError):
+        database.list_destinations()
 
 
 def test_transaction_rolls_back_all_writes_on_error(db: Database) -> None:

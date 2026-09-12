@@ -31,6 +31,7 @@ def _default_dependencies() -> ApiDependencies:
         runtime,
         reconnect_destination=runtime.reconnect_destination,
         test_destination=runtime.test_destination,
+        assets_dir=Path(__file__).resolve().parent / "static",
     )
 
 

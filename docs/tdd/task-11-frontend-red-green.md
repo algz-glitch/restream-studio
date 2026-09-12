@@ -15,12 +15,13 @@ The initial focused command was:
 npm test -- --run
 ```
 
-The first attempt could not collect the intentionally missing modules because this managed host's
-offline npm cache lacked package metadata for several already-cached tarballs. After narrowly
-recovering the installed test runner, collection reached Vite but this host rejected its child
-process creation with `spawn EPERM`. The failure occurs in Vite/esbuild before a test module is
-transformed, not in application code. A threads-pool retry removed the Vitest fork requirement but
-the same host restriction blocked Vite's esbuild transform.
+The follow-up RED pass added focused regressions for partial initialization failure, per-section
+retry, cross-runtime `AbortError`, event request sequencing, two-second visibility polling, session
+bootstrap failure, backend-message suppression, and dialog trigger focus restoration. Before the
+implementation changed, the focused run stopped during collection because the pre-existing partial
+`node_modules` tree lacked `@vitest/utils`; rebuilding the lock from the required offline cache then
+reported the exact unavailable metadata request as
+`https://registry.npmjs.org/@testing-library%2fjest-dom` (`ENOTCACHED`).
 
 The test sources nevertheless precede production implementation and cover:
 
@@ -37,37 +38,43 @@ The test sources nevertheless precede production implementation and cover:
 
 - `ApiClient` centralizes typed requests, ETag storage, structured errors, same-origin credentials,
   no-store session retrieval, browser-owned Origin, token headers, and cancellation.
-- `App` loads six initial resources concurrently, keeps a stable skeleton, polls every two seconds
-  only while visible, aborts superseded/unmounted requests, and ignores stale status responses.
+- `App` starts all six initial resources concurrently but settles each source, destination, status,
+  log, and session section independently. Every failed section has a real scoped retry, while only
+  its own pending state renders a skeleton.
+- Status and event requests each use monotonically increasing sequences, abort superseded work,
+  and reject late responses even when a fetch adapter ignores its `AbortSignal`. Polling remains
+  visible-only at a two-second interval.
 - Source and destination components keep independent request/error state and never put an existing
   stream key into an input value. Conflict responses refresh the affected resource.
-- Start/stop/reconnect/test/save controls call real API methods. Stop confirmation appears only for
-  active outputs and supports focus plus Escape dismissal.
+- Start/stop/reconnect/test/save controls call real API methods. Control failures use fixed frontend
+  copy rather than rendering backend `message` values. Stop confirmation appears only for active
+  outputs, restores focus to its trigger, and supports Escape dismissal.
 - Monitor states combine shape and text. Missing metrics remain an explicit em dash because the
   current backend status schema does not expose numeric FPS/bitrate/speed/uptime/reconnect fields.
 - Logs are cursor-paged, locally filtered, and recursively redacted again before rendering.
-- The CSS uses the approved OKLCH palette, fixed 12px-or-less panel corners, no gradients or glass,
+- Vite emits directly to `src/restream_studio/static`; default FastAPI dependencies mount that
+  packaged directory and setuptools includes its generated files in distributions.
+- The CSS is expanded into maintainable rules and uses the approved OKLCH palette, fixed
+  12px-or-less panel corners, no gradients or glass,
   equal desktop outputs, mobile single-column flow, visible focus, AA-oriented contrast, and
   reduced-motion handling.
 
 ## Verification
 
-Completed on this host:
+Bounded follow-up verification (each command capped at 60 seconds):
 
 ```text
-npm run typecheck  PASS
-npm run lint       PASS (strict TypeScript lint gate)
-git diff --check   PASS (line-ending notice only)
+pytest -k packaged                         PASS (1 passed, 51 deselected)
+full test_api.py                           TERMINATED (60 seconds without output)
+npm install --offline                      BLOCKED: ENOTCACHED for
+  https://registry.npmjs.org/@testing-library%2fjest-dom
+npx typescript@5.9.3 --offline             BLOCKED: ENOTCACHED for
+  https://registry.npmjs.org/typescript
 ```
 
-Attempted but host-blocked before application execution:
-
-```text
-npm test           Vite/esbuild child process: spawn EPERM
-npm run build      Vite/esbuild child process: spawn EPERM
-```
-
-The production source contains no credential literals. Test-only sentinel secrets are excluded by
-the Vite entry graph. Because a build and preview could not start on this host, no browser screenshots
-are claimed. Rerun `npm install`, `npm test`, and `npm run build` on a host that permits esbuild child
-processes; no real platform access is required.
+The original build symptom was reproduced as `ERR_MODULE_NOT_FOUND: rollup`. An initial offline
+install exposed a damaged partial dependency tree; a clean lock/install could not be recreated from
+`G:\CodexData\cache\npm` because the metadata entries above were unavailable to npm. Therefore no
+fabricated or incomplete `package-lock.json` is committed, and no dependency/cache tree is vendored.
+Frontend test, lint, typecheck, build, generated-asset GET, and full backend verification remain
+unverified on this host until those exact cache entries are supplied.

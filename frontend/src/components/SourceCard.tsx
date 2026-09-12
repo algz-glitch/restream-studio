@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ApiError, type ApiClient } from '../api'
+import { ApiError, isAbortError, type ApiClient } from '../api'
 import type { SourceResponse } from '../types'
 
 interface Props { source: SourceResponse; api: ApiClient; onChange: (value: SourceResponse) => void }
@@ -30,6 +30,7 @@ export function SourceCard({ source, api, onChange }: Props) {
       const value = await api.saveSource({ room_url: url, preferred_quality: quality || null }, request.current.signal)
       onChange(value); setNotice(`已保存规范地址：${value.room_identity ?? ''}`)
     } catch (cause) {
+      if (isAbortError(cause)) return
       if (cause instanceof ApiError && [409, 412].includes(cause.status)) {
         const fresh = await api.getSource(request.current.signal); onChange(fresh.data); setNotice('配置已被其他操作更新，已刷新，请重新检查后保存。')
       } else if (cause instanceof ApiError && cause.fields.room_url) setError('直播间地址未通过校验。')

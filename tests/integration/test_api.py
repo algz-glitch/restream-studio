@@ -630,6 +630,13 @@ def test_pure_default_factory_uses_runtime_manager() -> None:
     assert dependencies.test_destination == dependencies.controller.test_destination
 
 
+def test_pure_default_factory_points_to_packaged_frontend_assets() -> None:
+    import restream_studio.main as main_module
+
+    dependencies = main_module._default_dependencies()
+    assert dependencies.assets_dir == Path(main_module.__file__).resolve().parent / "static"
+
+
 def test_pure_default_factory_wires_runtime_start_reconnect_and_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

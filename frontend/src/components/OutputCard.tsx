@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ApiError, type ApiClient } from '../api'
+import { ApiError, isAbortError, type ApiClient } from '../api'
 import type { DestinationKind, DestinationResponse } from '../types'
 import { StatusBadge } from './StatusBadge'
 
@@ -29,6 +29,7 @@ export function OutputCard({ destination, api, onChange }: Props) {
         const value = await api.testDestination(destination.kind, request.current.signal); setFeedback(value.ok ? '连接测试通过。' : '连接测试失败。')
       } else { await api.reconnect(destination.kind, request.current.signal); setFeedback('已请求重连。') }
     } catch (cause) {
+      if (isAbortError(cause)) return
       if (cause instanceof ApiError && [409, 412].includes(cause.status) && type === 'save') {
         const fresh = await api.getDestination(destination.kind, request.current.signal); onChange(fresh.data); setFeedback('配置已更新，已刷新，请重新检查。')
       } else setError(type === 'save' ? '保存失败，请重试。' : '操作失败，请重试。')

@@ -3,7 +3,7 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   esbuild: { jsx: 'automatic' },
   build: {
-    outDir: 'dist',
+    outDir: '../src/restream_studio/static',
     emptyOutDir: true,
   },
   server: {

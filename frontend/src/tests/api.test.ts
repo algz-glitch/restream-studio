@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ApiClient, ApiError } from '../api'
+import { ApiClient, ApiError, isAbortError } from '../api'
 import { json } from './fixtures'
 
 describe('ApiClient', () => {
@@ -31,5 +31,11 @@ describe('ApiClient', () => {
     const controller = new AbortController()
     await api.getStatus(controller.signal)
     expect(fetcher).toHaveBeenCalledWith('/api/status', expect.objectContaining({ signal: controller.signal }))
+  })
+
+  it('统一识别 DOMException 和跨运行时 AbortError', () => {
+    expect(isAbortError(new DOMException('aborted', 'AbortError'))).toBe(true)
+    expect(isAbortError(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(true)
+    expect(isAbortError(new Error('network failed'))).toBe(false)
   })
 })

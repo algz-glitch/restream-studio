@@ -163,4 +163,110 @@ describe('播控台', () => {
     await act(async () => { await Promise.resolve() }); expect(signals.length).toBeGreaterThan(1)
     const latest = signals.at(-1); view.unmount(); expect(latest?.aborted).toBe(true)
   })
+
+  it('初始化区块并行独立完成，来源失败不拖垮输出、状态和日志且可单独重试', async () => {
+    let sourceCalls = 0
+    const baseFetch = installApi()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/source' && sourceCalls++ === 0) {
+        return json({ error: { code: 'source_down', message: 'private backend detail', fields: {}, request_id: 'r' } }, { status: 503 })
+      }
+      return baseFetch(input, init)
+    }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByRole('region', { name: '抖音输出' })).toBeVisible()
+    expect(screen.getByRole('region', { name: '运行监控' })).toBeVisible()
+    expect(screen.getByRole('region', { name: '运行日志' })).toBeVisible()
+    expect(screen.getByText('来源加载失败。')).toBeVisible()
+    expect(screen.queryByText('private backend detail')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '重试加载来源' }))
+    expect(await screen.findByRole('region', { name: '直播来源' })).toBeVisible()
+  })
+
+  it('一个初始化请求未完成时只保留该区块 loading', async () => {
+    let resolveSource: ((value: Response) => void) | undefined
+    installApi({ '/api/source': new Promise<Response>((resolve) => { resolveSource = resolve }) })
+    render(<App />)
+
+    expect(await screen.findByRole('region', { name: '抖音输出' })).toBeVisible()
+    expect(screen.getByLabelText('正在加载来源')).toBeVisible()
+    expect(screen.queryByLabelText('正在加载输出')).not.toBeInTheDocument()
+    resolveSource?.(json(source, { headers: { ETag: '"1"' } }))
+    expect(await screen.findByRole('region', { name: '直播来源' })).toBeVisible()
+  })
+
+  it('会话认证失败时禁用控制并可独立重试恢复', async () => {
+    let sessionCalls = 0
+    const baseFetch = installApi()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/session' && sessionCalls++ === 0) {
+        return json({ error: { code: 'session_unavailable', message: 'token internals', fields: {}, request_id: 'r' } }, { status: 503 })
+      }
+      return baseFetch(input, init)
+    }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByText('安全会话初始化失败。')).toBeVisible()
+    expect(screen.getByRole('button', { name: '开始监控' })).toBeDisabled()
+    expect(screen.queryByText('token internals')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '重试初始化会话' }))
+    await waitFor(() => expect(screen.queryByText('安全会话初始化失败。')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: '开始监控' })).toBeEnabled()
+  })
+
+  it('不显示控制接口返回的后端错误 message', async () => {
+    installApi({
+      'POST /api/control/start': json({ error: { code: 'start_failed', message: 'C:\\private\\secret token=abc', fields: {}, request_id: 'r' } }, { status: 503 }),
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: '开始监控' }))
+    expect(await screen.findByText('操作失败，请重试。')).toBeVisible()
+    expect(screen.queryByText(/private|token=abc/)).not.toBeInTheDocument()
+  })
+
+  it('关闭停止确认对话框后恢复焦点到触发按钮', async () => {
+    installApi({ '/api/status': { ...status, desired_running: true, outputs: [{ ...status.outputs[0], status: 'LIVE' }] } })
+    const user = userEvent.setup()
+    render(<App />)
+    const stop = await screen.findByRole('button', { name: '停止全部' })
+    await user.click(stop)
+    await user.keyboard('{Escape}')
+    expect(stop).toHaveFocus()
+  })
+
+  it('可见时严格每 2 秒轮询一次状态', async () => {
+    vi.useFakeTimers()
+    const mock = installApi()
+    render(<App />)
+    await act(async () => { await Promise.resolve() })
+    const countStatus = () => mock.mock.calls.filter(([input]) => input === '/api/status').length
+    expect(countStatus()).toBe(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1999) })
+    expect(countStatus()).toBe(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(countStatus()).toBe(2)
+  })
+
+  it('日志请求用 sequence 阻止忽略 abort 的旧响应覆盖新响应', async () => {
+    let resolveOld: ((value: Response) => void) | undefined
+    installApi({
+      '/api/events?limit=50&cursor=0': { items: [], next_cursor: 1 },
+      '/api/events?limit=50&cursor=1': new Promise<Response>((resolve) => { resolveOld = resolve }),
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('region', { name: '运行日志' })
+    await user.click(screen.getByRole('button', { name: '加载更多日志' }))
+    await user.click(screen.getByRole('button', { name: '刷新日志' }))
+    resolveOld?.(json({ items: [{ id: 99, created_at: '2026-01-01T00:00:00Z', level: 'ERROR', event_type: 'stale_event', payload: {} }], next_cursor: null }))
+    await act(async () => { await Promise.resolve() })
+    expect(screen.queryByText('stale_event')).not.toBeInTheDocument()
+  })
 })

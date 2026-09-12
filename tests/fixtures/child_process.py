@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import subprocess
 import sys
 import time
 
@@ -11,7 +12,15 @@ import time
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "mode", choices=("healthy", "ignore-stop", "exit", "auth-fail", "malformed-metrics")
+        "mode",
+        choices=(
+            "healthy",
+            "ignore-stop",
+            "spawn-descendant-ignore-stop",
+            "exit",
+            "auth-fail",
+            "malformed-metrics",
+        ),
     )
     parser.add_argument("--code", type=int, default=17)
     parser.add_argument("--secret", default="")
@@ -29,6 +38,8 @@ def main() -> int:
         return int(args.code)
     if args.mode == "auth-fail":
         print(f"{args.message} {args.secret}", file=sys.stderr)
+        for index in range(args.lines):
+            print(f"post-auth-line-{index}", file=sys.stderr)
         return int(args.code)
     if args.mode == "malformed-metrics":
         print("unknown=" + ("x" * 10_000), file=sys.stderr)
@@ -54,6 +65,14 @@ def main() -> int:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+
+    if args.mode == "spawn-descendant-ignore-stop":
+        descendant = subprocess.Popen(
+            [sys.executable, __file__, "ignore-stop"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
+        print(f"descendant_pid={descendant.pid}", file=sys.stderr, flush=True)
 
     print("fps=29.97", file=sys.stderr, flush=True)
     print("bitrate=4123.5kbits/s", file=sys.stderr, flush=True)

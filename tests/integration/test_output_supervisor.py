@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -61,6 +62,32 @@ async def test_async_process_kills_after_timeout_and_concurrent_stop_is_idempote
     assert results[0] == results[1] == process.returncode
     assert process.was_killed is True
     assert pid is not None and not psutil.pid_exists(pid)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_subprocess_creation_reaps_the_late_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = asyncio.create_subprocess_exec
+    create_entered = asyncio.Event()
+    release_create = asyncio.Event()
+
+    async def delayed_create(*args: str, **kwargs: object) -> asyncio.subprocess.Process:
+        create_entered.set()
+        await release_create.wait()
+        return await original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_create)
+    process = AsyncProcess(child("healthy"))
+    start_task = asyncio.create_task(process.start())
+    await asyncio.wait_for(create_entered.wait(), timeout=1.0)
+    stop_task = asyncio.create_task(process.stop(timeout=0.5))
+    await asyncio.sleep(0)
+    release_create.set()
+
+    await asyncio.wait_for(asyncio.gather(start_task, stop_task), timeout=2.0)
+    assert process.pid is not None
+    assert not psutil.pid_exists(process.pid)
 
 
 @pytest.mark.asyncio
@@ -136,7 +163,7 @@ async def test_authentication_rejection_is_terminal(message: str) -> None:
     target = f"rtmp://live.example.com/app/{secret}"
     supervisor = OutputSupervisor(
         DestinationKind.WECHAT,
-        child("auth-fail", "--message", message, "--secret", target),
+        child("auth-fail", "--message", message, "--secret", target, "--lines", "75"),
         sensitive_values=(target, secret),
     )
     assert target not in repr(supervisor) and secret not in repr(supervisor)
@@ -146,6 +173,49 @@ async def test_authentication_rejection_is_terminal(message: str) -> None:
     assert supervisor.reconnect_count == 0
     rendered = repr(supervisor) + repr(supervisor.snapshot())
     assert target not in rendered and secret not in rendered
+    assert supervisor.process is not None
+    assert all(message.casefold() not in line.casefold() for line in supervisor.process.stderr_tail)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_during_backoff_reaps_internal_wait_tasks() -> None:
+    waiting = asyncio.Event()
+
+    async def blocked_retry(_delay: float) -> None:
+        waiting.set()
+        await asyncio.Event().wait()
+
+    supervisor = OutputSupervisor(
+        DestinationKind.DOUYIN,
+        child("exit", "--code", "9"),
+        retry_wait=blocked_retry,
+    )
+    task = asyncio.create_task(supervisor.run())
+    await asyncio.wait_for(waiting.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2.0)
+    await asyncio.sleep(0)
+
+    pending_names = {item.get_name() for item in asyncio.all_tasks() if item is not asyncio.current_task()}
+    assert "output-retry-delay" not in pending_names
+    assert "output-retry-stop" not in pending_names
+
+
+@pytest.mark.asyncio
+async def test_timeout_kill_terminates_descendant_process_tree() -> None:
+    process = AsyncProcess(child("spawn-descendant-ignore-stop"))
+    await process.start()
+    await eventually(lambda: any(line.startswith("descendant_pid=") for line in process.stderr_tail))
+    descendant_line = next(line for line in process.stderr_tail if line.startswith("descendant_pid="))
+    descendant_pid = int(descendant_line.partition("=")[2])
+    assert psutil.pid_exists(descendant_pid)
+
+    await asyncio.wait_for(process.stop(timeout=0.05), timeout=3.0)
+    await eventually(lambda: not psutil.pid_exists(descendant_pid))
+
+    assert process.was_killed is True
+    assert not psutil.pid_exists(descendant_pid)
 
 
 @pytest.mark.asyncio
@@ -199,11 +269,24 @@ async def test_malformed_and_unbounded_progress_fields_are_discarded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_error_does_not_expose_sensitive_argv() -> None:
-    secret = "secret-in-missing-executable"
-    process = AsyncProcess((secret,), sensitive_values=(secret,))
+async def test_start_error_traceback_has_no_sensitive_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "rtmp://live.example.com/app/secret-in-start-error"
+
+    async def fail_create(*_args: str, **_kwargs: object) -> asyncio.subprocess.Process:
+        raise OSError(f"cannot spawn {secret}")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_create)
+    process = AsyncProcess(("ffmpeg", secret), sensitive_values=(secret,))
 
     with pytest.raises(RuntimeError) as raised:
-        await process.start()
+        try:
+            await process.start()
+        except RuntimeError:
+            formatted = traceback.format_exc()
+            raise
 
+    assert raised.value.__cause__ is None
+    assert secret not in formatted
     assert secret not in str(raised.value) and secret not in repr(raised.value)

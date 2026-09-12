@@ -17,6 +17,14 @@ from restream_studio.security.redaction import redact
 
 _PROGRESS_KEYS: Final = frozenset({"fps", "bitrate", "speed", "out_time", "progress"})
 _TIME_PATTERN: Final = re.compile(r"^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$")
+_AUTH_FAILURE_MARKERS: Final = (
+    "authentication failed",
+    "403",
+    "invalid stream key",
+    "publish denied",
+    "authorization failed",
+    "unauthorized",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +69,12 @@ class AsyncProcess:
         self._metrics: dict[str, float | str] = {}
         self._process: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._stop_lock = asyncio.Lock()
         self._finalize_lock = asyncio.Lock()
         self._was_killed = False
+        self._stop_requested = False
+        self._auth_failed = False
 
     @property
     def pid(self) -> int | None:
@@ -82,6 +93,14 @@ class AsyncProcess:
         return self._was_killed
 
     @property
+    def auth_failed(self) -> bool:
+        return self._auth_failed
+
+    @property
+    def started(self) -> bool:
+        return self._process is not None
+
+    @property
     def stderr_tail(self) -> tuple[str, ...]:
         return tuple(self._tail)
 
@@ -90,28 +109,31 @@ class AsyncProcess:
         return dict(self._metrics)
 
     async def start(self) -> None:
-        if self._process is not None:
-            raise RuntimeError("process instances may only be started once")
-        try:
-            if os.name == "nt":
-                self._process = await asyncio.create_subprocess_exec(
-                    *self._argv,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-            else:
-                self._process = await asyncio.create_subprocess_exec(
-                    *self._argv,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                )
-        except (OSError, ValueError) as exc:
-            raise ProcessStartError("output process could not be started") from exc
-        self._stderr_task = asyncio.create_task(self._read_stderr())
+        async with self._lifecycle_lock:
+            if self._process is not None:
+                raise RuntimeError("process instances may only be started once")
+            if self._stop_requested:
+                return
+            try:
+                if os.name == "nt":
+                    self._process = await asyncio.create_subprocess_exec(
+                        *self._argv,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    )
+                else:
+                    self._process = await asyncio.create_subprocess_exec(
+                        *self._argv,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+            except (OSError, ValueError):
+                raise ProcessStartError("output process could not be started") from None
+            self._stderr_task = asyncio.create_task(self._read_stderr())
 
     async def _read_stderr(self) -> None:
         process = self._require_process()
@@ -139,6 +161,9 @@ class AsyncProcess:
 
     def _capture_line(self, raw: bytes) -> None:
         decoded = raw.decode("utf-8", errors="replace")
+        folded = decoded.casefold()
+        if any(marker in folded for marker in _AUTH_FAILURE_MARKERS):
+            self._auth_failed = True
         self._capture_metric(decoded)
         self._append_tail(self._sanitize(decoded))
 
@@ -198,8 +223,11 @@ class AsyncProcess:
     async def stop(self, *, timeout: float = 5.0) -> int:
         if timeout < 0:
             raise ValueError("timeout must not be negative")
-        async with self._stop_lock:
-            process = self._require_process()
+        self._stop_requested = True
+        async with self._stop_lock, self._lifecycle_lock:
+            if self._process is None:
+                return 0
+            process = self._process
             if process.returncode is None:
                 self._gentle_stop()
                 try:
@@ -236,9 +264,23 @@ class AsyncProcess:
             if os.name != "nt":
                 os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
             else:
-                process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+                completed = subprocess.run(
+                    ("taskkill", "/PID", str(int(process.pid)), "/T", "/F"),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    shell=False,
+                    timeout=5.0,
+                )
+                if completed.returncode != 0 and process.returncode is None:
+                    process.kill()
+        except (OSError, ProcessLookupError, subprocess.SubprocessError):
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
 
     def snapshot(self) -> ProcessSnapshot:
         return ProcessSnapshot(

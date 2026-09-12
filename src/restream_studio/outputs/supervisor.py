@@ -11,14 +11,6 @@ from restream_studio.domain import DestinationKind, OutputState
 from restream_studio.media.process import AsyncProcess, ProcessSnapshot
 
 _BACKOFF: Final = (2.0, 5.0, 10.0, 20.0, 30.0)
-_AUTH_MARKERS: Final = (
-    "authentication failed",
-    "403",
-    "invalid stream key",
-    "publish denied",
-    "authorization failed",
-    "unauthorized",
-)
 _TRANSITIONS: Final[Mapping[OutputState, frozenset[OutputState]]] = {
     OutputState.DISABLED: frozenset({OutputState.STOPPED}),
     OutputState.STOPPED: frozenset({OutputState.CONNECTING}),
@@ -120,12 +112,14 @@ class OutputSupervisor:
                 except Exception:
                     self.transition(OutputState.ERROR)
                     raise
+                if not process.started or self._stop_requested.is_set():
+                    break
                 self.transition(OutputState.LIVE)
                 self._live.set()
                 await process.wait()
                 if self._stop_requested.is_set():
                     break
-                if self._is_auth_failure(process.stderr_tail):
+                if process.auth_failed:
                     self.transition(OutputState.AUTH_FAILED)
                     return
                 self._reconnect_count += 1
@@ -152,13 +146,17 @@ class OutputSupervisor:
 
         retry = asyncio.create_task(wait_delay())
         stopped = asyncio.create_task(wait_stop())
-        done, pending = await asyncio.wait({retry, stopped}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
-        return self._stop_requested.is_set()
+        retry.set_name("output-retry-delay")
+        stopped.set_name("output-retry-stop")
+        try:
+            done, _ = await asyncio.wait({retry, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+            return self._stop_requested.is_set()
+        finally:
+            retry.cancel()
+            stopped.cancel()
+            await asyncio.gather(retry, stopped, return_exceptions=True)
 
     async def stop(self) -> None:
         async with self._stop_lock:
@@ -171,17 +169,12 @@ class OutputSupervisor:
 
     async def _close_process(self) -> None:
         process = self._process
-        if process is not None and process.running:
+        if process is not None:
             await process.stop(timeout=self._stop_timeout)
 
     def _to_stopped(self) -> None:
         if self._state is not OutputState.STOPPED:
             self.transition(OutputState.STOPPED)
-
-    @staticmethod
-    def _is_auth_failure(lines: Sequence[str]) -> bool:
-        diagnostic = "\n".join(lines).casefold()
-        return any(marker in diagnostic for marker in _AUTH_MARKERS)
 
     def snapshot(self) -> SupervisorSnapshot:
         return SupervisorSnapshot(

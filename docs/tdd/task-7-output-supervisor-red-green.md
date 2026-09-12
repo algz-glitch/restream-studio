@@ -90,3 +90,29 @@ Collection remains healthy:
   above. Full `npm run verify` reaches pytest after clean lint/typecheck, then collection is blocked
   by a pre-existing inaccessible root `tmp0fe8fhgz` directory. No indefinite wait was left
   running.
+
+## Specification review follow-up
+
+Five additional regression cases were written before the review fixes:
+
+1. stop racing a delayed `create_subprocess_exec` must reap the child that starts later;
+2. cancellation during backoff must leave no named retry/stop tasks pending;
+3. an authentication marker followed by 75 diagnostic lines must remain terminal after the marker
+   is evicted from the 50-line tail;
+4. timeout escalation must terminate both a fixture parent and its independently verified child
+   PID;
+5. `traceback.format_exc()`, `str`, `repr`, and `__cause__` must not expose a start-error URL.
+
+The implementation adds an `AsyncProcess` lifecycle lock and stop intent, `finally` cleanup for
+both backoff wait tasks, a sticky boolean `auth_failed`, Windows `taskkill /PID <integer> /T /F`
+without a shell (with process-kill fallback), POSIX group kill, and `ProcessStartError from None`.
+The suite now collects 16 Task 7 cases.
+
+The requested process-local command set `socket._LOCALHOST = "127.0.0.1"`. On this host that
+constant was already `127.0.0.1`, while Python's TCP fallback socketpair still blocked in
+`accept`. A process-only UDP loopback wakeup pair allowed pytest-asyncio to start without adding
+any repository shim. Under that runner, the traceback/cause regression passed. Real subprocess
+cases then failed immediately at the host boundary with `PermissionError(13, WinError 5)` from
+`asyncio.create_subprocess_exec`; they did not hang and no child application code ran. This is
+separate from the implementation assertions and is retained here rather than reported as a green
+runtime suite.

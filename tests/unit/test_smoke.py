@@ -3,6 +3,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import uvicorn
 
 
 def test_package_exposes_version() -> None:
@@ -28,7 +29,7 @@ def test_run_passes_application_object_to_uvicorn(
         captured["application"] = application
         captured.update(configuration)
 
-    monkeypatch.setattr(main.uvicorn, "run", fake_run)
+    monkeypatch.setattr(uvicorn, "run", fake_run)
     monkeypatch.setenv("RESTREAM_STUDIO_PORT", "49152")
 
     main.run()

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import ssl
 from collections.abc import Coroutine
 from typing import Any, cast
+
+import pytest
 
 from restream_studio.destination_test import (
     DestinationTester,
@@ -170,3 +173,80 @@ def test_probe_timeout_kills_and_reaps_child() -> None:
     )
     assert process.killed
     assert process.waited
+
+
+def test_request_cancellation_kills_and_reaps_child_before_propagating() -> None:
+    process = FakeProcess(None)
+    waits = 0
+
+    async def dns(kind: DestinationKind, server: str) -> tuple[str, ...]:
+        del kind, server
+        return ("203.0.113.10",)
+
+    async def connect(
+        host: str, port: int, *, ssl: object = None, server_hostname: str | None = None
+    ) -> tuple[object, FakeWriter]:
+        del host, port, ssl, server_hostname
+        return object(), FakeWriter()
+
+    async def spawn(argv: tuple[str, ...]) -> ProcessPort:
+        del argv
+        return process
+
+    async def cancel_publish(awaitable: Any, timeout: float) -> object:
+        nonlocal waits
+        del timeout
+        waits += 1
+        if waits == 1:
+            return await awaitable
+        awaitable.close()
+        raise asyncio.CancelledError
+
+    tester = DestinationTester(
+        dns_validator=dns,
+        connector=connect,
+        process_factory=spawn,
+        waiter=cancel_publish,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        run(tester.test(DestinationKind.DOUYIN, "rtmp://publish.example/live", SECRET))
+    assert process.killed
+    assert process.waited
+
+
+def test_preflight_tries_sorted_addresses_until_one_succeeds_with_original_sni() -> None:
+    attempted: list[tuple[str, str | None]] = []
+    process = FakeProcess()
+    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    async def dns(kind: DestinationKind, server: str) -> tuple[str, ...]:
+        del kind, server
+        return ("203.0.113.20", "203.0.113.10")
+
+    async def connect(
+        host: str, port: int, *, ssl: object = None, server_hostname: str | None = None
+    ) -> tuple[object, FakeWriter]:
+        del port, ssl
+        attempted.append((host, server_hostname))
+        if host == "203.0.113.10":
+            raise OSError("first address unavailable")
+        return object(), FakeWriter()
+
+    async def spawn(argv: tuple[str, ...]) -> ProcessPort:
+        del argv
+        return process
+
+    tester = DestinationTester(
+        dns_validator=dns,
+        connector=connect,
+        process_factory=spawn,
+        ssl_context_factory=lambda: tls_context,
+        waiter=immediate,
+    )
+    assert run(
+        tester.test(DestinationKind.DOUYIN, "rtmps://publish.example/live", SECRET)
+    )
+    assert attempted == [
+        ("203.0.113.10", "publish.example"),
+        ("203.0.113.20", "publish.example"),
+    ]

@@ -219,6 +219,23 @@ def test_shutdown_stops_processes_without_persisting_desired_state() -> None:
     assert wechat.stop_count == 1
 
 
+def test_disabling_last_destination_stops_and_persists_false() -> None:
+    store = FakeStore(
+        PersistedControllerState(CANONICAL_ROOM, True, ("primary", "secondary"))
+    )
+    controller, _, _, _, _ = make_controller(FakeResolver([]), store=store)
+
+    drive(controller.initialize())
+    drive(controller.set_destination_enabled("primary", False))
+    drive(controller.set_destination_enabled("secondary", False))
+    snapshot = drive(controller.snapshot())
+
+    assert snapshot.desired_running is False
+    assert snapshot.source_state is SourceState.STOPPED
+    assert store.saved[-1].desired_running is False
+    assert store.saved[-1].enabled_destinations == ()
+
+
 def test_real_controller_store_round_trips_primary_secondary_identities(tmp_path: Path) -> None:
     paths = AppPaths.create(tmp_path / "controller-store")
     encrypt = lambda value: "cipher:" + value[::-1]

@@ -75,7 +75,8 @@ async def validate_destination_dns(
             raise RuntimeBuildError("local test destination must resolve to loopback")
     elif not all(address.is_global for address in parsed_addresses):
         raise RuntimeBuildError("destination must resolve only to public addresses")
-    return tuple(str(address) for address in parsed_addresses)
+    ordered = sorted(parsed_addresses, key=lambda address: (address.version, int(address)))
+    return tuple(str(address) for address in ordered)
 
 
 class _Probe:
@@ -157,6 +158,7 @@ class RuntimeManager:
         self._adapters: dict[DestinationKind, _DestinationAdapter] = {}
         self._lock = asyncio.Lock()
         self._startup_failed = False
+        self._configuration_blocked = False
 
     async def initialize(self) -> None:
         await self._apply_configuration(suppress_resume_failure=True)
@@ -210,11 +212,17 @@ class RuntimeManager:
             self._controller = new_controller
             self._adapters = new_adapters
             self._startup_failed = False
-            if (
-                (was_running or restored_running)
-                and has_enabled_destination
-                and new_controller is not None
-            ):
+            self._configuration_blocked = False
+            requested_running = was_running or restored_running
+            if requested_running and not has_enabled_destination:
+                if new_controller is not None:
+                    await new_controller.stop()
+                if source is not None:
+                    self._database.set_source(
+                        source.room_identity, source.preferred_quality, False
+                    )
+                self._configuration_blocked = True
+            elif requested_running and new_controller is not None:
                 try:
                     await new_controller.start()
                 except Exception:
@@ -228,8 +236,17 @@ class RuntimeManager:
             controller = self._controller
             if controller is None:
                 raise RuntimeBuildError("runtime is not configured")
+            if not any(item.enabled for item in self._database.list_destinations()):
+                source = self._database.get_source()
+                if source is not None:
+                    self._database.set_source(
+                        source.room_identity, source.preferred_quality, False
+                    )
+                self._configuration_blocked = True
+                raise RuntimeBuildError("runtime has no enabled destination")
             await controller.start()
             self._startup_failed = False
+            self._configuration_blocked = False
 
     async def stop(self) -> None:
         async with self._lock:
@@ -237,6 +254,7 @@ class RuntimeManager:
             if controller is not None:
                 await controller.stop()
             self._startup_failed = False
+            self._configuration_blocked = False
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -248,7 +266,7 @@ class RuntimeManager:
         controller = self._controller
         if controller is not None:
             snapshot = await controller.snapshot()
-            if self._startup_failed:
+            if self._startup_failed or self._configuration_blocked:
                 return replace(
                     snapshot,
                     desired_running=False,
@@ -261,8 +279,8 @@ class RuntimeManager:
         return ControllerSnapshot(
             source.room_identity if source else "https://live.douyin.com/unconfigured",
             False,
-            SourceState.STOPPED,
-            None,
+            SourceState.ERROR if self._configuration_blocked else SourceState.STOPPED,
+            SourceFailure.UNEXPECTED if self._configuration_blocked else None,
             None,
             0,
             (),
@@ -287,3 +305,4 @@ class RuntimeManager:
         self._controller = None
         self._adapters = {}
         self._startup_failed = False
+        self._configuration_blocked = False

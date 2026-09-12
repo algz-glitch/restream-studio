@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import ssl
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -101,6 +102,7 @@ class DestinationTester:
         process_factory: ProcessFactory = _spawn,
         ssl_context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context,
         waiter: Waiter = asyncio.wait_for,
+        monotonic: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 4.0,
     ) -> None:
         self._dns_validator = dns_validator
@@ -108,13 +110,30 @@ class DestinationTester:
         self._process_factory = process_factory
         self._ssl_context_factory = ssl_context_factory
         self._waiter = waiter
+        self._monotonic = monotonic
         self._timeout = timeout_seconds
 
     async def test(self, kind: DestinationKind, server: str, stream_key: str) -> bool:
+        deadline = self._monotonic() + self._timeout
         try:
             addresses = await self._dns_validator(kind, server)
-            await self._waiter(self._preflight(server, addresses[0]), self._timeout)
-            return await self._publish(server, stream_key)
+            connected = False
+            for address in sorted(addresses, key=_address_sort_key):
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    await self._waiter(self._preflight(server, address), remaining)
+                except (OSError, TimeoutError, ValueError):
+                    continue
+                connected = True
+                break
+            if not connected:
+                return False
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return False
+            return await self._publish(server, stream_key, remaining)
         except (OSError, TimeoutError, ValueError):
             return False
 
@@ -134,16 +153,20 @@ class DestinationTester:
         writer.close()
         await writer.wait_closed()
 
-    async def _publish(self, server: str, stream_key: str) -> bool:
+    async def _publish(self, server: str, stream_key: str, timeout: float) -> bool:
         command = build_destination_test_command(server, stream_key)
         process = await self._process_factory(command.argv)
         try:
-            return bool(await self._waiter(self._wait_bounded(process), self._timeout))
+            return bool(await self._waiter(self._wait_bounded(process), timeout))
         except TimeoutError:
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
             return False
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.wait()
 
     @staticmethod
     async def _wait_bounded(process: ProcessPort) -> bool:
@@ -156,3 +179,10 @@ class DestinationTester:
         if _AUTH_FAILURE.search(stderr):
             return False
         return returncode == 0 and len(stderr) <= _MAX_STDERR
+
+
+def _address_sort_key(value: str) -> tuple[int, int]:
+    from ipaddress import ip_address
+
+    address = ip_address(value)
+    return address.version, int(address)

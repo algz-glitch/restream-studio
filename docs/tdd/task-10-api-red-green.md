@@ -207,3 +207,37 @@ GREEN evidence above.
 A wider synchronous regression command was also attempted and stopped at the requested 30-second
 bound after 31 progress markers rather than being left running; it produced no failure before the
 stop, but is not reported as a passing suite.
+
+## Final three-item review closure
+
+The final review tests were introduced before implementation. RED demonstrated that publication
+cancellation did not reap the child, preflight used only the first unsorted address, disabling the
+last output left desired-running true, and restored desired-running with no enabled output was not
+represented as blocked.
+
+- Destination diagnostics now use one monotonic deadline across all preflight attempts and the
+  FFmpeg publication wait. Addresses are sorted deterministically by IP version and numeric value.
+  Each validated address is attempted within the remaining deadline until one succeeds; every
+  RTMPS attempt uses a verifying TLS context with the original hostname for SNI and certificate
+  checks. Individual connection errors are discarded and only the fixed safe diagnostic escapes.
+- Once FFmpeg exists, `_publish` always executes kill-if-live and `wait()` in `finally`, including
+  timeout and request-cancellation unwinding. The API's five-second guard remains larger than the
+  tester's four-second internal deadline. A cancellation regression proves no fake child remains
+  live, and a multi-address regression proves first-failure/second-success behavior.
+- Restored or running intent without any enabled destination is now fail-closed: source desired
+  state is persisted false and runtime status is `ERROR` with no internal detail. Disabling the
+  last controller destination automatically stops outputs and persists both desired-running false
+  and the empty enabled set. Re-enabling configuration does not silently restart; the operator must
+  issue start again.
+
+Final focused evidence is recorded from the completed commands below; the previously documented
+managed-host TestClient limitation is unchanged.
+
+```text
+97 passed: database + controller + DestinationTester focused regression
+18 passed, 33 deselected: socket-free API/runtime/security regression
+ruff: All checks passed
+mypy: Success, 42 source files
+compileall: passed
+git diff --check: passed (line-ending notices only)
+```

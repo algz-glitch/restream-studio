@@ -696,6 +696,10 @@ def test_pure_dns_policy_checks_every_answer_and_allows_explicit_localhost() -> 
         del host, port
         return ("8.8.8.8", "127.0.0.1")
 
+    async def unsorted_public_answers(host: str, port: int) -> tuple[str, ...]:
+        del host, port
+        return ("8.8.8.8", "1.1.1.1")
+
     with pytest.raises(RuntimeBuildError):
         run_immediate(
             validate_destination_dns(
@@ -707,6 +711,13 @@ def test_pure_dns_policy_checks_every_answer_and_allows_explicit_localhost() -> 
     assert run_immediate(
         validate_destination_dns(DestinationKind.LOCAL_TEST, "rtmp://localhost/live")
     ) == ("127.0.0.1", "::1")
+    assert run_immediate(
+        validate_destination_dns(
+            DestinationKind.DOUYIN,
+            "rtmp://publish.invalid/live",
+            resolver=unsorted_public_answers,
+        )
+    ) == ("1.1.1.1", "8.8.8.8")
 
 
 def test_runtime_initialize_resumes_and_rebuild_shutdown_does_not_rewrite_database(
@@ -864,3 +875,51 @@ def test_runtime_restart_failure_reports_error_instead_of_false_running(
     assert snapshot.desired_running is False
     assert snapshot.source_state is SourceState.ERROR
     assert snapshot.error_detail is None
+
+
+def test_runtime_persists_stopped_error_when_desired_but_no_destination_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import restream_studio.runtime as runtime_module
+    from restream_studio.persistence.database import RuntimeDestination
+
+    database = FakeDatabase()
+    database.source = SourceConfig(CANONICAL, "origin", True)
+    database.set_destination(
+        DestinationKind.DOUYIN, "rtmps://publish.invalid/live", SECRET, enabled=False
+    )
+    database.get_destination_runtime = lambda kind: RuntimeDestination(  # type: ignore[method-assign]
+        kind, "douyin", "rtmps://publish.invalid/live", SECRET, False
+    )
+
+    class RestoredController(FakeController):
+        async def snapshot(self) -> ControllerSnapshot:
+            snapshot = await super().snapshot()
+            return ControllerSnapshot(
+                snapshot.room_identity,
+                True,
+                snapshot.source_state,
+                None,
+                None,
+                0,
+                snapshot.outputs,
+            )
+
+    monkeypatch.setattr(runtime_module, "Controller", lambda **kwargs: RestoredController())
+    manager = runtime_module.RuntimeManager(cast(Any, database))
+
+    def finish(coroutine: Any) -> Any:
+        iterator = coroutine.__await__()
+        try:
+            iterator.send(None)
+        except StopIteration as stopped:
+            return stopped.value
+        raise AssertionError("blocked runtime coroutine unexpectedly suspended")
+
+    finish(manager.initialize())
+    snapshot = finish(manager.snapshot())
+    assert database.source is not None and database.source.desired_running is False
+    assert snapshot.desired_running is False
+    assert snapshot.source_state is SourceState.ERROR
+    with pytest.raises(runtime_module.RuntimeBuildError):
+        finish(manager.start())

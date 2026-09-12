@@ -426,6 +426,7 @@ class Controller:
 
     async def set_destination_enabled(self, identity: str, enabled: bool) -> None:
         selected = self._destination(identity)
+        stop_controller = False
         async with self._state_lock:
             if self._enabled[identity] is enabled:
                 return
@@ -435,6 +436,10 @@ class Controller:
             if not enabled:
                 self._inputs[identity] = OutputInput.NONE
                 self._output_source_fingerprints[identity] = None
+                stop_controller = self._desired_running and not any(self._enabled.values())
+        if stop_controller:
+            await self.stop()
+            return
         if not enabled:
             await self._stop_destination(selected)
         await self._persist()

@@ -1,0 +1,388 @@
+# Task 14：真实平台验收门
+
+## 1. 目的与当前基线
+
+本门禁只证明抖音与微信视频号官方平台实际收流；本机 `/health`、目标“连接成功”、
+FFmpeg 退出码或本地 RTMP 测试都不能代替平台预览。任何自动化程序不得登录平台、申请
+凭据、替操作者点击开播，或把本地成功改写成平台成功。
+
+当前仓库基线状态为
+`LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING`：当前没有账号持有人的官方凭据，
+也没有完成 MediaMTX 本地完整链路验收。不得创建或提交伪造的 passed artifact。
+
+状态含义：
+
+- `LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING`：本地完整链路或真实平台验收至少一项未完成。
+- `LOCAL_CHAIN_VERIFIED_PLATFORM_ACCEPTANCE_PENDING`：MediaMTX + 应用 + FFmpeg 的本地完整链路已有真实通过记录，但两个真实平台尚未全部验收。
+- `PLATFORM_ACCEPTED`：本页所有必选项、30 分钟记录、故障恢复、脱敏证据和双人签字均真实完成。
+
+除以上三个值外，`result.json` 不接受其他状态；非通过结果必须保持前两个 pending 状态。
+
+## 2. 人员与前置条件
+
+角色必须分离：账号持有人负责登录、取得凭据和查看平台后台；验收人负责计时、观察应用、
+记录证据与复核脱敏。二者可以是同一自然人，但必须分别签字并留下 UTC 时间戳。
+
+- [ ] 记录应用版本、Git 提交、Windows 版本、FFmpeg/ffprobe 版本和 MediaMTX 版本。
+- [ ] 备份 `%LOCALAPPDATA%\RestreamStudio`，停止旧版本，记录可回滚的旧程序目录。
+- [ ] 确认测试内容有转播授权，并在抖音与视频号各创建一次本次验收专用直播任务。
+- [ ] 确认本地完整链路的真实结果；若尚未完成，最终状态只能是
+      `LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING`。
+- [ ] 关闭录屏、剪贴板同步、命令历史记录工具和会自动采集表单的浏览器扩展。
+- [ ] 建立本地且被 Git 忽略的证据目录：
+      `artifacts/platform-acceptance/<UTC-run-id>/`。不得将该目录提交到版本库。
+
+## 3. 官方 server/key 的人工取得与输入
+
+以下步骤必须由账号持有人手工完成：
+
+1. 登录**抖音直播伴侣**或其官方直播控制台，为本次直播取得官方 server 和 key。
+2. 登录**视频号助手**，在官方推流设置中为本次直播取得官方 server 和 key。
+3. server/key 仅通过 Restream Studio UI 输入；密钥字段必须是密码框。不得写入本文档、
+   `result.json`、脚本、命令行、`.env`、工单、聊天、日志或截图。
+4. 分别保存抖音、视频号目标并执行 UI 中的“测试”。测试成功只代表连接探测成功，
+   仍不得标记 `PLATFORM_ACCEPTED`。
+
+检查：
+
+- [ ] 抖音凭据由账号持有人从官方界面取得并仅通过 Restream Studio UI 输入。
+- [ ] 视频号凭据由账号持有人从官方界面取得并仅通过 Restream Studio UI 输入。
+- [ ] UI 回显只有固定掩码 `********`，页面、日志和事件中没有 server/key 明文。
+- [ ] 未把凭据复制到任何仓库文件或验收证据。
+
+## 4. 初始平台预览与停止隔离
+
+1. 在工作台启用两个目标并启动转播。
+2. 账号持有人同时打开抖音和视频号官方平台预览；每目标独立预览并人工确认：画面正确、
+   声音可听、音画对应、没有错误来源或待机画面。
+3. 在 Restream Studio UI 仅停止抖音目标。确认抖音平台预览停止，同时视频号连续保持音视频；
+   记录停止、观察和恢复 UTC 时间。
+4. 恢复抖音并重新确认音视频。然后仅停止视频号目标，确认视频号平台预览停止，同时抖音
+   连续保持音视频；记录停止、观察和恢复 UTC 时间。
+5. 任一目标停止导致另一目标断流、重启、转入待机或重连，停止隔离即失败，状态保持 pending。
+
+- [ ] 抖音独立预览音视频通过。
+- [ ] 视频号独立预览音视频通过。
+- [ ] 抖音停止隔离通过，视频号未受影响。
+- [ ] 视频号停止隔离通过，抖音未受影响。
+
+## 5. 同步 30 分钟稳定性记录
+
+两个目标恢复 LIVE 后，以同一 UTC 起点开始连续 **30 分钟**观察。每分钟只写一条同步记录，
+`minute=1..30`，不得事后批量补填。每条必须同时记录：应用/来源状态、两个目标状态、各目标
+码率、累计掉帧、累计重连、各自平台预览音频/视频、整机或应用进程 CPU 和内存。
+平台未提供数值时写 `null` 并在 `notes` 说明数据来源缺失，禁止猜测；但平台预览音视频必须
+由账号持有人实际观察并记录布尔值。
+
+| minute | UTC | 来源/应用 | 抖音状态/码率/掉帧/重连/预览音视频 | 视频号状态/码率/掉帧/重连/预览音视频 | CPU%/内存 MiB | 记录人 |
+|---:|---|---|---|---|---|---|
+| 01 |  |  |  |  |  |  |
+| 02 |  |  |  |  |  |  |
+| 03 |  |  |  |  |  |  |
+| 04 |  |  |  |  |  |  |
+| 05 |  |  |  |  |  |  |
+| 06 |  |  |  |  |  |  |
+| 07 |  |  |  |  |  |  |
+| 08 |  |  |  |  |  |  |
+| 09 |  |  |  |  |  |  |
+| 10 |  |  |  |  |  |  |
+| 11 |  |  |  |  |  |  |
+| 12 |  |  |  |  |  |  |
+| 13 |  |  |  |  |  |  |
+| 14 |  |  |  |  |  |  |
+| 15 |  |  |  |  |  |  |
+| 16 |  |  |  |  |  |  |
+| 17 |  |  |  |  |  |  |
+| 18 |  |  |  |  |  |  |
+| 19 |  |  |  |  |  |  |
+| 20 |  |  |  |  |  |  |
+| 21 |  |  |  |  |  |  |
+| 22 |  |  |  |  |  |  |
+| 23 |  |  |  |  |  |  |
+| 24 |  |  |  |  |  |  |
+| 25 |  |  |  |  |  |  |
+| 26 |  |  |  |  |  |  |
+| 27 |  |  |  |  |  |  |
+| 28 |  |  |  |  |  |  |
+| 29 |  |  |  |  |  |  |
+| 30 |  |  |  |  |  |  |
+
+失败条件：缺少任一分钟；时间倒退或相邻记录超过 75 秒；任一平台预览未实际观察；任一必填
+指标没有值且未说明；出现未解释的断流、掉帧增长或重连。失败时不得补造记录，只能保留
+pending 状态并重新进行完整 30 分钟窗口。
+
+## 6. 来源中断、待机与恢复
+
+稳定性窗口后执行一次受控故障：
+
+1. 记录 UTC 时间并中断来源 **> 60 秒**（建议 65–75 秒），不要停止两个目标输出。
+2. 在应用和两个官方平台预览上分别确认已进入待机；记录待机首次出现时间。任一目标断开
+   而非持续发布待机，或在 60 秒内提前恢复，均失败。
+3. 恢复来源。只有在两个连续探测都确认来源 LIVE、抖音预览音视频正常、视频号预览音视频
+   正常后才能判定恢复；两次探测间隔至少 10 秒。
+4. 任一次探测失败会把连续计数清零，必须重新取得连续两次探测；不得把单次恢复当作通过。
+
+- [ ] 实测中断时长大于 60 秒。
+- [ ] 抖音与视频号均实际显示待机音视频。
+- [ ] 恢复连续两次探测通过，且两次 UTC 时间相差至少 10 秒。
+- [ ] 故障期间重连、掉帧和平台状态已写入 `result.json`。
+
+## 7. 截图脱敏与证据管理
+
+截图至少覆盖：两个目标初始音视频预览、两次停止隔离、双平台待机、恢复后的第二次探测和
+平台结束状态。截图脱敏必须在复制出证据目录前完成，并由第二人逐张复核。
+
+必须裁剪或不可逆遮盖：完整 server/key、RTMP URL、账号/手机号/头像/二维码、直播间 ID、
+Cookie/Authorization/token、浏览器地址栏查询参数、本机用户名与绝对路径、通知和其他隐私。
+仅缩小、打码透明层、隐藏图层或在文件名中改写不算脱敏。检查图片元数据；证据文件名只用
+运行 ID、目标、步骤和 UTC 时间。原始截图不得提交或外发。
+
+- [ ] 每张截图由记录人完成截图脱敏。
+- [ ] 每张截图由复核人确认无法恢复敏感内容。
+- [ ] `result.json` 只引用证据目录内的相对路径和 SHA-256，不包含图片数据或绝对路径。
+
+## 8. `result.json` schema
+
+`result.json` 是一次真实运行的结构化索引，不是自动生成的通过证明。应在本地忽略目录中生成，
+填写真实观测后由账号持有人和验收人签字。禁止提交示例通过文件。以下为 JSON Schema
+Draft 2020-12；实现校验器时必须按原 schema 校验，不得删除必填项或放宽数量限制。
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/restream-studio/platform-acceptance-result.schema.json",
+  "title": "Restream Studio real platform acceptance result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "status", "started_at_utc", "completed_at_utc", "build", "local_chain", "credential_provenance", "initial_preview", "stop_isolation", "minute_samples", "source_interruption", "screenshots", "signoff", "rollback"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9-]+$" },
+    "status": { "enum": ["LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING", "LOCAL_CHAIN_VERIFIED_PLATFORM_ACCEPTANCE_PENDING", "PLATFORM_ACCEPTED"] },
+    "started_at_utc": { "$ref": "#/$defs/utc" },
+    "completed_at_utc": { "$ref": "#/$defs/utc" },
+    "build": {
+      "type": "object", "additionalProperties": false,
+      "required": ["app_version", "git_commit", "windows_version", "ffmpeg_version", "mediamtx_version"],
+      "properties": {
+        "app_version": { "type": "string", "minLength": 1 },
+        "git_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "windows_version": { "type": "string", "minLength": 1 },
+        "ffmpeg_version": { "type": "string", "minLength": 1 },
+        "mediamtx_version": { "type": ["string", "null"] }
+      }
+    },
+    "local_chain": {
+      "type": "object", "additionalProperties": false,
+      "required": ["verified", "evidence_sha256"],
+      "properties": {
+        "verified": { "type": "boolean" },
+        "evidence_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "credential_provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["douyin", "wechat_channels"],
+      "properties": {
+        "douyin": { "$ref": "#/$defs/provenance" },
+        "wechat_channels": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "initial_preview": { "$ref": "#/$defs/twoTargetObservation" },
+    "stop_isolation": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": { "$ref": "#/$defs/isolation" }
+    },
+    "minute_samples": {
+      "type": "array", "minItems": 30, "maxItems": 30,
+      "items": { "$ref": "#/$defs/minuteSample" }
+    },
+    "source_interruption": {
+      "type": "object", "additionalProperties": false,
+      "required": ["started_at_utc", "restored_at_utc", "duration_seconds", "standby", "recovery_probes"],
+      "properties": {
+        "started_at_utc": { "$ref": "#/$defs/utc" },
+        "restored_at_utc": { "$ref": "#/$defs/utc" },
+        "duration_seconds": { "type": "number", "exclusiveMinimum": 60 },
+        "standby": { "$ref": "#/$defs/twoTargetObservation" },
+        "recovery_probes": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "items": { "$ref": "#/$defs/recoveryProbe" }
+        }
+      }
+    },
+    "screenshots": {
+      "type": "array", "minItems": 7,
+      "items": { "$ref": "#/$defs/screenshot" }
+    },
+    "signoff": {
+      "type": "object", "additionalProperties": false,
+      "required": ["account_holder", "acceptance_verifier"],
+      "properties": {
+        "account_holder": { "$ref": "#/$defs/signature" },
+        "acceptance_verifier": { "$ref": "#/$defs/signature" }
+      }
+    },
+    "rollback": {
+      "type": "object", "additionalProperties": false,
+      "required": ["backup_reference", "old_program_reference", "outputs_stopped", "platform_sessions_ended", "credentials_removed_or_rotated", "verified_at_utc"],
+      "properties": {
+        "backup_reference": { "type": "string", "minLength": 1 },
+        "old_program_reference": { "type": "string", "minLength": 1 },
+        "outputs_stopped": { "type": "boolean" },
+        "platform_sessions_ended": { "type": "boolean" },
+        "credentials_removed_or_rotated": { "type": "boolean" },
+        "verified_at_utc": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+    }
+  },
+  "$defs": {
+    "utc": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["official_console", "obtained_by_account_holder", "input_channel", "persisted_outside_app"],
+      "properties": {
+        "official_console": { "enum": ["抖音直播伴侣", "视频号助手"] },
+        "obtained_by_account_holder": { "const": true },
+        "input_channel": { "const": "restream_studio_ui" },
+        "persisted_outside_app": { "const": false }
+      }
+    },
+    "targetObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "video_visible", "audio_audible", "observed_at_utc", "observed_by"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "video_visible": { "type": "boolean" },
+        "audio_audible": { "type": "boolean" },
+        "observed_at_utc": { "$ref": "#/$defs/utc" },
+        "observed_by": { "type": "string", "minLength": 1 }
+      }
+    },
+    "twoTargetObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["douyin", "wechat_channels"],
+      "properties": {
+        "douyin": { "$ref": "#/$defs/targetObservation" },
+        "wechat_channels": { "$ref": "#/$defs/targetObservation" }
+      }
+    },
+    "isolation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stopped_target", "stopped_at_utc", "peer_remained_live", "stopped_target_absent_in_preview", "resumed_at_utc", "observed_by"],
+      "properties": {
+        "stopped_target": { "enum": ["douyin", "wechat_channels"] },
+        "stopped_at_utc": { "$ref": "#/$defs/utc" },
+        "peer_remained_live": { "type": "boolean" },
+        "stopped_target_absent_in_preview": { "type": "boolean" },
+        "resumed_at_utc": { "$ref": "#/$defs/utc" },
+        "observed_by": { "type": "string", "minLength": 1 }
+      }
+    },
+    "targetMinute": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "bitrate_kbps", "dropped_frames", "reconnect_count", "platform_video_visible", "platform_audio_audible"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "bitrate_kbps": { "type": ["number", "null"], "minimum": 0 },
+        "dropped_frames": { "type": ["integer", "null"], "minimum": 0 },
+        "reconnect_count": { "type": ["integer", "null"], "minimum": 0 },
+        "platform_video_visible": { "type": "boolean" },
+        "platform_audio_audible": { "type": "boolean" }
+      }
+    },
+    "minuteSample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["minute", "captured_at_utc", "application_status", "source_status", "douyin", "wechat_channels", "cpu_percent", "memory_mib", "recorded_by", "notes"],
+      "properties": {
+        "minute": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "captured_at_utc": { "$ref": "#/$defs/utc" },
+        "application_status": { "type": "string", "minLength": 1 },
+        "source_status": { "type": "string", "minLength": 1 },
+        "douyin": { "$ref": "#/$defs/targetMinute" },
+        "wechat_channels": { "$ref": "#/$defs/targetMinute" },
+        "cpu_percent": { "type": "number", "minimum": 0 },
+        "memory_mib": { "type": "number", "minimum": 0 },
+        "recorded_by": { "type": "string", "minLength": 1 },
+        "notes": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "recoveryProbe": {
+      "type": "object", "additionalProperties": false,
+      "required": ["captured_at_utc", "source_live", "targets"],
+      "properties": {
+        "captured_at_utc": { "$ref": "#/$defs/utc" },
+        "source_live": { "const": true },
+        "targets": { "$ref": "#/$defs/twoTargetObservation" }
+      }
+    },
+    "screenshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["step", "relative_path", "sha256", "captured_at_utc", "redacted", "reviewed_by"],
+      "properties": {
+        "step": { "type": "string", "minLength": 1 },
+        "relative_path": { "type": "string", "pattern": "^(?![A-Za-z]:|[/\\\\]|.*\\.\\.).+$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "captured_at_utc": { "$ref": "#/$defs/utc" },
+        "redacted": { "const": true },
+        "reviewed_by": { "type": "string", "minLength": 1 }
+      }
+    },
+    "signature": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "signed", "signed_at_utc"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "signed": { "const": true },
+        "signed_at_utc": { "$ref": "#/$defs/utc" }
+      }
+    }
+  }
+}
+```
+
+JSON Schema 不能表达全部跨字段约束。验收人还必须人工核对：分钟编号恰为 1–30 且不重复；
+UTC 时间单调递增；两项停止隔离分别覆盖两个目标；两个恢复探测间隔至少 10 秒；所有截图
+哈希可重算；`completed_at_utc` 晚于所有证据时间。
+
+## 9. 状态机与判定
+
+```text
+LOCAL_CHAIN_PENDING_PLATFORM_ACCEPTANCE_PENDING
+  -- 本地 MediaMTX 完整链路真实通过 -->
+LOCAL_CHAIN_VERIFIED_PLATFORM_ACCEPTANCE_PENDING
+  -- 双平台全部门禁 + 脱敏证据 + 人工签字真实通过 -->
+PLATFORM_ACCEPTED
+```
+
+任何缺项、平台失败、证据无法复核、签字缺失或时间戳矛盾都禁止进入
+`PLATFORM_ACCEPTED`。平台通过后若凭据被轮换、平台规则改变、版本/链路发生影响推流的变更，
+状态退回相应 pending 状态并重新验收。自动化只能校验结构和一致性，不能生成平台观察结论，
+也不能把 HTTP、FFmpeg、MediaMTX 或 UI 状态映射成平台通过。
+
+最终人工签字（同时写入 `result.json`）：
+
+- 账号持有人：________________  签字：________________  UTC：________________
+- 验收人：____________________  签字：________________  UTC：________________
+
+## 10. 结束与回滚
+
+无论通过或失败，都按顺序执行：
+
+1. 在 Restream Studio UI 停止两个输出，确认没有后台 FFmpeg 子进程继续发布。
+2. 在抖音直播伴侣和视频号助手结束本次直播，并从官方预览确认已停止收流。
+3. 通过 UI 删除本次目标凭据；若平台支持，立即轮换或撤销本次 key。
+4. 若验收暴露回归：停止新版本，恢复验收前的数据目录备份，从保留的旧程序目录启动；
+   不得让新旧版本同时访问同一数据库。
+5. 对回滚版本执行 `/health` 和本地非发布检查，不得用回滚成功代替平台验收。
+6. 在 `result.json.rollback` 写入脱敏备份引用、旧程序引用、停止/结束/凭据处理结果和 UTC 时间。
+7. 删除含敏感信息的原始截图和临时文件；保留已脱敏证据须遵循账号持有人的保留策略。
+
+- [ ] 两个平台会话均已结束。
+- [ ] 两个输出均已停止。
+- [ ] 本次凭据已从应用删除并在需要时轮换/撤销。
+- [ ] 回滚路径已验证或明确记录为未执行及原因；不得虚报已回滚。

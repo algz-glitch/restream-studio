@@ -8,12 +8,12 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "cryptography",
-    "fastapi",
-    "httpx",
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
     "psutil",
-    "pydantic",
+    "pydantic>=2.10,<3",
     "streamget==4.0.10",
-    "uvicorn[standard]",
+    "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]

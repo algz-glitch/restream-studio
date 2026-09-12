@@ -17,8 +17,10 @@ def _parser() -> argparse.ArgumentParser:
             "healthy",
             "ignore-stop",
             "spawn-descendant-ignore-stop",
+            "spawn-descendant-parent-exits",
             "exit",
             "auth-fail",
+            "transient-4032",
             "malformed-metrics",
         ),
     )
@@ -41,6 +43,9 @@ def main() -> int:
         for index in range(args.lines):
             print(f"post-auth-line-{index}", file=sys.stderr)
         return int(args.code)
+    if args.mode == "transient-4032":
+        print("frame=4032 fps=30.0 ordinary encoder diagnostic", file=sys.stderr)
+        return int(args.code)
     if args.mode == "malformed-metrics":
         print("unknown=" + ("x" * 10_000), file=sys.stderr)
         print("fps=nan", file=sys.stderr)
@@ -57,7 +62,7 @@ def main() -> int:
         nonlocal stopping
         stopping = True
 
-    if args.mode == "healthy":
+    if args.mode in {"healthy", "spawn-descendant-parent-exits"}:
         signal.signal(signal.SIGTERM, request_stop)
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, request_stop)
@@ -66,7 +71,7 @@ def main() -> int:
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, signal.SIG_IGN)
 
-    if args.mode == "spawn-descendant-ignore-stop":
+    if args.mode in {"spawn-descendant-ignore-stop", "spawn-descendant-parent-exits"}:
         descendant = subprocess.Popen(
             [sys.executable, __file__, "ignore-stop"],
             stdin=subprocess.DEVNULL,
@@ -79,6 +84,7 @@ def main() -> int:
     print("speed=1.02x", file=sys.stderr, flush=True)
     print("out_time=00:01:02.500000", file=sys.stderr, flush=True)
     print("progress=continue", file=sys.stderr, flush=True)
+    print("ordinary ffmpeg diagnostic", file=sys.stderr, flush=True)
     while not stopping:
         time.sleep(0.02)
     print("progress=end", file=sys.stderr, flush=True)

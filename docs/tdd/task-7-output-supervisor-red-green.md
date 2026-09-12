@@ -149,3 +149,46 @@ Focused GREEN command result:
 ```
 
 No loopback or asyncio shim was added to the repository.
+
+## Quality review follow-up
+
+Six review regressions were added before production changes. RED evidence included a concurrent
+start joiner timing out on `_live` after the runner failed, and the FFmpeg command assertion
+reporting zero `-progress` arguments. The new cases cover joiner failure/stop termination,
+contextual 403 classification, parent-exits/child-survives cleanup, reconnect reset across an
+explicit stop/start boundary, taskkill-helper cancellation cleanup, and production progress argv.
+
+Implementation changes:
+
+- every start caller races its own bounded live-event task against the shared runner; the owner
+  still owns cancellation cleanup, while joiners receive runner failure, cancellation, or an
+  explicit `stopped before becoming live` error instead of waiting forever;
+- auth matching uses bounded phrases and HTTP/RTMP status context, never a bare `403` substring;
+- the process group ID is retained on POSIX and killed after the parent exits; Windows children are
+  attached at startup to a kill-on-close Job Object, with async taskkill as a fallback;
+- a newly owned public-start session resets `reconnect_count`, while reconnects within that run
+  remain monotonic;
+- taskkill uses a separately tracked waiter which is killed and shield-reaped on timeout or caller
+  cancellation; main-process fallback waits are shielded on cancellation;
+- generated FFmpeg argv now contains `-progress pipe:2 -nostats`; ordinary diagnostics and parsed
+  progress lines continue sharing the bounded redacted stderr reader.
+
+Runnable focused evidence on this host:
+
+```text
+7 passed, 1 warning in 0.08s
+29 passed, 1 warning in 0.06s
+```
+
+Real nested-child cases remain subject to the documented host `CreateProcess` denial. They retain
+per-test asyncio deadlines and deterministic local Python fixtures; no test shim was committed.
+
+Final verification after the quality-review implementation:
+
+```text
+8 runnable Task 7 cases passed in 0.09s
+138 synchronous regression cases passed, 1 deselected, in 0.19s
+25 Task 7 cases collected
+Ruff: All checks passed
+mypy: Success, no issues found in 27 source files
+```

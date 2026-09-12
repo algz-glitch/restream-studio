@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import math
 import os
 import re
@@ -17,14 +18,116 @@ from restream_studio.security.redaction import redact
 
 _PROGRESS_KEYS: Final = frozenset({"fps", "bitrate", "speed", "out_time", "progress"})
 _TIME_PATTERN: Final = re.compile(r"^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$")
-_AUTH_FAILURE_MARKERS: Final = (
-    "authentication failed",
-    "403",
-    "invalid stream key",
-    "publish denied",
-    "authorization failed",
-    "unauthorized",
+_AUTH_FAILURE_PATTERN: Final = re.compile(
+    r"(?ix)(?:"
+    r"\bauthentication\s+failed\b|"
+    r"\bauthorization\s+failed\b|"
+    r"\bunauthorized\b|"
+    r"\binvalid\s+stream\s+key\b|"
+    r"\bpublish\s+denied\b|"
+    r"\bhttp(?:/\d(?:\.\d)?)?\s+403\b|"
+    r"\bserver\s+returned\s+403\b|"
+    r"\b403\s+forbidden\b"
+    r")"
 )
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Final = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: Final = 9
+_PROCESS_ASSIGN_RIGHTS: Final = 0x0001 | 0x0100 | 0x1000
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _BasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _ExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _WindowsJob:
+    def __init__(self, handle: int) -> None:
+        self._handle: int | None = handle
+
+    @classmethod
+    def attach(cls, pid: int) -> _WindowsJob | None:
+        if os.name != "nt":
+            return None
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        raw_job_handle = kernel32.CreateJobObjectW(None, None)
+        job_handle = int(raw_job_handle or 0)
+        if not job_handle:
+            return None
+        information = _ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        configured = kernel32.SetInformationJobObject(
+            job_handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        )
+        raw_process_handle = kernel32.OpenProcess(_PROCESS_ASSIGN_RIGHTS, False, pid)
+        process_handle = int(raw_process_handle or 0)
+        if not configured or not process_handle:
+            if process_handle:
+                kernel32.CloseHandle(process_handle)
+            kernel32.CloseHandle(job_handle)
+            return None
+        try:
+            assigned = kernel32.AssignProcessToJobObject(job_handle, process_handle)
+        finally:
+            kernel32.CloseHandle(process_handle)
+        if not assigned:
+            kernel32.CloseHandle(job_handle)
+            return None
+        return cls(job_handle)
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle(handle)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +178,10 @@ class AsyncProcess:
         self._was_killed = False
         self._stop_requested = False
         self._auth_failed = False
+        self._process_group_id: int | None = None
+        self._windows_job: _WindowsJob | None = None
+        self._tree_cleanup_done = False
+        self._tree_cleanup_lock = asyncio.Lock()
 
     @property
     def pid(self) -> int | None:
@@ -133,6 +240,9 @@ class AsyncProcess:
                     )
             except (OSError, ValueError):
                 raise ProcessStartError("output process could not be started") from None
+            self._process_group_id = self._process.pid
+            if os.name == "nt":
+                self._windows_job = _WindowsJob.attach(self._process.pid)
             self._stderr_task = asyncio.create_task(self._read_stderr())
 
     async def _read_stderr(self) -> None:
@@ -161,8 +271,7 @@ class AsyncProcess:
 
     def _capture_line(self, raw: bytes) -> None:
         decoded = raw.decode("utf-8", errors="replace")
-        folded = decoded.casefold()
-        if any(marker in folded for marker in _AUTH_FAILURE_MARKERS):
+        if _AUTH_FAILURE_PATTERN.search(decoded) is not None:
             self._auth_failed = True
         self._capture_metric(decoded)
         self._append_tail(self._sanitize(decoded))
@@ -211,6 +320,7 @@ class AsyncProcess:
     async def wait(self) -> int:
         process = self._require_process()
         returncode = await process.wait()
+        await self._cleanup_process_tree()
         await self._finalize_reader()
         return returncode
 
@@ -228,17 +338,27 @@ class AsyncProcess:
             if self._process is None:
                 return 0
             process = self._process
-            if process.returncode is None:
-                self._gentle_stop()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=timeout)
-                except TimeoutError:
-                    self._was_killed = True
-                    await self.kill()
-                    await process.wait()
-            await self._finalize_reader()
-            assert process.returncode is not None
-            return process.returncode
+            try:
+                if process.returncode is None:
+                    self._gentle_stop()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=timeout)
+                    except TimeoutError:
+                        self._was_killed = True
+                        await self.kill()
+                        await process.wait()
+                await self._cleanup_process_tree()
+                await self._finalize_reader()
+                assert process.returncode is not None
+                return process.returncode
+            except asyncio.CancelledError:
+                await asyncio.shield(self.kill())
+                if process.returncode is None:
+                    process.kill()
+                await asyncio.shield(process.wait())
+                await asyncio.shield(self._cleanup_process_tree())
+                await asyncio.shield(self._finalize_reader())
+                raise
 
     def _gentle_stop(self) -> None:
         process = self._require_process()
@@ -258,35 +378,74 @@ class AsyncProcess:
 
     async def kill(self) -> None:
         process = self._require_process()
-        if process.returncode is not None:
-            return
         try:
             if os.name != "nt":
-                os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+                await self._cleanup_process_tree()
             else:
-                taskkill = await asyncio.create_subprocess_exec(
-                    "taskkill",
-                    "/PID",
-                    str(int(process.pid)),
-                    "/T",
-                    "/F",
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                try:
-                    taskkill_returncode = await asyncio.wait_for(taskkill.wait(), timeout=5.0)
-                except TimeoutError:
-                    taskkill.kill()
-                    taskkill_returncode = await taskkill.wait()
-                if taskkill_returncode != 0 and process.returncode is None:
+                tree_stopped = await self._cleanup_process_tree()
+                if not tree_stopped and process.returncode is None:
                     process.kill()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await asyncio.shield(process.wait())
+            raise
         except (OSError, ProcessLookupError):
             if process.returncode is None:
+                process.kill()
+
+    async def _cleanup_process_tree(self) -> bool:
+        async with self._tree_cleanup_lock:
+            if self._tree_cleanup_done:
+                return True
+            group_id = self._process_group_id
+            if group_id is None:
+                return False
+            if os.name != "nt":
                 try:
-                    process.kill()
+                    os.killpg(group_id, signal.SIGKILL)  # type: ignore[attr-defined]
                 except ProcessLookupError:
                     pass
+                self._tree_cleanup_done = True
+                return True
+            if self._windows_job is not None:
+                self._windows_job.close()
+                self._windows_job = None
+                self._tree_cleanup_done = True
+                await asyncio.sleep(0)
+                return True
+            taskkill_returncode = await self._run_taskkill(group_id)
+            if taskkill_returncode != 0:
+                return False
+            self._tree_cleanup_done = True
+            return True
+
+    @staticmethod
+    async def _run_taskkill(pid: int) -> int:
+        taskkill = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(int(pid)),
+            "/T",
+            "/F",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        waiter = asyncio.create_task(taskkill.wait())
+        try:
+            return await asyncio.wait_for(asyncio.shield(waiter), timeout=5.0)
+        except TimeoutError:
+            taskkill.kill()
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            taskkill.kill()
+            await asyncio.shield(waiter)
+            raise
+        finally:
+            if not waiter.done():
+                taskkill.kill()
+                await asyncio.shield(waiter)
 
     def snapshot(self) -> ProcessSnapshot:
         return ProcessSnapshot(

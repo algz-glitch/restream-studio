@@ -148,6 +148,21 @@ def test_hls_and_flv_inputs_include_reconnect_options_and_one_output() -> None:
         assert sum(arg.startswith(("rtmp://", "rtmps://")) for arg in command.argv) == 1
 
 
+def test_output_command_enables_machine_readable_progress_on_stderr() -> None:
+    command = build_ffmpeg_command(
+        "https://media.example.test/live.flv",
+        "rtmp://push.example.com/live/key",
+        DestinationKind.DOUYIN,
+        compatible_probe(),
+    )
+
+    assert command.argv.count("-progress") == 1
+    progress_index = command.argv.index("-progress")
+    assert command.argv[progress_index + 1] == "pipe:2"
+    assert command.argv.count("-nostats") == 1
+    assert progress_index < command.argv.index("-f")
+
+
 @pytest.mark.parametrize(
     "destination",
     [

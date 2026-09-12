@@ -83,25 +83,34 @@ class OutputSupervisor:
         self._state = target
 
     async def start(self) -> None:
-        if self._runner is not None and not self._runner.done():
-            await self._live.wait()
+        existing = self._runner
+        if existing is not None and not existing.done():
+            await self._wait_until_live_or_done(existing, owns_runner=False)
             return
         self._live.clear()
+        self._reconnect_count = 0
         runner = asyncio.create_task(
             self.run(), name=f"output-supervisor-{self.destination.value.casefold()}"
         )
         self._runner = runner
+        await self._wait_until_live_or_done(runner, owns_runner=True)
+
+    async def _wait_until_live_or_done(
+        self, runner: asyncio.Task[None], *, owns_runner: bool
+    ) -> None:
         live_wait = asyncio.create_task(self._live.wait(), name="output-supervisor-live")
         try:
             done, _ = await asyncio.wait({runner, live_wait}, return_when=asyncio.FIRST_COMPLETED)
-            if runner in done:
-                runner.result()
+            if live_wait in done and self._live.is_set():
+                return
+            runner.result()
+            raise RuntimeError("output supervisor stopped before becoming live")
         except asyncio.CancelledError:
-            runner.cancel()
-            live_wait.cancel()
-            await asyncio.gather(runner, live_wait, return_exceptions=True)
-            await self._close_process()
-            self._to_stopped()
+            if owns_runner:
+                runner.cancel()
+                await asyncio.gather(runner, return_exceptions=True)
+                await self._close_process()
+                self._to_stopped()
             raise
         finally:
             live_wait.cancel()

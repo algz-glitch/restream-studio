@@ -10,7 +10,7 @@ import psutil  # type: ignore[import-untyped]
 import pytest
 
 from restream_studio.domain import DestinationKind, OutputState
-from restream_studio.media.process import AsyncProcess
+from restream_studio.media.process import AsyncProcess, ProcessStartError
 from restream_studio.outputs.supervisor import OutputSupervisor
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "child_process.py"
@@ -40,6 +40,7 @@ async def test_async_process_starts_collects_metrics_and_stops_cleanly() -> None
         "out_time_seconds": 62.5,
         "progress": "continue",
     }
+    assert "ordinary ffmpeg diagnostic" in process.stderr_tail
 
     returncode = await asyncio.wait_for(process.stop(timeout=1.0), timeout=2.0)
     assert returncode == 0
@@ -154,6 +155,76 @@ async def test_supervisor_start_reaches_live_and_stop_reaps_process() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_start_joiner_receives_runner_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class FailingProcess:
+        started = False
+        auth_failed = False
+
+        def __init__(self, _argv: object, *, sensitive_values: object) -> None:
+            return None
+
+        async def start(self) -> None:
+            entered.set()
+            await release.wait()
+            raise ProcessStartError("typed start failure")
+
+        async def stop(self, *, timeout: float) -> int:
+            return 0
+
+    monkeypatch.setattr("restream_studio.outputs.supervisor.AsyncProcess", FailingProcess)
+    supervisor = OutputSupervisor(DestinationKind.DOUYIN, child("healthy"))
+    owner = asyncio.create_task(supervisor.start())
+    await entered.wait()
+    joiner = asyncio.create_task(supervisor.start())
+    release.set()
+
+    results = await asyncio.wait_for(
+        asyncio.gather(owner, joiner, return_exceptions=True), timeout=1.0
+    )
+    assert all(isinstance(result, ProcessStartError) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_start_joiner_terminates_when_stopped_before_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    stopped = asyncio.Event()
+
+    class StoppedProcess:
+        started = False
+        auth_failed = False
+
+        def __init__(self, _argv: object, *, sensitive_values: object) -> None:
+            return None
+
+        async def start(self) -> None:
+            entered.set()
+            await stopped.wait()
+
+        async def stop(self, *, timeout: float) -> int:
+            stopped.set()
+            return 0
+
+    monkeypatch.setattr("restream_studio.outputs.supervisor.AsyncProcess", StoppedProcess)
+    supervisor = OutputSupervisor(DestinationKind.WECHAT, child("healthy"))
+    owner = asyncio.create_task(supervisor.start())
+    await entered.wait()
+    joiner = asyncio.create_task(supervisor.start())
+    await supervisor.stop()
+
+    results = await asyncio.wait_for(
+        asyncio.gather(owner, joiner, return_exceptions=True), timeout=1.0
+    )
+    assert all(isinstance(result, RuntimeError) for result in results)
+
+
+@pytest.mark.asyncio
 async def test_cancelling_public_start_cancels_runner_and_closes_started_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -228,6 +299,36 @@ async def test_authentication_rejection_is_terminal(message: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_frame_4032_is_transient_not_authentication_failure() -> None:
+    retry_started = asyncio.Event()
+
+    async def blocked_retry(_delay: float) -> None:
+        retry_started.set()
+        await asyncio.Event().wait()
+
+    supervisor = OutputSupervisor(
+        DestinationKind.DOUYIN,
+        child("transient-4032"),
+        retry_wait=blocked_retry,
+    )
+    task = asyncio.create_task(supervisor.run())
+    await asyncio.wait_for(retry_started.wait(), timeout=2.0)
+    assert supervisor.state is OutputState.RECONNECTING
+    assert supervisor.process is not None and supervisor.process.auth_failed is False
+    await supervisor.stop()
+    await task
+
+
+def test_auth_classifier_requires_status_context_and_boundaries() -> None:
+    process = AsyncProcess(("unused",))
+    process._capture_line(b"frame=4032 fps=30.0")
+    assert process.auth_failed is False
+
+    process._capture_line(b"RTMP server returned 403 Forbidden")
+    assert process.auth_failed is True
+
+
+@pytest.mark.asyncio
 async def test_cancelling_during_backoff_reaps_internal_wait_tasks() -> None:
     waiting = asyncio.Event()
 
@@ -266,6 +367,19 @@ async def test_timeout_kill_terminates_descendant_process_tree() -> None:
 
     assert process.was_killed is True
     assert not psutil.pid_exists(descendant_pid)
+
+
+@pytest.mark.asyncio
+async def test_parent_graceful_exit_still_terminates_surviving_descendant() -> None:
+    process = AsyncProcess(child("spawn-descendant-parent-exits"))
+    await process.start()
+    await eventually(lambda: any(line.startswith("descendant_pid=") for line in process.stderr_tail))
+    descendant_line = next(line for line in process.stderr_tail if line.startswith("descendant_pid="))
+    descendant_pid = int(descendant_line.partition("=")[2])
+
+    assert await asyncio.wait_for(process.stop(timeout=1.0), timeout=3.0) == 0
+    await eventually(lambda: not psutil.pid_exists(descendant_pid))
+    assert process.was_killed is False
 
 
 @pytest.mark.asyncio
@@ -317,6 +431,7 @@ async def test_windows_tree_kill_is_async_and_does_not_block_peer_work(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
     process = AsyncProcess(("unused",))
     object.__setattr__(process, "_process", main_process)
+    object.__setattr__(process, "_process_group_id", main_process.pid)
 
     stop_task = asyncio.create_task(process.stop(timeout=0.01))
     await asyncio.wait_for(taskkill_entered.wait(), timeout=1.0)
@@ -330,6 +445,110 @@ async def test_windows_tree_kill_is_async_and_does_not_block_peer_work(
     assert not stop_task.done()
     release_taskkill.set()
     await asyncio.wait_for(asyncio.gather(stop_task, peer_task), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_taskkill_reaps_helper_and_main_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows taskkill behavior")
+    helper_started = asyncio.Event()
+    helper_killed = asyncio.Event()
+    helper_reaped = asyncio.Event()
+    main_reaped = asyncio.Event()
+
+    class FakeMainProcess:
+        pid = 4343
+        returncode: int | None = None
+
+        def send_signal(self, _signal: int) -> None:
+            return None
+
+        async def wait(self) -> int:
+            if self.returncode is None:
+                await main_reaped.wait()
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+            main_reaped.set()
+
+    class FakeTaskkillProcess:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            helper_started.set()
+            if not helper_killed.is_set():
+                await helper_killed.wait()
+            helper_reaped.set()
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+            helper_killed.set()
+
+    async def fake_create(*_argv: str, **_kwargs: object) -> asyncio.subprocess.Process:
+        return FakeTaskkillProcess()  # type: ignore[return-value]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    process = AsyncProcess(("unused",))
+    main_process = FakeMainProcess()
+    object.__setattr__(process, "_process", main_process)
+    object.__setattr__(process, "_process_group_id", main_process.pid)
+    kill_task = asyncio.create_task(process.kill())
+    await helper_started.wait()
+    kill_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await kill_task
+    assert helper_killed.is_set() and helper_reaped.is_set() and main_reaped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_restart_resets_reconnect_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances: list[SessionProcess] = []
+
+    class SessionProcess:
+        auth_failed = False
+
+        def __init__(self, _argv: object, *, sensitive_values: object) -> None:
+            self.started = False
+            self.exited = asyncio.Event()
+            instances.append(self)
+
+        async def start(self) -> None:
+            self.started = True
+
+        async def wait(self) -> int:
+            if len(instances) == 1:
+                return 9
+            await self.exited.wait()
+            return 0
+
+        async def stop(self, *, timeout: float) -> int:
+            self.exited.set()
+            return 0
+
+    async def immediate_retry(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("restream_studio.outputs.supervisor.AsyncProcess", SessionProcess)
+    supervisor = OutputSupervisor(
+        DestinationKind.LOCAL_TEST, child("healthy"), retry_wait=immediate_retry
+    )
+    await supervisor.start()
+    await eventually(lambda: supervisor.reconnect_count == 1 and len(instances) == 2)
+    await supervisor.stop()
+
+    await supervisor.start()
+    assert supervisor.state is OutputState.LIVE
+    assert supervisor.reconnect_count == 0
+    await supervisor.stop()
 
 
 @pytest.mark.asyncio

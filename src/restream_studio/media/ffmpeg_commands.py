@@ -176,7 +176,7 @@ def build_ffmpeg_command(
                 str(preset.channels),
             )
         )
-    args.extend(("-f", "flv", output))
+    args.extend(("-progress", "pipe:2", "-nostats", "-f", "flv", output))
     argv = tuple(args)
     display_argv = tuple(
         _display_source_url(item)

@@ -194,10 +194,9 @@ class OutputSupervisor:
             await asyncio.gather(retry, stopped, return_exceptions=True)
 
     async def stop(self) -> None:
-        async with self._stop_lock:
-            async with self._lifecycle_lock:
-                self._stop_requested.set()
-                runner = self._runner
+        async with self._stop_lock, self._lifecycle_lock:
+            self._stop_requested.set()
+            runner = self._runner
             await self._close_process()
             if runner is not None and runner is not asyncio.current_task() and not runner.done():
                 await runner

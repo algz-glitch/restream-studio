@@ -5,6 +5,7 @@ import sys
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from typing import Self
 
 import psutil  # type: ignore[import-untyped]
 import pytest
@@ -258,6 +259,92 @@ async def test_stop_intent_survives_runner_scheduled_after_stop(
     assert isinstance(result[0], RuntimeError)
     assert children_created == 0
     assert supervisor.state is OutputState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_start_waits_for_concurrent_stop_of_finished_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_stop_entered = asyncio.Event()
+    release_old_stop = asyncio.Event()
+    new_started = asyncio.Event()
+    new_exited = asyncio.Event()
+    new_stopped = asyncio.Event()
+    second_lock_attempted = asyncio.Event()
+    second_lock_acquired = asyncio.Event()
+
+    class ObservedLifecycleLock:
+        def __init__(self) -> None:
+            self._lock = asyncio.Lock()
+            self._attempts = 0
+
+        async def __aenter__(self) -> Self:
+            self._attempts += 1
+            attempt = self._attempts
+            if attempt == 2:
+                second_lock_attempted.set()
+            await self._lock.acquire()
+            if attempt == 2:
+                second_lock_acquired.set()
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            self._lock.release()
+
+    class OldProcess:
+        async def stop(self, *, timeout: float) -> int:
+            old_stop_entered.set()
+            await release_old_stop.wait()
+            return 0
+
+    class NewProcess:
+        started = False
+        auth_failed = False
+
+        def __init__(self, _argv: object, *, sensitive_values: object) -> None:
+            return None
+
+        async def start(self) -> None:
+            self.started = True
+            new_started.set()
+
+        async def wait(self) -> int:
+            await new_exited.wait()
+            return 0
+
+        async def stop(self, *, timeout: float) -> int:
+            new_stopped.set()
+            new_exited.set()
+            return 0
+
+    async def finished_runner() -> None:
+        return None
+
+    monkeypatch.setattr("restream_studio.outputs.supervisor.AsyncProcess", NewProcess)
+    supervisor = OutputSupervisor(DestinationKind.WECHAT, child("healthy"))
+    supervisor._lifecycle_lock = ObservedLifecycleLock()  # type: ignore[assignment]
+    old_runner = asyncio.create_task(finished_runner())
+    await old_runner
+    supervisor._runner = old_runner
+    supervisor._process = OldProcess()  # type: ignore[assignment]
+
+    stop_task = asyncio.create_task(supervisor.stop())
+    await old_stop_entered.wait()
+    start_task = asyncio.create_task(supervisor.start())
+    try:
+        await second_lock_attempted.wait()
+        await asyncio.sleep(0)
+        assert not second_lock_acquired.is_set()
+        assert not new_started.is_set()
+        release_old_stop.set()
+        await asyncio.wait_for(stop_task, timeout=1.0)
+        await asyncio.wait_for(start_task, timeout=1.0)
+        assert supervisor.state is OutputState.LIVE
+        assert new_stopped.is_set() is False
+    finally:
+        release_old_stop.set()
+        await asyncio.gather(stop_task, start_task, return_exceptions=True)
+        await supervisor.stop()
 
 
 @pytest.mark.asyncio

@@ -222,3 +222,25 @@ Final focused evidence:
 28 Task 7 cases collected
 Ruff and strict mypy passed
 ```
+
+## Final stop/start generation race closure
+
+The final deterministic regression installs an already-finished old runner and an old process
+whose stop is held at a barrier, then calls `start()` concurrently. RED showed that the new child
+could acquire the observed lifecycle lock before old-process cleanup completed
+(`second_lock_acquired=True`); after the barrier was released, the old `stop()` could overwrite
+the new generation's state with STOPPED.
+
+GREEN keeps the lifecycle lock for the complete stop transaction: recording stop intent, closing
+the captured generation's process, awaiting its runner, and transitioning to STOPPED. A concurrent
+`start()` therefore waits until that transaction is complete, then clears stop intent and creates
+the next generation. It cannot be cleaned up or have its state overwritten by the earlier stop.
+
+Focused verification after the fix:
+
+```text
+12 runnable Task 7 cases passed, 17 deselected, in 0.16s
+138 synchronous regression cases passed, 1 deselected, in 0.19s
+29 Task 7 cases collected
+Ruff and strict mypy passed
+```

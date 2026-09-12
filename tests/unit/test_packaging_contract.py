@@ -108,13 +108,26 @@ def test_dev_supervises_vite_readiness_and_both_exact_processes() -> None:
     assert "Select-Object -First 1" in script
     assert "--strictPort" in script
     assert "$FrontendRoot = Join-Path $Root 'frontend'" in script
-    assert "-WorkingDirectory $FrontendRoot" in script
     assert "Invoke-WebRequest" in script
     assert "Restream Studio" in script
     assert "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in script
-    assert "AssignProcessToJobObject" in script
-    assert "$ProcessJob.AddProcess($frontend)" in script
-    assert "$ProcessJob.AddProcess($backend)" in script
+    assert "CreateProcessW" in script
+    assert "CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW" in script
+    assert "QuoteCommandLineArgument" in script
+    assert "Start-Process" not in script
+    create = script.index("CreateProcessW(", script.index("public Process StartProcessSuspended"))
+    assign = script.index("AssignProcessToJobObject(handle, processInfo.Process)", create)
+    resume = script.index("ResumeThread(processInfo.Thread)", assign)
+    assert create < assign < resume
+    assert script.count("$ProcessJob.StartProcessSuspended(") == 2
+    frontend_launch = script.index("$frontend = $ProcessJob.StartProcessSuspended(")
+    backend_launch = script.index("$backend = $ProcessJob.StartProcessSuspended(")
+    assert script.index("$FrontendRoot", frontend_launch, backend_launch) > frontend_launch
+    assert script.index("$Root", backend_launch) > backend_launch
+    assert "CloseHandle(processInfo.Thread)" in script
+    assert "CloseHandle(processInfo.Process)" in script
+    assert "managedProcess.Handle" in script
+    assert "TerminateJobObject" in script
     assert "$ProcessJob.Dispose()" in script
     for environment_name, old_value in (
         ("FFMPEG_PATH", "$oldFFmpeg"),

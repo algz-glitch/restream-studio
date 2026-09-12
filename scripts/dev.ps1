@@ -6,13 +6,20 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace RestreamStudio {
     public sealed class KillOnCloseJob : IDisposable {
         private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const uint CREATE_SUSPENDED = 0x00000004;
+        private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+        private const uint CREATE_NO_WINDOW = 0x08000000;
+        private const uint STARTF_USESHOWWINDOW = 0x00000001;
+        private const short SW_HIDE = 0;
         private IntPtr handle;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -48,6 +55,36 @@ namespace RestreamStudio {
             public UIntPtr PeakJobMemoryUsed;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo {
+            public int Size;
+            public string Reserved;
+            public string Desktop;
+            public string Title;
+            public int X;
+            public int Y;
+            public int XSize;
+            public int YSize;
+            public int XCountChars;
+            public int YCountChars;
+            public int FillAttribute;
+            public uint Flags;
+            public short ShowWindow;
+            public short Reserved2Size;
+            public IntPtr Reserved2;
+            public IntPtr StandardInput;
+            public IntPtr StandardOutput;
+            public IntPtr StandardError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation {
+            public IntPtr Process;
+            public IntPtr Thread;
+            public uint ProcessId;
+            public uint ThreadId;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
 
@@ -57,6 +94,28 @@ namespace RestreamStudio {
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcessW(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref StartupInfo startupInfo,
+            out ProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
@@ -81,10 +140,99 @@ namespace RestreamStudio {
             finally { Marshal.FreeHGlobal(buffer); }
         }
 
-        public void AddProcess(Process process) {
+        private static string QuoteCommandLineArgument(string argument) {
+            if (argument.Length == 0) return "\"\"";
+            if (argument.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '\"' }) < 0) return argument;
+
+            var quoted = new StringBuilder(argument.Length + 2);
+            quoted.Append('\"');
+            int backslashes = 0;
+            foreach (char character in argument) {
+                if (character == '\\') {
+                    backslashes++;
+                    continue;
+                }
+                if (character == '\"') {
+                    quoted.Append('\\', (backslashes * 2) + 1);
+                    quoted.Append('\"');
+                    backslashes = 0;
+                    continue;
+                }
+                quoted.Append('\\', backslashes);
+                quoted.Append(character);
+                backslashes = 0;
+            }
+            quoted.Append('\\', backslashes * 2);
+            quoted.Append('\"');
+            return quoted.ToString();
+        }
+
+        private static StringBuilder BuildCommandLine(
+            string executable, IEnumerable<string> arguments) {
+            var commandLine = new StringBuilder(QuoteCommandLineArgument(executable));
+            foreach (string argument in arguments) {
+                commandLine.Append(' ');
+                commandLine.Append(QuoteCommandLineArgument(argument));
+            }
+            return commandLine;
+        }
+
+        public Process StartProcessSuspended(
+            string executable, string[] arguments, string workingDirectory) {
             if (handle == IntPtr.Zero) throw new ObjectDisposedException("KillOnCloseJob");
-            if (!AssignProcessToJobObject(handle, process.Handle))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (String.IsNullOrWhiteSpace(executable))
+                throw new ArgumentException("Executable is required.", "executable");
+            if (arguments == null) throw new ArgumentNullException("arguments");
+            if (String.IsNullOrWhiteSpace(workingDirectory))
+                throw new ArgumentException("Working directory is required.", "workingDirectory");
+
+            var startupInfo = new StartupInfo {
+                Size = Marshal.SizeOf(typeof(StartupInfo)),
+                Flags = STARTF_USESHOWWINDOW,
+                ShowWindow = SW_HIDE
+            };
+            ProcessInformation processInfo = new ProcessInformation();
+            Process managedProcess = null;
+            bool created = false;
+            try {
+                uint creationFlags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+                if (!CreateProcessW(
+                    executable,
+                    BuildCommandLine(executable, arguments),
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    false,
+                    creationFlags,
+                    IntPtr.Zero,
+                    workingDirectory,
+                    ref startupInfo,
+                    out processInfo))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                created = true;
+
+                if (!AssignProcessToJobObject(handle, processInfo.Process))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                managedProcess = Process.GetProcessById(checked((int)processInfo.ProcessId));
+                IntPtr managedHandle = managedProcess.Handle;
+                if (managedHandle == IntPtr.Zero)
+                    throw new Win32Exception("Managed process handle is unavailable.");
+                if (ResumeThread(processInfo.Thread) == UInt32.MaxValue)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+
+                return managedProcess;
+            }
+            catch {
+                if (managedProcess != null) managedProcess.Dispose();
+                if (created) {
+                    TerminateJobObject(handle, 1);
+                    TerminateProcess(processInfo.Process, 1);
+                }
+                throw;
+            }
+            finally {
+                if (processInfo.Thread != IntPtr.Zero) CloseHandle(processInfo.Thread);
+                if (processInfo.Process != IntPtr.Zero) CloseHandle(processInfo.Process);
+            }
         }
 
         public void Dispose() {
@@ -173,10 +321,11 @@ try {
     if ($null -eq $ViteScript) {
         throw 'Vite entry point is missing after npm ci'
     }
-    $frontend = Start-Process -FilePath $Node `
-        -ArgumentList @($ViteScript, '--host', '127.0.0.1', '--port', [string]$FrontendPort, '--strictPort') `
-        -WorkingDirectory $FrontendRoot -PassThru -NoNewWindow
-    $ProcessJob.AddProcess($frontend)
+    $frontend = $ProcessJob.StartProcessSuspended(
+        $Node,
+        [string[]]@($ViteScript, '--host', '127.0.0.1', '--port', [string]$FrontendPort, '--strictPort'),
+        $FrontendRoot
+    )
 
     $readiness = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-FrontendHomepage -Port $FrontendPort)) {
@@ -188,9 +337,11 @@ try {
     $frontend.Refresh()
     if ($frontend.HasExited) { throw "Vite exited before readiness with code $($frontend.ExitCode)" }
 
-    $backend = Start-Process -FilePath $Python -ArgumentList @('-m', 'restream_studio.main') `
-        -WorkingDirectory $Root -PassThru -NoNewWindow
-    $ProcessJob.AddProcess($backend)
+    $backend = $ProcessJob.StartProcessSuspended(
+        $Python,
+        [string[]]@('-m', 'restream_studio.main'),
+        $Root
+    )
     while ($true) {
         $frontend.Refresh()
         $backend.Refresh()

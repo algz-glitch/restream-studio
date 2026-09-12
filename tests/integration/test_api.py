@@ -432,6 +432,15 @@ def test_host_forwarded_origin_and_session_guards(app: FastAPI) -> None:
             headers={"host": "localhost", "origin": "http://localhost", "x-restream-session": "wrong"},
             json={"room_url": CANONICAL},
         ).status_code == 403
+        assert client.get("/api/session", headers={"host": "localhost"}).status_code == 403
+        assert client.get(
+            "/api/session", headers={"host": "localhost", "sec-fetch-site": "cross-site"}
+        ).status_code == 403
+        browser_bootstrap = client.get(
+            "/api/session", headers={"host": "localhost", "sec-fetch-site": "same-origin"}
+        )
+        assert browser_bootstrap.status_code == 200
+        assert browser_bootstrap.json()["session_token"] == token
 
 
 def test_startup_shutdown_close_dependencies(app: FastAPI, harness: Harness) -> None:

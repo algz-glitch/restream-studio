@@ -155,6 +155,13 @@ def mutation_is_authorized(
     )
 
 
+def session_bootstrap_is_authorized(origin: str, host: str, sec_fetch_site: str) -> bool:
+    """Allow same-origin browser fetches, which commonly omit Origin on GET."""
+    if origin:
+        return _origin_matches_host(origin, host)
+    return sec_fetch_site.casefold() == "same-origin"
+
+
 def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -> FastAPI:
     deps = factory()
 
@@ -212,7 +219,11 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
         if (
             request.method in {"GET", "HEAD"}
             and request.url.path == "/api/session"
-            and not _origin_matches_host(request.headers.get("origin", ""), host)
+            and not session_bootstrap_is_authorized(
+                request.headers.get("origin", ""),
+                host,
+                request.headers.get("sec-fetch-site", ""),
+            )
         ):
             return _error(request, 403, "request_forbidden", "Origin is invalid")
         response = await call_next(request)

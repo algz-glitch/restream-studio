@@ -209,3 +209,33 @@ Ruff: All checks passed
 mypy: Success, no issues found in 34 source files
 git diff --check: clean
 ```
+
+## Atomic controller-load snapshot review
+
+Four final regressions were added first. A trace-controlled second SQLite connection committed a
+new desired state between the source and enabled-destination reads; RED returned the old source
+state with the new destination set. Three tampered identity cases (URL, control character, and
+space) also passed through unchanged:
+
+```text
+4 failed, 52 deselected in 0.53s
+```
+
+`load()` now holds the instance lock and an explicit `BEGIN DEFERRED` read transaction across both
+queries. The first source read establishes one WAL snapshot, so a concurrent connection may commit
+without producing a mixed result. Commit/rollback and busy/corruption translation remain typed.
+
+Every enabled `controller_identity` is validated again at the read boundary. Any malformed stored
+identity becomes `DatabaseCorruptError` with no raw identity value in the message; `ValueError`
+does not escape.
+
+Final verification:
+
+```text
+tests/unit/test_database.py: 56 passed
+tests/unit/test_database.py + tests/integration/test_controller.py: 86 passed
+synchronous regression: 224 passed, 1 deselected
+Ruff: All checks passed
+mypy: Success, no issues found in 34 source files
+git diff --check: clean
+```

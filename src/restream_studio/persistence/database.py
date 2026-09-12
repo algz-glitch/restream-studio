@@ -963,20 +963,40 @@ class Database:
         canonical = normalize_douyin_url(room_identity)
         with self._lock:
             connection = self._require_connection()
-            row = connection.execute(
-                "SELECT room_identity, desired_running "
-                "FROM source_config WHERE singleton_id=1 AND room_identity=?",
-                (canonical,),
-            ).fetchone()
-            enabled_rows = connection.execute(
-                "SELECT controller_identity FROM destination_config WHERE enabled=1 "
-                "ORDER BY CASE kind WHEN 'douyin' THEN 1 WHEN 'wechat_channels' THEN 2 ELSE 3 END"
-            ).fetchall()
+            try:
+                connection.execute("BEGIN DEFERRED")
+                row = connection.execute(
+                    "SELECT room_identity, desired_running "
+                    "FROM source_config WHERE singleton_id=1 AND room_identity=?",
+                    (canonical,),
+                ).fetchone()
+                enabled_rows = connection.execute(
+                    "SELECT controller_identity FROM destination_config WHERE enabled=1 "
+                    "ORDER BY CASE kind WHEN 'douyin' THEN 1 "
+                    "WHEN 'wechat_channels' THEN 2 ELSE 3 END"
+                ).fetchall()
+                connection.commit()
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if _is_busy(exc):
+                    raise DatabaseBusyError("SQLite database is busy") from exc
+                raise DatabaseCorruptError("Unable to read persisted controller state") from exc
+            except sqlite3.DatabaseError as exc:
+                connection.rollback()
+                raise DatabaseCorruptError("Unable to read persisted controller state") from exc
+            except BaseException:
+                connection.rollback()
+                raise
         if row is None:
             return None
         if row[1] not in (0, 1):
             raise DatabaseCorruptError("Persisted controller desired state is malformed")
-        enabled = tuple(str(enabled_row[0]) for enabled_row in enabled_rows)
+        try:
+            enabled = tuple(
+                _validate_controller_identity(str(enabled_row[0])) for enabled_row in enabled_rows
+            )
+        except ValueError as exc:
+            raise DatabaseCorruptError("Persisted controller identity is malformed") from exc
         return PersistedControllerState(str(row[0]), bool(row[1]), enabled)
 
     def dump_text(self) -> str:

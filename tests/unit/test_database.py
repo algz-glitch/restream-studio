@@ -562,6 +562,83 @@ def test_controller_store_round_trips_configured_destination_identities(db: Data
     assert db.get_destination(DestinationKind.WECHAT).controller_identity == "secondary"  # type: ignore[union-attr]
 
 
+def test_controller_load_uses_one_cross_connection_snapshot(
+    paths: AppPaths, crypto: tuple[Callable[[str], str], Callable[[str], str]]
+) -> None:
+    reader = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    )
+    writer = Database(
+        paths.database_file, paths=paths, encrypt_secret=crypto[0], decrypt_secret=crypto[1]
+    )
+    reader.open()
+    reader.set_destination(
+        DestinationKind.DOUYIN,
+        "rtmp://one.test/app",
+        "one",
+        controller_identity="primary",
+    )
+    reader.set_destination(
+        DestinationKind.WECHAT,
+        "rtmp://two.test/app",
+        "two",
+        controller_identity="secondary",
+    )
+    run(
+        reader.save(
+            PersistedControllerState("https://live.douyin.com/snapshot-room", True, ("primary",))
+        )
+    )
+    writer.open()
+    switched = False
+
+    def interleave(sql: str) -> None:
+        nonlocal switched
+        if not switched and sql.startswith("SELECT controller_identity"):
+            switched = True
+            run(
+                writer.save(
+                    PersistedControllerState(
+                        "https://live.douyin.com/snapshot-room", False, ("secondary",)
+                    )
+                )
+            )
+
+    connection = reader._connection
+    assert connection is not None
+    connection.set_trace_callback(interleave)
+    try:
+        restored = run(reader.load("https://live.douyin.com/snapshot-room"))
+    finally:
+        connection.set_trace_callback(None)
+        writer.close()
+        reader.close()
+
+    assert switched is True
+    assert restored == PersistedControllerState(
+        "https://live.douyin.com/snapshot-room", True, ("primary",)
+    )
+
+
+@pytest.mark.parametrize(
+    "tampered_identity",
+    ["https://evil.test/controller", "bad\nidentity", "bad identity"],
+)
+def test_controller_load_rejects_tampered_destination_identity(
+    db: Database, tampered_identity: str
+) -> None:
+    db.set_source("https://live.douyin.com/tampered-identity", None, True)
+    db.set_destination(DestinationKind.DOUYIN, "rtmp://one.test/app", "one", enabled=True)
+    db.execute_for_test("PRAGMA ignore_check_constraints=ON")
+    db.execute_for_test(
+        "UPDATE destination_config SET controller_identity=? WHERE kind='douyin'",
+        (tampered_identity,),
+    )
+
+    with pytest.raises(DatabaseCorruptError, match="controller identity"):
+        run(db.load("https://live.douyin.com/tampered-identity"))
+
+
 def test_explicit_empty_controller_identity_is_rejected_instead_of_defaulted(db: Database) -> None:
     with pytest.raises(ValueError, match="identity"):
         db.set_destination(

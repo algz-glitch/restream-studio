@@ -1,9 +1,10 @@
-import type { ActionResponse, ApiErrorBody, ControlResponse, DestinationKind, DestinationResponse, DestinationUpdate, EventItem, EventsResponse, Resource, SessionResponse, SourceResponse, SourceUpdate, StatusOutput, StatusResponse } from './types'
+import type { ActionResponse, ApiErrorBody, ControlResponse, DestinationKind, DestinationResponse, DestinationUpdate, EventItem, EventsResponse, InstallResponse, Resource, SessionResponse, SourceResponse, SourceUpdate, StatusOutput, StatusResponse, UpdateResponse, UpdateStatus } from './types'
 
 type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 type Validator<T> = (value: unknown) => value is T
 
 const destinationKinds: readonly DestinationKind[] = ['douyin', 'wechat_channels']
+const updateStatuses: readonly UpdateStatus[] = ['idle', 'checking', 'current', 'available', 'downloading', 'ready', 'failed']
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -11,6 +12,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === 'string'
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value)
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key))
 }
 
 function isOptionalFiniteNumber(value: unknown): boolean {
@@ -88,6 +94,24 @@ const isEventsResponse: Validator<EventsResponse> = (value): value is EventsResp
   && (value.next_cursor === null || (typeof value.next_cursor === 'number' && Number.isInteger(value.next_cursor)))
 )
 
+const updateKeys = ['status', 'current_version', 'available_version', 'release_url', 'last_checked_at', 'error_code', 'error_message'] as const
+const isUpdateResponse: Validator<UpdateResponse> = (value): value is UpdateResponse => (
+  isRecord(value)
+  && hasExactKeys(value, updateKeys)
+  && typeof value.status === 'string'
+  && updateStatuses.includes(value.status as UpdateStatus)
+  && typeof value.current_version === 'string'
+  && isNullableString(value.available_version)
+  && isNullableString(value.release_url)
+  && isNullableString(value.last_checked_at)
+  && isNullableString(value.error_code)
+  && isNullableString(value.error_message)
+)
+
+const isInstallResponse: Validator<InstallResponse> = (value): value is InstallResponse => (
+  isRecord(value) && hasExactKeys(value, ['status']) && value.status === 'restart_scheduled'
+)
+
 function controlValidator(expectedStatus: ControlResponse['status']): Validator<ControlResponse> {
   return (value): value is ControlResponse => isRecord(value) && value.status === expectedStatus
 }
@@ -162,6 +186,10 @@ export class ApiClient {
   saveSource(value: SourceUpdate, signal?: AbortSignal): Promise<SourceResponse> { return this.mutation('/api/source', 'PUT', value, isSourceResponse, signal, 'source') }
   saveDestination(kind: DestinationKind, value: DestinationUpdate, signal?: AbortSignal): Promise<DestinationResponse> { return this.mutation(`/api/destinations/${kind}`, 'PUT', value, destinationValidator(kind), signal, `destination:${kind}`) }
   getStatus(signal?: AbortSignal): Promise<StatusResponse> { return this.request('/api/status', isStatusResponse, { signal }) }
+  getUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.request('/api/update', isUpdateResponse, { signal }) }
+  checkUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.mutation('/api/update/check', 'POST', {}, isUpdateResponse, signal) }
+  downloadUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.mutation('/api/update/download', 'POST', {}, isUpdateResponse, signal) }
+  installUpdate(signal?: AbortSignal): Promise<InstallResponse> { return this.mutation('/api/update/install', 'POST', {}, isInstallResponse, signal) }
   getEvents(cursor = 0, signal?: AbortSignal): Promise<EventsResponse> { return this.request(`/api/events?limit=50&cursor=${cursor}`, isEventsResponse, { signal }) }
   start(signal?: AbortSignal): Promise<ControlResponse> { return this.mutation('/api/control/start', 'POST', { local_test: false }, controlValidator('started'), signal) }
   stop(signal?: AbortSignal): Promise<ControlResponse> { return this.mutation('/api/control/stop', 'POST', {}, controlValidator('stopped'), signal) }

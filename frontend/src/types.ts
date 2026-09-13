@@ -42,3 +42,15 @@ export interface EventsResponse { items: EventItem[]; next_cursor: number | null
 export interface ControlResponse { status: 'started' | 'stopped' }
 export interface ActionResponse { kind: DestinationKind; status?: string; ok?: boolean; diagnostic?: string }
 export interface Resource<T> { data: T; etag: string }
+
+export type UpdateStatus = 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'failed'
+export interface UpdateResponse {
+  status: UpdateStatus
+  current_version: string
+  available_version: string | null
+  release_url: string | null
+  last_checked_at: string | null
+  error_code: string | null
+  error_message: string | null
+}
+export interface InstallResponse { status: 'restart_scheduled' }

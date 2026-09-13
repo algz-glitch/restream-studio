@@ -267,6 +267,70 @@ input:focus-visible,select:focus-visible,.button:focus-visible {
 .lower-grid>.panel {
   margin-top:0
 }
+.update-card {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  gap:0 24px;
+  margin-top:16px;
+  overflow:hidden
+}
+.update-card__heading {
+  grid-column:1/-1
+}
+.update-card__body {
+  min-width:0
+}
+.update-card__action {
+  display:flex;
+  align-items:end;
+  justify-content:flex-end
+}
+.update-card__action .button {
+  min-width:128px
+}
+.update-card__heading h2 {
+  margin-top:4px
+}
+.update-version {
+  display:flex;
+  gap:10px 20px;
+  flex-wrap:wrap;
+  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  overflow-wrap:anywhere
+}
+.update-version strong {
+  color:var(--primary-hover)
+}
+.update-state {
+  flex:none;
+  border:1px solid var(--border);
+  border-radius:999px;
+  padding:5px 10px;
+  color:var(--muted);
+  font-size:12px
+}
+.update-state--available,.update-state--ready {
+  border-color:var(--success);
+  color:var(--success)
+}
+.update-state--checking,.update-state--downloading {
+  border-color:var(--warning);
+  color:var(--warning)
+}
+.update-state--failed {
+  border-color:var(--danger);
+  color:var(--danger)
+}
+.release-link {
+  display:inline-block;
+  color:var(--info);
+  overflow-wrap:anywhere
+}
+.update-stop-hint {
+  margin:10px 0 0;
+  color:var(--warning);
+  font-size:13px
+}
 .monitor-scroll {
   overflow-x:auto
 }
@@ -462,6 +526,16 @@ input:focus-visible,select:focus-visible,.button:focus-visible {
   }
   .output-grid {
     gap:12px
+  }
+  .update-card {
+    grid-template-columns:minmax(0,1fr);
+    gap:14px
+  }
+  .update-card__action {
+    justify-content:stretch
+  }
+  .update-card__action .button {
+    width:100%
   }
   .monitor-scroll {
     margin:0 -16px;

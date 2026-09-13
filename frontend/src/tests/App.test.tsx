@@ -2,11 +2,101 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../App'
+import { UpdateCard } from '../components/UpdateCard'
+import type { ApiClient } from '../api'
+import type { UpdateResponse } from '../types'
 import { destinations, events, installApi, json, source, status } from './fixtures'
 
 describe('播控台', () => {
   beforeEach(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }) })
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
+
+  const updateBase: UpdateResponse = {
+    status: 'idle', current_version: '0.1.0', available_version: null, release_url: null,
+    last_checked_at: null, error_code: null, error_message: null,
+  }
+
+  it.each([
+    ['idle', '尚未检查更新'], ['checking', '正在检查更新'], ['current', '已是最新版本'],
+    ['available', '发现新版本'], ['downloading', '正在下载更新'], ['ready', '更新已准备就绪'],
+    ['failed', '更新操作失败，请稍后重试。'],
+  ] as const)('更新卡展示 %s 状态', (state, copy) => {
+    render(<UpdateCard update={{ ...updateBase, status: state }} desiredRunning={false} api={{} as ApiClient} onChange={() => undefined} />)
+    expect(screen.getByRole('region', { name: '软件更新' })).toBeVisible()
+    expect(screen.getByText('当前版本 0.1.0')).toBeVisible()
+    expect(screen.getByText(copy)).toBeVisible()
+  })
+
+  it('可用更新只展示 HTTPS GitHub 发布页并下载一次', async () => {
+    let resolveDownload: ((value: UpdateResponse) => void) | undefined
+    const downloadUpdate = vi.fn(() => new Promise<UpdateResponse>((resolve) => { resolveDownload = resolve }))
+    const api = { downloadUpdate } as unknown as ApiClient
+    const user = userEvent.setup()
+    render(<UpdateCard update={{ ...updateBase, status: 'available', available_version: '0.2.0', release_url: 'https://github.com/algz-glitch/restream-studio/releases/tag/v0.2.0' }} desiredRunning={false} api={api} onChange={() => undefined} />)
+
+    const link = screen.getByRole('link', { name: '查看 GitHub 发布说明' })
+    expect(link).toHaveAttribute('href', 'https://github.com/algz-glitch/restream-studio/releases/tag/v0.2.0')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+    const button = screen.getByRole('button', { name: '下载更新' })
+    await user.dblClick(button)
+    expect(downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: '正在下载' })).toBeDisabled()
+    resolveDownload?.({ ...updateBase, status: 'ready', available_version: '0.2.0' })
+  })
+
+  it('ready 且有运行中继时禁用安装并提示先停止全部输出', () => {
+    render(<UpdateCard update={{ ...updateBase, status: 'ready', available_version: '0.2.0' }} desiredRunning api={{} as ApiClient} onChange={() => undefined} />)
+    expect(screen.getByRole('button', { name: '安装并重启' })).toBeDisabled()
+    expect(screen.getByText('请先停止全部输出，再安装更新。')).toBeVisible()
+  })
+
+  it('非 HTTPS GitHub 发布地址不渲染为外链', () => {
+    render(<UpdateCard update={{ ...updateBase, status: 'available', available_version: '0.2.0', release_url: 'http://example.com/C:/private/update.exe' }} desiredRunning={false} api={{} as ApiClient} onChange={() => undefined} />)
+    expect(screen.queryByRole('link', { name: '查看 GitHub 发布说明' })).not.toBeInTheDocument()
+  })
+
+  it('检查与安装调用真实方法，卸载时中止进行中的动作', async () => {
+    const signals: AbortSignal[] = []
+    const checkUpdate = vi.fn((signal?: AbortSignal) => { if (signal) signals.push(signal); return new Promise<UpdateResponse>(() => undefined) })
+    const api = { checkUpdate } as unknown as ApiClient
+    const user = userEvent.setup()
+    const view = render(<UpdateCard update={updateBase} desiredRunning={false} api={api} onChange={() => undefined} />)
+    await user.click(screen.getByRole('button', { name: '检查更新' }))
+    expect(checkUpdate).toHaveBeenCalledTimes(1)
+    view.unmount()
+    expect(signals[0].aborted).toBe(true)
+
+    const installUpdate = vi.fn().mockResolvedValue({ status: 'restart_scheduled' })
+    render(<UpdateCard update={{ ...updateBase, status: 'ready', available_version: '0.2.0' }} desiredRunning={false} api={{ installUpdate } as unknown as ApiClient} onChange={() => undefined} />)
+    await user.dblClick(screen.getByRole('button', { name: '安装并重启' }))
+    expect(installUpdate).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: '重启已安排' })).toBeDisabled()
+  })
+
+  it('更新原始错误和本地路径不进入界面', () => {
+    render(<UpdateCard update={{ ...updateBase, status: 'failed', error_code: 'download_failed', error_message: 'C:\\private\\update.exe token=secret' }} desiredRunning={false} api={{} as ApiClient} onChange={() => undefined} />)
+    expect(screen.getByText('更新操作失败，请稍后重试。')).toBeVisible()
+    expect(screen.queryByText(/private|token=secret|download_failed/)).not.toBeInTheDocument()
+  })
+
+  it('App 独立初始化并轮询更新，更新失败不阻断现有页面', async () => {
+    vi.useFakeTimers()
+    let updateCalls = 0
+    const baseFetch = installApi({ '/api/update': updateBase })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/update' && updateCalls++ > 0) return json({ error: { code: 'private', message: 'C:\\private\\file' } }, { status: 503 })
+      return baseFetch(input, init)
+    }))
+    render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByRole('region', { name: '软件更新' })).toBeVisible()
+    expect(screen.getByRole('region', { name: '直播来源' })).toBeVisible()
+    await act(async () => { await vi.advanceTimersByTimeAsync(30000) })
+    expect(screen.getByText('更新状态加载失败，请稍后重试。')).toBeVisible()
+    expect(screen.getByRole('region', { name: '传输监控' })).toBeVisible()
+    expect(screen.queryByText(/private|C:\\/)).not.toBeInTheDocument()
+  })
 
   it('加载时保留页面布局骨架，完成后呈现离线状态与移动端语义顺序', async () => {
     let resolveSource: ((value: Response) => void) | undefined

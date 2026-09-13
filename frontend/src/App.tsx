@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api as defaultApi, isAbortError, type ApiClient } from './api'
-import type { DestinationKind, DestinationResponse, EventItem, SourceResponse, StatusResponse } from './types'
+import type { DestinationKind, DestinationResponse, EventItem, SourceResponse, StatusResponse, UpdateResponse } from './types'
 import { SourceCard } from './components/SourceCard'
 import { OutputCard } from './components/OutputCard'
 import { Monitor } from './components/Monitor'
 import { Logs } from './components/Logs'
 import { StatusBadge } from './components/StatusBadge'
+import { UpdateCard } from './components/UpdateCard'
 import './styles.css'
 
 const kinds = ['douyin', 'wechat_channels'] as const
 const outputNames: Record<DestinationKind, string> = { douyin: '抖音输出', wechat_channels: '微信视频号输出' }
 const blankStatus: StatusResponse = { desired_running: false, source_state: 'OFFLINE', source_failure: null, outputs: [] }
+const blankUpdate: UpdateResponse = { status: 'idle', current_version: '—', available_version: null, release_url: null, last_checked_at: null, error_code: null, error_message: null }
 
 export default function App({ api = defaultApi }: { api?: ApiClient }) {
   const [source, setSource] = useState<SourceResponse | null>(null)
@@ -22,6 +24,9 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [statusLoading, setStatusLoading] = useState(true)
   const [statusError, setStatusError] = useState('')
+  const [update, setUpdate] = useState<UpdateResponse | null>(null)
+  const [updateLoading, setUpdateLoading] = useState(true)
+  const [updateError, setUpdateError] = useState('')
   const [events, setEvents] = useState<EventItem[]>([])
   const [nextCursor, setNextCursor] = useState<number | null>(0)
   const [logsLoading, setLogsLoading] = useState(true)
@@ -37,12 +42,15 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
   const destinationControllers = useRef<Partial<Record<DestinationKind, AbortController>>>({})
   const statusController = useRef<AbortController | null>(null)
   const statusRequest = useRef<Promise<void> | null>(null)
+  const updateController = useRef<AbortController | null>(null)
+  const updateRequest = useRef<Promise<void> | null>(null)
   const eventsController = useRef<AbortController | null>(null)
   const sessionController = useRef<AbortController | null>(null)
   const controlController = useRef<AbortController | null>(null)
   const sourceSequence = useRef(0)
   const destinationSequences = useRef<Record<DestinationKind, number>>({ douyin: 0, wechat_channels: 0 })
   const statusSequence = useRef(0)
+  const updateSequence = useRef(0)
   const eventsSequence = useRef(0)
   const sessionSequence = useRef(0)
   const confirmButton = useRef<HTMLButtonElement>(null)
@@ -139,6 +147,33 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
     }
   }, [api])
 
+  const loadUpdate = useCallback((): Promise<void> => {
+    if (updateRequest.current && updateController.current && !updateController.current.signal.aborted) return updateRequest.current
+    const controller = new AbortController()
+    const sequence = ++updateSequence.current
+    updateController.current = controller
+    setUpdateLoading(true)
+    const pending = (async () => {
+      try {
+        const value = await api.getUpdate(controller.signal)
+        if (!controller.signal.aborted && sequence === updateSequence.current) {
+          setUpdate(value)
+          setUpdateError('')
+        }
+      } catch (cause) {
+        if (!isAbortError(cause) && sequence === updateSequence.current) setUpdateError('更新状态加载失败，请稍后重试。')
+      } finally {
+        if (sequence === updateSequence.current) setUpdateLoading(false)
+        if (updateController.current === controller) {
+          updateController.current = null
+          updateRequest.current = null
+        }
+      }
+    })()
+    updateRequest.current = pending
+    return pending
+  }, [api])
+
   const loadSession = useCallback(async () => {
     sessionController.current?.abort()
     const controller = new AbortController()
@@ -168,11 +203,44 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
       sourceController.current?.abort()
       for (const controller of Object.values(destinationControllers.current)) controller?.abort()
       statusController.current?.abort()
+      updateController.current?.abort()
       eventsController.current?.abort()
       sessionController.current?.abort()
       controlController.current?.abort()
     }
   }, [loadDestination, loadEvents, loadSession, loadSource])
+
+  useEffect(() => {
+    let timer: number | undefined
+    let generation = 0
+    let disposed = false
+    const clearTimer = () => { if (timer !== undefined) window.clearTimeout(timer); timer = undefined }
+    async function poll(expectedGeneration: number) {
+      await loadUpdate()
+      if (disposed || generation !== expectedGeneration || document.visibilityState !== 'visible') return
+      timer = window.setTimeout(() => void poll(expectedGeneration), 30000)
+    }
+    function stop() {
+      generation += 1
+      clearTimer()
+      updateController.current?.abort()
+      updateController.current = null
+      updateRequest.current = null
+    }
+    function start() {
+      clearTimer()
+      const expectedGeneration = ++generation
+      void poll(expectedGeneration)
+    }
+    const visibility = () => { if (document.visibilityState === 'hidden') stop(); else start() }
+    if (document.visibilityState === 'visible') start()
+    document.addEventListener('visibilitychange', visibility)
+    return () => {
+      disposed = true
+      stop()
+      document.removeEventListener('visibilitychange', visibility)
+    }
+  }, [loadUpdate])
 
   useEffect(() => {
     let timer: number | undefined
@@ -298,6 +366,7 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
         {statusLoading && !status ? <PanelSkeleton label="正在加载状态" /> : statusError ? <LoadError text={statusError} retryLabel="重试加载状态" onRetry={() => void loadStatus()} /> : <Monitor status={status ?? blankStatus} />}
         {logsLoading && events.length === 0 && nextCursor === 0 && !logsError ? <PanelSkeleton label="正在加载日志" /> : <Logs items={events} loading={logsLoading} error={logsError} hasMore={nextCursor !== null} onMore={() => void loadEvents(nextCursor ?? 0, true)} onRetry={() => void loadEvents(0)} />}
       </div>
+      <UpdateCard update={update ?? blankUpdate} desiredRunning={status?.desired_running ?? false} api={api} onChange={(value) => { setUpdate(value); setUpdateError('') }} loadError={updateError} loading={updateLoading} />
       </main>
     </div>
     {confirmStop && <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConfirmStop(false) }}><div ref={dialog} role="dialog" aria-modal="true" aria-labelledby="stop-title" aria-describedby="stop-description" className="dialog"><h2 id="stop-title">停止全部输出？</h2><p id="stop-description">当前有活跃输出。确认后两路发布都会停止。</p><div className="button-row"><button className="button" onClick={() => setConfirmStop(false)}>继续监控</button><button ref={confirmButton} className="button button--danger" onClick={() => void control('stop')}>确认停止</button></div></div></div>}

@@ -33,6 +33,56 @@ describe('ApiClient', () => {
     expect(fetcher).toHaveBeenCalledWith('/api/status', expect.objectContaining({ signal: controller.signal }))
   })
 
+  it('严格读取更新状态并把 AbortSignal 传给 GET /api/update', async () => {
+    const payload = {
+      status: 'available', current_version: '0.1.0', available_version: '0.2.0',
+      release_url: 'https://github.com/algz-glitch/restream-studio/releases/tag/v0.2.0',
+      last_checked_at: '2026-09-13T12:00:00Z', error_code: null, error_message: null,
+    }
+    const fetcher = vi.fn().mockResolvedValue(json(payload))
+    const api = new ApiClient(fetcher)
+    const controller = new AbortController()
+
+    await expect(api.getUpdate(controller.signal)).resolves.toEqual(payload)
+    expect(fetcher).toHaveBeenCalledWith('/api/update', expect.objectContaining({ signal: controller.signal }))
+  })
+
+  it('更新 mutation 沿用安全会话、空 JSON 请求体和 AbortSignal', async () => {
+    const update = {
+      status: 'current', current_version: '0.1.0', available_version: null, release_url: null,
+      last_checked_at: '2026-09-13T12:00:00Z', error_code: null, error_message: null,
+    }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(json({ session_token: 'update-session' }))
+      .mockResolvedValueOnce(json(update))
+      .mockResolvedValueOnce(json({ ...update, status: 'ready', available_version: '0.2.0' }))
+      .mockResolvedValueOnce(json({ status: 'restart_scheduled' }))
+    const api = new ApiClient(fetcher)
+    const controller = new AbortController()
+    await api.session()
+
+    await api.checkUpdate(controller.signal)
+    await api.downloadUpdate(controller.signal)
+    await api.installUpdate(controller.signal)
+
+    for (const call of fetcher.mock.calls.slice(1)) {
+      expect(call[1]).toEqual(expect.objectContaining({
+        method: 'POST', body: '{}', signal: controller.signal,
+        headers: expect.objectContaining({ 'X-Restream-Session': 'update-session' }),
+      }))
+    }
+  })
+
+  it.each([
+    { status: 'private', current_version: '0.1.0', available_version: null, release_url: null, last_checked_at: null, error_code: null, error_message: null },
+    { status: 'idle', current_version: 1, available_version: null, release_url: null, last_checked_at: null, error_code: null, error_message: null },
+    { status: 'idle', current_version: '0.1.0', available_version: null, release_url: null, last_checked_at: 1, error_code: null, error_message: null },
+    { status: 'idle', current_version: '0.1.0', available_version: null, release_url: null, last_checked_at: null, error_code: null, error_message: null, local_path: 'C:\\private\\update.exe' },
+  ])('拒绝字段或类型不匹配的更新响应 %#', async (payload) => {
+    const api = new ApiClient(vi.fn().mockResolvedValue(json(payload)))
+    await expect(api.getUpdate()).rejects.toMatchObject({ code: 'response_invalid', message: '服务器响应无效' })
+  })
+
   it.each([
     ['session', (api: ApiClient) => api.session(), { session_token: { secret: 'private-session' } }],
     ['getSource', (api: ApiClient) => api.getSource(), { configured: 'yes', room_identity: 'private-source', preferred_quality: null }],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from ipaddress import ip_address
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -172,3 +173,28 @@ class StatusResponse(StrictModel):
     source_state: str
     source_failure: str | None
     outputs: list[StatusOutput]
+
+
+UpdateStatusName = Literal[
+    "idle",
+    "checking",
+    "current",
+    "available",
+    "downloading",
+    "ready",
+    "failed",
+]
+
+
+class UpdateResponse(StrictModel):
+    status: UpdateStatusName
+    current_version: str
+    available_version: str | None
+    release_url: str | None
+    last_checked_at: datetime | None
+    error_code: str | None
+    error_message: str | None
+
+
+class InstallResponse(StrictModel):
+    status: Literal["restart_scheduled"]

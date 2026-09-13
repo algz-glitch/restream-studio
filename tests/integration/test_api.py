@@ -1014,3 +1014,110 @@ def test_runtime_persists_stopped_error_when_desired_but_no_destination_enabled(
     assert snapshot.source_state is SourceState.ERROR
     with pytest.raises(runtime_module.RuntimeBuildError):
         finish(manager.start())
+
+
+def test_update_api_is_strict_protected_and_secret_safe(harness: Harness) -> None:
+    from restream_studio.update.service import UpdateOperationError, UpdateSnapshot, UpdateStatus
+
+    class FakeUpdateService:
+        def __init__(self) -> None:
+            self.value = UpdateSnapshot(UpdateStatus.IDLE, "0.1.0")
+            self.calls: list[str] = []
+
+        def snapshot(self) -> UpdateSnapshot:
+            return self.value
+
+        async def check(self) -> UpdateSnapshot:
+            self.calls.append("check")
+            self.value = UpdateSnapshot(UpdateStatus.CURRENT, "0.1.0")
+            return self.value
+
+        async def download(self) -> UpdateSnapshot:
+            self.calls.append("download")
+            raise UpdateOperationError("download_in_progress", "Download already in progress")
+
+        async def install(self, *, current_pid: int) -> None:
+            assert current_pid > 0
+            self.calls.append("install")
+
+        def start_background(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    updates = FakeUpdateService()
+    application = create_app(
+        lambda: ApiDependencies(harness.db, harness.controller, update_service=updates)
+    )
+    with TestClient(application, headers={"host": "localhost"}) as update_client:
+        token = application.state.session_token
+        authorized = {
+            "origin": "http://localhost",
+            "x-restream-session": token,
+        }
+        assert update_client.get("/api/update").json() == {
+            "status": "idle",
+            "current_version": "0.1.0",
+            "available_version": None,
+            "release_url": None,
+            "last_checked_at": None,
+            "error_code": None,
+            "error_message": None,
+        }
+        assert update_client.post("/api/update/check", json={}).status_code == 403
+        checked = update_client.post("/api/update/check", json={}, headers=authorized)
+        assert checked.status_code == 200 and checked.json()["status"] == "current"
+        extra = update_client.post(
+            "/api/update/check", json={"unexpected": True}, headers=authorized
+        )
+        assert extra.status_code == 422
+        duplicate = update_client.post("/api/update/download", json={}, headers=authorized)
+        assert duplicate.status_code == 409
+        assert duplicate.json()["error"]["code"] == "download_in_progress"
+        assert "path" not in duplicate.text.casefold()
+
+
+def test_update_install_requires_stopped_relay_before_service_call(harness: Harness) -> None:
+    from restream_studio.update.service import UpdateSnapshot, UpdateStatus
+
+    class FakeUpdateService:
+        def __init__(self) -> None:
+            self.installs = 0
+
+        def snapshot(self) -> UpdateSnapshot:
+            return UpdateSnapshot(UpdateStatus.READY, "0.1.0", available_version="0.2.0")
+
+        async def check(self) -> UpdateSnapshot:
+            return self.snapshot()
+
+        async def download(self) -> UpdateSnapshot:
+            return self.snapshot()
+
+        async def install(self, *, current_pid: int) -> None:
+            del current_pid
+            self.installs += 1
+
+        def start_background(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    harness.controller.started = 1
+    updates = FakeUpdateService()
+    application = create_app(
+        lambda: ApiDependencies(harness.db, harness.controller, update_service=updates)
+    )
+    with TestClient(application, headers={"host": "localhost"}) as update_client:
+        response = update_client.post(
+            "/api/update/install",
+            json={},
+            headers={
+                "origin": "http://localhost",
+                "x-restream-session": application.state.session_token,
+            },
+        )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "relay_must_be_stopped"
+    assert updates.installs == 0

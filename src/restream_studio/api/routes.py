@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ from restream_studio.persistence.database import (
     SourceConfig,
 )
 from restream_studio.security.redaction import redact
+from restream_studio.update.service import UpdateOperationError, UpdateSnapshot
 
 from .schemas import (
     ControlResponse,
@@ -30,6 +32,7 @@ from .schemas import (
     EmptyRequest,
     EventResponse,
     EventsResponse,
+    InstallResponse,
     ReconnectResponse,
     SessionResponse,
     SourceResponse,
@@ -38,6 +41,7 @@ from .schemas import (
     StatusOutput,
     StatusResponse,
     TestResponse,
+    UpdateResponse,
 )
 
 _KINDS = {
@@ -110,6 +114,15 @@ class ControllerPort(Protocol):
     def clear(self) -> None: ...
 
 
+class UpdateServicePort(Protocol):
+    def snapshot(self) -> UpdateSnapshot: ...
+    async def check(self) -> UpdateSnapshot: ...
+    async def download(self) -> UpdateSnapshot: ...
+    async def install(self, *, current_pid: int) -> None: ...
+    def start_background(self) -> None: ...
+    async def shutdown(self) -> None: ...
+
+
 DestinationAction = Callable[[DestinationKind], Awaitable[None]]
 DestinationTest = Callable[[DestinationKind, str, str], Awaitable[bool]]
 
@@ -132,6 +145,7 @@ class ApiDependencies:
     test_destination: DestinationTest = _unavailable_test
     local_test_mode: bool = False
     assets_dir: Path | None = None
+    update_service: UpdateServicePort | None = None
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -231,6 +245,60 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
         if not token:
             raise ApiError(503, "session_unavailable", "Session is not initialized")
         return SessionResponse(session_token=token)
+
+    def update_service() -> UpdateServicePort:
+        if deps.update_service is None:
+            raise ApiError(503, "update_unavailable", "Update service is unavailable")
+        return deps.update_service
+
+    def update_response(value: UpdateSnapshot) -> UpdateResponse:
+        return UpdateResponse(
+            status=value.status.value,
+            current_version=value.current_version,
+            available_version=value.available_version,
+            release_url=value.release_url,
+            last_checked_at=value.last_checked_at,
+            error_code=value.error_code,
+            error_message=value.error_message,
+        )
+
+    @router.get("/api/update", response_model=UpdateResponse)
+    async def get_update() -> UpdateResponse:
+        return update_response(update_service().snapshot())
+
+    @router.post("/api/update/check", response_model=UpdateResponse)
+    async def check_update(value: EmptyRequest) -> UpdateResponse:
+        del value
+        try:
+            state = await update_service().check()
+        except UpdateOperationError as error:
+            raise ApiError(409, error.code, error.message) from error
+        return update_response(state)
+
+    @router.post("/api/update/download", response_model=UpdateResponse)
+    async def download_update(value: EmptyRequest) -> UpdateResponse:
+        del value
+        try:
+            state = await update_service().download()
+        except UpdateOperationError as error:
+            raise ApiError(409, error.code, error.message) from error
+        return update_response(state)
+
+    @router.post("/api/update/install", response_model=InstallResponse)
+    async def install_update(value: EmptyRequest) -> InstallResponse:
+        del value
+        snapshot = await deps.controller.snapshot()
+        if snapshot.desired_running:
+            raise ApiError(
+                409,
+                "relay_must_be_stopped",
+                "Stop all outputs before installing",
+            )
+        try:
+            await update_service().install(current_pid=os.getpid())
+        except UpdateOperationError as error:
+            raise ApiError(409, error.code, error.message) from error
+        return InstallResponse(status="restart_scheduled")
 
     @router.get("/api/source", response_model=SourceResponse)
     async def get_source(response: Response) -> SourceResponse:

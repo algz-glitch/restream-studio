@@ -8,6 +8,7 @@ from .contracts import (
     UpdateManifest,
     Version,
 )
+from .service import UpdateOperationError, UpdateService, UpdateSnapshot, UpdateStatus
 
 __all__ = [
     "DEFAULT_MANIFEST_URL",
@@ -19,5 +20,9 @@ __all__ = [
     "UpdateClientError",
     "UpdateErrorCode",
     "UpdateManifest",
+    "UpdateOperationError",
+    "UpdateService",
+    "UpdateSnapshot",
+    "UpdateStatus",
     "Version",
 ]

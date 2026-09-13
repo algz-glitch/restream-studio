@@ -22,6 +22,7 @@ from restream_studio.api.routes import ApiDependencies, ApiError, install_routes
 from restream_studio.config import AppPaths
 from restream_studio.persistence.database import Database
 from restream_studio.runtime import RuntimeManager
+from restream_studio.update.service import UpdateService
 
 
 def _bundled_path(relative: str) -> Path | None:
@@ -71,12 +72,14 @@ def _default_dependencies() -> ApiDependencies:
         ffmpeg_executable=_tool_executable("ffmpeg", "FFMPEG_PATH"),
         ffprobe_executable=_tool_executable("ffprobe", "FFPROBE_PATH"),
     )
+    update_service = UpdateService(paths.data_dir / "update")
     return ApiDependencies(
         database,
         runtime,
         reconnect_destination=runtime.reconnect_destination,
         test_destination=runtime.test_destination,
         assets_dir=_frontend_assets_dir(),
+        update_service=update_service,
     )
 
 
@@ -172,9 +175,16 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
         try:
             deps.database.open()
             await deps.controller.initialize()
+            if deps.update_service is not None:
+                deps.update_service.start_background()
             yield
         finally:
             cleanup_failed = False
+            if deps.update_service is not None:
+                try:
+                    await deps.update_service.shutdown()
+                except BaseException:  # noqa: BLE001 - every cleanup step must still run
+                    cleanup_failed = True
             try:
                 await deps.controller.shutdown()
             except BaseException:  # noqa: BLE001 - every cleanup step must still run

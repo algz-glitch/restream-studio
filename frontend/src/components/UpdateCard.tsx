@@ -51,8 +51,15 @@ export function UpdateCard({ update, desiredRunning, sessionReady, api, onChange
   const controller = useRef<AbortController | null>(null)
   const actionLock = useRef(false)
   const installLock = useRef(false)
+  const mounted = useRef(true)
 
-  useEffect(() => () => controller.current?.abort(), [])
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      controller.current?.abort()
+    }
+  }, [])
 
   async function act(action: UpdateAction) {
     if (!sessionReady || actionLock.current || (action === 'install' && (desiredRunning || installLock.current))) return
@@ -64,21 +71,28 @@ export function UpdateCard({ update, desiredRunning, sessionReady, api, onChange
     setActionError('')
     setInstallNotice('')
     try {
-      if (action === 'check') onChange(await api.checkUpdate(nextController.signal))
-      else if (action === 'download') onChange(await api.downloadUpdate(nextController.signal))
-      else {
+      if (action === 'check') {
+        const value = await api.checkUpdate(nextController.signal)
+        if (mounted.current && !nextController.signal.aborted) onChange(value)
+      } else if (action === 'download') {
+        const value = await api.downloadUpdate(nextController.signal)
+        if (mounted.current && !nextController.signal.aborted) onChange(value)
+      } else {
         await api.installUpdate(nextController.signal)
+        if (!mounted.current || nextController.signal.aborted) return
         installLock.current = true
         setInstallScheduled(true)
         setInstallNotice('已提交安装，软件将自动重启。')
       }
     } catch (cause) {
-      if (!isAbortError(cause)) setActionError('更新操作失败，请稍后重试。')
+      if (mounted.current && !isAbortError(cause)) setActionError('更新操作失败，请稍后重试。')
     } finally {
       if (controller.current === nextController) controller.current = null
       actionLock.current = false
-      setBusy(null)
-      onActionSettled?.()
+      if (mounted.current) {
+        setBusy(null)
+        onActionSettled?.()
+      }
     }
   }
 

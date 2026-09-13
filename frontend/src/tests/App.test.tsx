@@ -137,6 +137,36 @@ describe('播控台', () => {
     expect(screen.queryByRole('button', { name: '下载更新' })).not.toBeInTheDocument()
   })
 
+  it('mutation 进行中卸载后不再 setState 或发起后续更新 GET', async () => {
+    let updateReads = 0
+    let mutationStarted = false
+    const available = { ...updateBase, status: 'available' as const, available_version: '0.2.0' }
+    const baseFetch = installApi({ '/api/update': available })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/update') {
+        updateReads += 1
+        return json(available)
+      }
+      if (path === '/api/update/download' && init?.method === 'POST') {
+        mutationStarted = true
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+        })
+      }
+      return baseFetch(input, init)
+    }))
+    const view = render(<App />)
+    const download = await screen.findByRole('button', { name: '下载更新' })
+
+    fireEvent.click(download)
+    expect(mutationStarted).toBe(true)
+    view.unmount()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    expect(updateReads).toBe(1)
+  })
+
   it.each([
     ['idle', '检查更新'],
     ['available', '下载更新'],

@@ -22,6 +22,7 @@ type UpdateAction = 'check' | 'download' | 'install'
 interface UpdateCardProps {
   update: UpdateResponse
   desiredRunning: boolean
+  sessionReady: boolean
   api: ApiClient
   onChange: (value: UpdateResponse) => void
   loadError?: string
@@ -41,7 +42,7 @@ function approvedReleaseUrl(value: string | null): string | null {
   }
 }
 
-export function UpdateCard({ update, desiredRunning, api, onChange, loadError = '', loading = false }: UpdateCardProps) {
+export function UpdateCard({ update, desiredRunning, sessionReady, api, onChange, loadError = '', loading = false }: UpdateCardProps) {
   const [busy, setBusy] = useState<UpdateAction | null>(null)
   const [actionError, setActionError] = useState('')
   const [installNotice, setInstallNotice] = useState('')
@@ -53,7 +54,7 @@ export function UpdateCard({ update, desiredRunning, api, onChange, loadError = 
   useEffect(() => () => controller.current?.abort(), [])
 
   async function act(action: UpdateAction) {
-    if (actionLock.current || (action === 'install' && (desiredRunning || installLock.current))) return
+    if (!sessionReady || actionLock.current || (action === 'install' && (desiredRunning || installLock.current))) return
     actionLock.current = true
     controller.current?.abort()
     const nextController = new AbortController()
@@ -94,13 +95,14 @@ export function UpdateCard({ update, desiredRunning, api, onChange, loadError = 
       <div className="update-version"><span>当前版本 {update.current_version}</span>{update.available_version && <strong>目标版本 {update.available_version}</strong>}</div>
       <p className={`feedback${actionError || loadError || update.status === 'failed' ? ' feedback--error' : ''}`} aria-live="polite">{diagnostic}</p>
       {releaseUrl && <a className="release-link" href={releaseUrl} target="_blank" rel="noopener noreferrer">查看 GitHub 发布说明</a>}
+      {!sessionReady && <p className="update-session-hint" id="update-session-hint">本地安全会话尚未就绪，更新操作暂不可用。</p>}
       {canInstall && desiredRunning && <p className="update-stop-hint" id="update-stop-hint">请先停止全部输出，再安装更新。</p>}
       {installNotice && <p className="feedback" aria-live="polite">{installNotice}</p>}
     </div>
     <div className="update-card__action">
-      {canCheck && <button className="button button--primary" disabled={busy !== null || loading} onClick={() => void act('check')}>{busy === 'check' ? '正在检查' : '检查更新'}</button>}
-      {canDownload && <button className="button button--primary" disabled={busy !== null || loading} onClick={() => void act('download')}>{busy === 'download' ? '正在下载' : '下载更新'}</button>}
-      {canInstall && <button className="button button--primary" disabled={busy !== null || desiredRunning || loading || installScheduled} aria-describedby={desiredRunning ? 'update-stop-hint' : undefined} onClick={() => void act('install')}>{installScheduled ? '重启已安排' : busy === 'install' ? '正在安装' : '安装并重启'}</button>}
+      {canCheck && <button className="button button--primary" disabled={!sessionReady || busy !== null || loading} aria-describedby={!sessionReady ? 'update-session-hint' : undefined} onClick={() => void act('check')}>{busy === 'check' ? '正在检查' : '检查更新'}</button>}
+      {canDownload && <button className="button button--primary" disabled={!sessionReady || busy !== null || loading} aria-describedby={!sessionReady ? 'update-session-hint' : undefined} onClick={() => void act('download')}>{busy === 'download' ? '正在下载' : '下载更新'}</button>}
+      {canInstall && <button className="button button--primary" disabled={!sessionReady || busy !== null || desiredRunning || loading || installScheduled} aria-describedby={!sessionReady ? 'update-session-hint' : desiredRunning ? 'update-stop-hint' : undefined} onClick={() => void act('install')}>{installScheduled ? '重启已安排' : busy === 'install' ? '正在安装' : '安装并重启'}</button>}
       {(update.status === 'checking' || update.status === 'downloading') && <button className="button button--primary" disabled>{update.status === 'checking' ? '正在检查' : '正在下载'}</button>}
     </div>
   </section>

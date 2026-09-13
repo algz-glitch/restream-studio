@@ -366,7 +366,7 @@ export default function App({ api = defaultApi }: { api?: ApiClient }) {
         {statusLoading && !status ? <PanelSkeleton label="正在加载状态" /> : statusError ? <LoadError text={statusError} retryLabel="重试加载状态" onRetry={() => void loadStatus()} /> : <Monitor status={status ?? blankStatus} />}
         {logsLoading && events.length === 0 && nextCursor === 0 && !logsError ? <PanelSkeleton label="正在加载日志" /> : <Logs items={events} loading={logsLoading} error={logsError} hasMore={nextCursor !== null} onMore={() => void loadEvents(nextCursor ?? 0, true)} onRetry={() => void loadEvents(0)} />}
       </div>
-      <UpdateCard update={update ?? blankUpdate} desiredRunning={status?.desired_running ?? false} api={api} onChange={(value) => { setUpdate(value); setUpdateError('') }} loadError={updateError} loading={updateLoading} />
+      <UpdateCard update={update ?? blankUpdate} desiredRunning={status?.desired_running ?? false} sessionReady={sessionReady} api={api} onChange={(value) => { setUpdate(value); setUpdateError('') }} loadError={updateError} loading={updateLoading} />
       </main>
     </div>
     {confirmStop && <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConfirmStop(false) }}><div ref={dialog} role="dialog" aria-modal="true" aria-labelledby="stop-title" aria-describedby="stop-description" className="dialog"><h2 id="stop-title">停止全部输出？</h2><p id="stop-description">当前有活跃输出。确认后两路发布都会停止。</p><div className="button-row"><button className="button" onClick={() => setConfirmStop(false)}>继续监控</button><button ref={confirmButton} className="button button--danger" onClick={() => void control('stop')}>确认停止</button></div></div></div>}

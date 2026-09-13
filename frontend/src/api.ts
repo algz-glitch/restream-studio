@@ -168,6 +168,11 @@ export class ApiClient {
     return this.request(path, validator, { method, headers, body: JSON.stringify(body), signal }, resource)
   }
 
+  private updateMutation<T>(path: string, validator: Validator<T>, signal?: AbortSignal): Promise<T> {
+    if (!this.token) return Promise.reject(new ApiError(0, 'session_required', '安全会话尚未初始化', {}, ''))
+    return this.mutation(path, 'POST', {}, validator, signal)
+  }
+
   async session(signal?: AbortSignal): Promise<SessionResponse> {
     const value = await this.request('/api/session', isSessionResponse, { cache: 'no-store', signal })
     this.token = value.session_token
@@ -187,9 +192,9 @@ export class ApiClient {
   saveDestination(kind: DestinationKind, value: DestinationUpdate, signal?: AbortSignal): Promise<DestinationResponse> { return this.mutation(`/api/destinations/${kind}`, 'PUT', value, destinationValidator(kind), signal, `destination:${kind}`) }
   getStatus(signal?: AbortSignal): Promise<StatusResponse> { return this.request('/api/status', isStatusResponse, { signal }) }
   getUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.request('/api/update', isUpdateResponse, { signal }) }
-  checkUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.mutation('/api/update/check', 'POST', {}, isUpdateResponse, signal) }
-  downloadUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.mutation('/api/update/download', 'POST', {}, isUpdateResponse, signal) }
-  installUpdate(signal?: AbortSignal): Promise<InstallResponse> { return this.mutation('/api/update/install', 'POST', {}, isInstallResponse, signal) }
+  checkUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.updateMutation('/api/update/check', isUpdateResponse, signal) }
+  downloadUpdate(signal?: AbortSignal): Promise<UpdateResponse> { return this.updateMutation('/api/update/download', isUpdateResponse, signal) }
+  installUpdate(signal?: AbortSignal): Promise<InstallResponse> { return this.updateMutation('/api/update/install', isInstallResponse, signal) }
   getEvents(cursor = 0, signal?: AbortSignal): Promise<EventsResponse> { return this.request(`/api/events?limit=50&cursor=${cursor}`, isEventsResponse, { signal }) }
   start(signal?: AbortSignal): Promise<ControlResponse> { return this.mutation('/api/control/start', 'POST', { local_test: false }, controlValidator('started'), signal) }
   stop(signal?: AbortSignal): Promise<ControlResponse> { return this.mutation('/api/control/stop', 'POST', {}, controlValidator('stopped'), signal) }

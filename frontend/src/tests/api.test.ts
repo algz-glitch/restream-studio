@@ -74,6 +74,18 @@ describe('ApiClient', () => {
   })
 
   it.each([
+    ['checkUpdate', (api: ApiClient) => api.checkUpdate()],
+    ['downloadUpdate', (api: ApiClient) => api.downloadUpdate()],
+    ['installUpdate', (api: ApiClient) => api.installUpdate()],
+  ] as const)('%s 在会话初始化前拒绝请求且不发送空会话头', async (_name, invoke) => {
+    const fetcher = vi.fn()
+    const api = new ApiClient(fetcher)
+
+    await expect(invoke(api)).rejects.toMatchObject({ code: 'session_required', message: '安全会话尚未初始化' })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each([
     { status: 'private', current_version: '0.1.0', available_version: null, release_url: null, last_checked_at: null, error_code: null, error_message: null },
     { status: 'idle', current_version: 1, available_version: null, release_url: null, last_checked_at: null, error_code: null, error_message: null },
     { status: 'idle', current_version: '0.1.0', available_version: null, release_url: null, last_checked_at: 1, error_code: null, error_message: null },

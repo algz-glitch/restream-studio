@@ -326,7 +326,7 @@ input:focus-visible,select:focus-visible,.button:focus-visible {
   color:var(--info);
   overflow-wrap:anywhere
 }
-.update-stop-hint {
+.update-stop-hint,.update-session-hint {
   margin:10px 0 0;
   color:var(--warning);
   font-size:13px

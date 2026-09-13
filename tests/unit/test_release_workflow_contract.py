@@ -380,7 +380,7 @@ def test_manifest_writer_verify_existing_detects_asset_drift(tmp_path: Path) -> 
 
 
 @pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell unavailable")
-def test_installer_builder_derives_a_0_1_1_fixture_from_three_sources(tmp_path: Path) -> None:
+def test_installer_builder_derives_release_and_next_patch_fixture_paths(tmp_path: Path) -> None:
     (tmp_path / "packaging").mkdir()
     (tmp_path / "packaging" / "restream-studio.iss").write_text(
         '#define MyAppVersion "0.1.1"\n', encoding="utf-8"
@@ -410,6 +410,8 @@ def test_installer_builder_derives_a_0_1_1_fixture_from_three_sources(tmp_path: 
     assert result.returncode == 0, result.stderr
     assert "RELEASE_VERSION=0.1.1" in result.stdout
     assert str(tmp_path / "dist" / "installer" / "RestreamStudio-Setup-0.1.1.exe") in result.stdout
+    assert "SMOKE_UPGRADE_VERSION=0.1.2" in result.stdout
+    assert str(tmp_path / "dist" / "installer" / "RestreamStudio-Setup-0.1.2.exe") in result.stdout
 
 
 def test_release_publish_is_clean_idempotent_and_reverifies_remote_assets() -> None:

@@ -4,6 +4,7 @@ param([Parameter(Mandatory)][string]$Installer,
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$LifecycleProcessStillRunning = $false
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -12,11 +13,32 @@ function Test-IsAdministrator {
 }
 
 function Stop-KnownProcessTree {
-    param([int]$ProcessId)
+    param([Parameter(Mandatory)][Diagnostics.Process]$Target)
+    $script:LifecycleProcessStillRunning = $true
     $killer = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
-        -ArgumentList @('/PID', [string]$ProcessId, '/T', '/F') -PassThru -WindowStyle Hidden
-    try { if (-not $killer.WaitForExit(15000)) { Stop-Process -Id $killer.Id -Force } }
+        -ArgumentList @('/PID', [string]$Target.Id, '/T', '/F') -PassThru -WindowStyle Hidden
+    $taskkillFailure = ''
+    try {
+        if (-not $killer.WaitForExit(15000)) {
+            Stop-Process -Id $killer.Id -Force
+            if (-not $killer.WaitForExit(5000)) {
+                $taskkillFailure = 'taskkill did not exit after its bounded timeout'
+            }
+        }
+        $killer.Refresh()
+        if ($killer.HasExited -and $killer.ExitCode -ne 0) {
+            $taskkillFailure = "taskkill exited with code $($killer.ExitCode)"
+        }
+    }
     finally { $killer.Dispose() }
+
+    $targetWaitCompleted = $Target.WaitForExit(15000)
+    $Target.Refresh()
+    if (-not $targetWaitCompleted -or -not $Target.HasExited) {
+        throw 'CRITICAL: installer or uninstaller process tree may still be running; no restore or delete is permitted; manual intervention required'
+    }
+    $script:LifecycleProcessStillRunning = $false
+    if ($taskkillFailure) { throw $taskkillFailure }
 }
 
 function Invoke-BoundedProcess {
@@ -27,7 +49,7 @@ function Invoke-BoundedProcess {
     $child = Start-Process @p
     try {
         if (-not $child.WaitForExit($TimeoutSeconds * 1000)) {
-            Stop-KnownProcessTree $child.Id
+            Stop-KnownProcessTree -Target $child
             throw $TimeoutMessage
         }
         if (-not $AllowNonZero -and $child.ExitCode -ne 0) {
@@ -77,6 +99,27 @@ $DesktopBackupSucceeded = $false
 $StartMenuBackupSucceeded = $false
 $DesktopBackupHash = ''
 $StartMenuBackupHash = ''
+
+function Get-NextPatchVersion {
+    param([Parameter(Mandatory)][string]$Version)
+    if ($Version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw 'lifecycle version must be canonical SemVer'
+    }
+    $nextPatch = [Numerics.BigInteger]::Parse($Matches[3]) + 1
+    return "$($Matches[1]).$($Matches[2]).$nextPatch"
+}
+
+$CurrentVersion = [string](
+    [IO.File]::ReadAllText((Join-Path $Root 'package.json')) | ConvertFrom-Json
+).version
+$UpgradeVersionPath = Join-Path $UpgradeDistribution '_internal\restream_studio\version.txt'
+if (-not (Test-Path -LiteralPath $UpgradeVersionPath -PathType Leaf)) {
+    throw 'smoke upgrade payload version metadata is missing'
+}
+$UpgradeVersion = [IO.File]::ReadAllText($UpgradeVersionPath).Trim()
+if ($UpgradeVersion -cne (Get-NextPatchVersion $CurrentVersion)) {
+    throw 'smoke upgrade payload is not the next patch version'
+}
 
 function Test-PathInside {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Parent)
@@ -457,9 +500,9 @@ try {
     Invoke-Install
     Assert-InstalledFiles
     Assert-Shortcuts
-    Assert-UninstallRegistration '0.1.0' | Out-Null
+    Assert-UninstallRegistration $CurrentVersion | Out-Null
     Assert-FirewallRule
-    Start-And-TestInstalledApplication '0.1.0'
+    Start-And-TestInstalledApplication $CurrentVersion
     Stop-InstalledApplication
 
     New-Item -ItemType Directory -Path $UserDataDir -Force | Out-Null
@@ -477,7 +520,7 @@ try {
     Invoke-Install -Setup $UpgradeInstaller
     Assert-InstalledFiles $UpgradeDistribution
     Assert-Shortcuts
-    Assert-UninstallRegistration '0.1.1' | Out-Null
+    Assert-UninstallRegistration $UpgradeVersion | Out-Null
     Assert-FirewallRule
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
         (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash -cne $markerHash) {
@@ -486,7 +529,7 @@ try {
     $upgradedProgramHash=(Get-FileHash $program -Algorithm SHA256).Hash
     if($upgradedProgramHash -cne $expectedProgramHash -or $upgradedProgramHash -ceq $tamperedProgramHash){throw 'program file was not replaced by upgrade'}
 
-    Start-And-TestInstalledApplication '0.1.1'
+    Start-And-TestInstalledApplication $UpgradeVersion
     Invoke-Uninstall
     $Process.WaitForExit(15000) | Out-Null
     if (-not (Wait-LocalPortReleased -PortNumber $Port)) { throw 'uninstall did not release the API port' }
@@ -503,7 +546,7 @@ try {
 
     Invoke-Install
     Assert-InstalledFiles
-    Assert-UninstallRegistration '0.1.0' | Out-Null
+    Assert-UninstallRegistration $CurrentVersion | Out-Null
     Invoke-Uninstall -DeleteUserData
     if ((Test-Path -LiteralPath $UserDataDir) -or (Test-Path -LiteralPath $InstallDir) -or
         $null -ne (Get-UninstallEntry) -or
@@ -514,6 +557,9 @@ try {
     Write-Output 'INSTALLER_LIFECYCLE_RESULT=PASS'
 }
 finally {
+    if ($LifecycleProcessStillRunning) {
+        throw 'CRITICAL: installer or uninstaller process tree may still be running; destructive lifecycle cleanup was skipped; manual intervention required'
+    }
     $cleanupErrors = [Collections.Generic.List[string]]::new()
     try { Stop-InstalledApplication } catch { $cleanupErrors.Add($_.Exception.Message) }
     try {
@@ -529,10 +575,16 @@ finally {
                 ) -TimeoutSeconds 300 -TimeoutMessage 'cleanup uninstaller timed out' | Out-Null
             }
             catch { $cleanupErrors.Add($_.Exception.Message) }
+            if ($LifecycleProcessStillRunning) {
+                throw 'CRITICAL: cleanup uninstaller may still be running; registry, firewall, shortcut, and tree cleanup are forbidden; manual intervention required'
+            }
         }
         if ($null -ne (Get-UninstallEntry)) { Remove-IsolatedUninstallRegistration }
       }
     } catch { $cleanupErrors.Add("registry cleanup failed: $($_.Exception.Message)") }
+    if ($LifecycleProcessStillRunning) {
+        throw 'CRITICAL: cleanup uninstaller may still be running; destructive lifecycle cleanup was stopped; manual intervention required'
+    }
     if ($SnapshotCaptured -and $FirewallMutationPossible) {
         try { Remove-IsolatedFirewallRules } catch { $cleanupErrors.Add("firewall cleanup failed: $($_.Exception.Message)") }
     }

@@ -22,10 +22,22 @@ $StaticIndex = Join-Path $Root 'src\restream_studio\static\index.html'
 $Spec = Join-Path $Root 'packaging\restream-studio.spec'
 $LockFile = Join-Path $Root 'package-lock.json'
 $TreeManifestTool = Join-Path $Root 'scripts\write-tree-manifest.py'
-$ProjectVersion = ([IO.File]::ReadAllText((Join-Path $Root 'package.json')) | ConvertFrom-Json).version
+$SourceVersion = ([IO.File]::ReadAllText((Join-Path $Root 'package.json')) | ConvertFrom-Json).version
+
+function Get-NextPatchVersion {
+    param([Parameter(Mandatory)][string]$Version)
+    if ($Version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw 'source version must be canonical SemVer'
+    }
+    $nextPatch = [Numerics.BigInteger]::Parse($Matches[3]) + 1
+    return "$($Matches[1]).$($Matches[2]).$nextPatch"
+}
+
+$ProjectVersion = $SourceVersion
 if ($VersionOverride) {
-    if (-not $SmokeBuild -or $VersionOverride -cne '0.1.1') {
-        throw 'VersionOverride is restricted to the smoke-only 0.1.1 payload build'
+    $expectedOverride = Get-NextPatchVersion $SourceVersion
+    if (-not $SmokeBuild -or $VersionOverride -cne $expectedOverride) {
+        throw 'VersionOverride must equal the smoke-only next patch version'
     }
     $ProjectVersion = $VersionOverride
 }

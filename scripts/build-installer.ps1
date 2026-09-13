@@ -61,9 +61,18 @@ function Get-ReleaseVersion {
     return $version
 }
 
+function Get-NextPatchVersion {
+    param([Parameter(Mandatory)][string]$Version)
+    if ($Version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw 'release version must be canonical SemVer before smoke upgrade calculation'
+    }
+    $nextPatch = [Numerics.BigInteger]::Parse($Matches[3]) + 1
+    return "$($Matches[1]).$($Matches[2]).$nextPatch"
+}
+
 $Version = Get-ReleaseVersion -RootPath $Root
 $Installer = Join-Path $InstallerDirectory "RestreamStudio-Setup-$Version.exe"
-$SmokeUpgradeVersion = '0.1.1'
+$SmokeUpgradeVersion = Get-NextPatchVersion $Version
 $SmokeUpgradeInstaller = Join-Path $InstallerDirectory `
     "RestreamStudio-Setup-$SmokeUpgradeVersion.exe"
 $SmokeDistributionRoot = Join-Path $Root 'dist\smoke-upgrade'
@@ -71,6 +80,8 @@ $SmokeDistribution = Join-Path $SmokeDistributionRoot 'RestreamStudio'
 if ($ResolveVersionOnly) {
     Write-Output "RELEASE_VERSION=$Version"
     Write-Output "INSTALLER_PATH=$Installer"
+    Write-Output "SMOKE_UPGRADE_VERSION=$SmokeUpgradeVersion"
+    Write-Output "SMOKE_UPGRADE_INSTALLER_PATH=$SmokeUpgradeInstaller"
     exit 0
 }
 
@@ -271,9 +282,6 @@ $hash = (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInv
 Write-Output "INSTALLER_PATH=$Installer"
 Write-Output "SHA256=$hash"
 if ($BuildSmokeFixtures) {
-    if ($Version -cne '0.1.0') {
-        throw 'smoke upgrade fixture is defined only for the 0.1.0 release baseline'
-    }
     & $PackageScript -OutputDirectory $SmokeDistributionRoot -SmokeBuild `
         -VersionOverride $SmokeUpgradeVersion
     if ($LASTEXITCODE -ne 0) { throw 'smoke payload package build failed' }
@@ -283,7 +291,7 @@ if ($BuildSmokeFixtures) {
         (Get-FileHash $smokeExe -Algorithm SHA256).Hash) {
         throw 'smoke upgrade executable must differ from the release executable'
     }
-    Invoke-External $iscc @('/DMyAppVersion=0.1.1', '/DSmokeTestBuild=1',
+    Invoke-External $iscc @("/DMyAppVersion=$SmokeUpgradeVersion", '/DSmokeTestBuild=1',
         "/DMyDistributionDir=$SmokeDistribution", $InstallerScript)
     if (-not (Test-Path -LiteralPath $SmokeUpgradeInstaller -PathType Leaf)) {
         throw "smoke upgrade installer is missing: $SmokeUpgradeInstaller"

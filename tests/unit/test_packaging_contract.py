@@ -165,6 +165,15 @@ def test_installer_processes_are_bounded_and_smoke_requires_administrator() -> N
     assert "Invoke-BoundedProcess" in smoke
     assert "WaitForExit($TimeoutSeconds * 1000)" in smoke
     assert "taskkill.exe" in smoke
+    assert "$killer.ExitCode" in smoke
+    assert "$LifecycleProcessStillRunning" in smoke
+    assert smoke.count("if ($LifecycleProcessStillRunning)") >= 3
+    assert "$Target.Refresh()" in smoke
+    assert "CRITICAL: installer or uninstaller process tree may still be running" in smoke
+    cleanup = smoke[smoke.rindex("\nfinally {\n") :]
+    assert cleanup.index("$LifecycleProcessStillRunning") < cleanup.index(
+        "Remove-IsolatedUninstallRegistration"
+    )
     assert "installer lifecycle smoke requires administrator PowerShell" in smoke
     assert "RunAs" not in smoke
     assert "ElevatedChild" not in smoke
@@ -174,6 +183,8 @@ def test_installer_processes_are_bounded_and_smoke_requires_administrator() -> N
     assert "-EncodedCommand" in broker
     assert "-Wait -PassThru" in broker
     assert "taskkill" not in broker
+    assert "Test-IsAdministrator" in broker
+    assert "if (Test-IsAdministrator)" in broker
 
 
 def test_smoke_build_uses_real_upgrade_version_and_failure_injection_fixture() -> None:
@@ -189,21 +200,26 @@ def test_smoke_build_uses_real_upgrade_version_and_failure_injection_fixture() -
     assert "cancel" in installer
     assert "command" in installer
     assert "[switch]$BuildSmokeFixtures" in build
-    assert "/DMyAppVersion=0.1.1" in build
+    assert "function Get-NextPatchVersion" in build
+    assert "$SmokeUpgradeVersion = Get-NextPatchVersion" in build
+    assert '"/DMyAppVersion=$SmokeUpgradeVersion"' in build
+    assert "/DMyAppVersion=0.1.1" not in build
     assert "/DSmokeTestBuild=1" in build
     assert "SMOKE_UPGRADE_INSTALLER_PATH=" in build
     assert "UpgradeInstaller" in smoke
     assert "DisplayVersion" in smoke
-    assert "0.1.0" in smoke and "0.1.1" in smoke
+    assert "Get-NextPatchVersion" in smoke
+    assert "Assert-UninstallRegistration $CurrentVersion" in smoke
+    assert "Assert-UninstallRegistration $UpgradeVersion" in smoke
     assert "tamperedProgramHash" in smoke
     assert "@('cancel','command')" in smoke
     assert '"/SMOKEFIREWALLFAIL=$mode"' in smoke
     assert "-BuildSmokeFixtures" in verify
     assert "-BuildSmokeFixtures" not in release
     assert "/DSmokeTestBuild" not in release
-    assert "VersionOverride is restricted to the smoke-only 0.1.1 payload build" in _read(
-        "scripts/package.ps1"
-    )
+    package = _read("scripts/package.ps1")
+    assert "Get-NextPatchVersion" in package
+    assert "VersionOverride must equal the smoke-only next patch version" in package
     assert '(str(version_file), "restream_studio")' in _read(
         "packaging/restream-studio.spec"
     )
@@ -218,7 +234,9 @@ def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> No
     assert "INSTALLER_BUILD" in verify
     assert "INSTALLER_LIFECYCLE" in verify
     assert "build-installer.ps1" in verify
-    assert "smoke-installer.ps1" in verify
+    assert "run-smoke-installer-elevated.ps1" in verify
+    assert "SMOKE_UPGRADE_INSTALLER_PATH=" in verify
+    assert "$SmokeUpgradeInstaller = ''" in verify
     assert "-ReuseVerifiedPackage" in verify
     assert "-PackageManifest" in verify
     assert "INSTALLER_LIFECYCLE=SKIP" in verify

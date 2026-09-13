@@ -8,7 +8,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $Package = Join-Path $PSScriptRoot 'package.ps1'
 $BuildInstaller = Join-Path $PSScriptRoot 'build-installer.ps1'
-$SmokeInstaller = Join-Path $PSScriptRoot 'smoke-installer.ps1'
+$SmokeInstallerBroker = Join-Path $PSScriptRoot 'run-smoke-installer-elevated.ps1'
 $Distribution = Join-Path $Root 'dist\RestreamStudio'
 $TreeManifestTool = Join-Path $Root 'scripts\write-tree-manifest.py'
 $ManifestDirectory = Join-Path $Root 'artifacts\release-verification'
@@ -38,7 +38,7 @@ function Get-ProjectVersion {
 
 $ProjectVersion = Get-ProjectVersion
 $Installer = Join-Path $Root "dist\installer\RestreamStudio-Setup-$ProjectVersion.exe"
-$SmokeUpgradeInstaller = Join-Path $Root 'dist\installer\RestreamStudio-Setup-0.1.1.exe'
+$SmokeUpgradeInstaller = ''
 
 function Invoke-External {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
@@ -268,12 +268,28 @@ try {
             [Environment]::SetEnvironmentVariable(
                 'RESTREAM_STUDIO_VERIFIED_COMMIT', $CurrentCommit
             )
-            & $BuildInstaller -Clean -ReuseVerifiedPackage -PackageManifest $PackageManifest `
-                -BuildSmokeFixtures |
-                ForEach-Object { [Console]::Error.WriteLine([string]$_) }
+            $upgradePaths = [Collections.Generic.List[string]]::new()
+            & $BuildInstaller -Clean -ReuseVerifiedPackage `
+                -PackageManifest $PackageManifest -BuildSmokeFixtures |
+                ForEach-Object {
+                    $line = [string]$_
+                    [Console]::Error.WriteLine($line)
+                    if ($line -like 'SMOKE_UPGRADE_INSTALLER_PATH=*') {
+                        $upgradePaths.Add($line)
+                    }
+                }
             if ($LASTEXITCODE -ne 0) {
                 throw "build-installer.ps1 exited with code $LASTEXITCODE"
             }
+            if ($upgradePaths.Count -ne 1) {
+                throw 'build-installer.ps1 did not emit exactly one smoke upgrade installer path'
+            }
+            $candidate = $upgradePaths[0].Substring(
+                'SMOKE_UPGRADE_INSTALLER_PATH='.Length
+            )
+            $script:SmokeUpgradeInstaller = (
+                Resolve-Path -LiteralPath $candidate -ErrorAction Stop
+            ).Path
         }
         finally {
             [Environment]::SetEnvironmentVariable(
@@ -295,7 +311,7 @@ try {
         Invoke-Gate -Name 'INSTALLER_LIFECYCLE' -Action {
             $PowerShell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
             Invoke-External $PowerShell @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SmokeInstaller,
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SmokeInstallerBroker,
                 '-Installer', $Installer, '-UpgradeInstaller', $SmokeUpgradeInstaller,
                 '-WorkspaceRoot', $Root
             )

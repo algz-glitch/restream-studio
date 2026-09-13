@@ -4,11 +4,13 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Self
 from urllib.parse import urlsplit
 
 _VERSION_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -56,6 +58,14 @@ class UpdateErrorCode(StrEnum):
     SIZE_MISMATCH = "size_mismatch"
     SHA256_MISMATCH = "sha256_mismatch"
     FILESYSTEM = "filesystem"
+    RATE_LIMITED = "rate_limited"
+    HTTP_STATUS = "http_status"
+    INSUFFICIENT_SPACE = "insufficient_space"
+
+
+class DownloadStatus(StrEnum):
+    SUCCESS = "success"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +91,8 @@ class UpdateManifest:
             raise ValueError("sha256 must contain exactly 64 hexadecimal characters")
         if type(self.size) is not int or self.size <= 0:
             raise ValueError("size must be a positive integer")
+        if self.size > MAX_INSTALLER_BYTES:
+            raise ValueError("size exceeds the maximum installer size")
         if not isinstance(self.published_at, datetime):
             raise TypeError("published_at must be a datetime")
         if self.published_at.tzinfo is None or self.published_at.utcoffset() is None:
@@ -103,6 +115,8 @@ class UpdateManifest:
         size = payload["size"]
         if type(size) is not int or size <= 0:
             raise ValueError("size must be a positive integer")
+        if size > MAX_INSTALLER_BYTES:
+            raise ValueError("size exceeds the maximum installer size")
         published_at = _parse_published_at(_require_string(payload, "published_at"))
         installer_url = _require_string(payload, "installer_url")
         release_url = _require_string(payload, "release_url")
@@ -146,6 +160,39 @@ class UpdateCheckResult:
         if not message:
             raise ValueError("error message must not be empty")
         return cls(update_available=False, error_code=code, error_message=message)
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadResult:
+    status: DownloadStatus
+    manifest: UpdateManifest
+    path: Path | None = None
+    error_code: UpdateErrorCode | None = None
+    error_message: str | None = None
+
+    def __post_init__(self) -> None:
+        success = self.status is DownloadStatus.SUCCESS
+        if success != (self.path is not None):
+            raise ValueError("successful downloads must contain exactly one path")
+        if (self.error_code is None) != (self.error_message is None):
+            raise ValueError("download error code and message must be provided together")
+        if success == (self.error_code is not None):
+            raise ValueError("download result must contain success or error state")
+
+    @classmethod
+    def succeeded(cls, manifest: UpdateManifest, path: Path) -> Self:
+        return cls(status=DownloadStatus.SUCCESS, manifest=manifest, path=path)
+
+    @classmethod
+    def failed(cls, manifest: UpdateManifest, code: UpdateErrorCode, message: str) -> Self:
+        if not message:
+            raise ValueError("error message must not be empty")
+        return cls(
+            status=DownloadStatus.FAILED,
+            manifest=manifest,
+            error_code=code,
+            error_message=message,
+        )
 
 
 def _require_string(payload: dict[object, object], field: str) -> str:

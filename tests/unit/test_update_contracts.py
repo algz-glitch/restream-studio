@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from restream_studio.update.contracts import (
+    MAX_INSTALLER_BYTES,
+    DownloadResult,
+    DownloadStatus,
     UpdateCheckResult,
     UpdateErrorCode,
     UpdateManifest,
@@ -85,6 +89,12 @@ def test_manifest_rejects_invalid_scalar_fields(field: str, value: object) -> No
         UpdateManifest.from_dict(manifest_payload(**{field: value}))
 
 
+def test_manifest_rejects_installer_larger_than_hard_limit() -> None:
+    assert MAX_INSTALLER_BYTES == 512 * 1024 * 1024
+    with pytest.raises(ValueError, match="maximum"):
+        UpdateManifest.from_dict(manifest_payload(size=MAX_INSTALLER_BYTES + 1))
+
+
 def test_manifest_rejects_unknown_or_missing_fields() -> None:
     with pytest.raises(ValueError, match="fields"):
         UpdateManifest.from_dict(manifest_payload(extra=True))
@@ -146,3 +156,13 @@ def test_update_result_has_typed_success_and_failure_states() -> None:
     assert available.update_available and available.manifest is manifest
     assert not current.update_available and current.error_code is None
     assert failed.error_code is UpdateErrorCode.NETWORK and failed.error_message == "offline"
+
+
+def test_download_result_has_independent_success_and_failure_states() -> None:
+    manifest = UpdateManifest.from_dict(manifest_payload())
+    path = Path("installer.exe")
+    success = DownloadResult.succeeded(manifest, path)
+    failed = DownloadResult.failed(manifest, UpdateErrorCode.TIMEOUT, "timed out")
+    assert success.status is DownloadStatus.SUCCESS and success.path == path
+    assert failed.status is DownloadStatus.FAILED and failed.path is None
+    assert failed.error_code is UpdateErrorCode.TIMEOUT

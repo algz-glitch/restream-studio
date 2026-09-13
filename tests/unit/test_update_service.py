@@ -147,7 +147,7 @@ async def test_automatic_check_is_throttled_for_24_hours_and_manual_check_is_not
 
 
 @pytest.mark.asyncio
-async def test_restart_discards_unusable_available_state_and_rechecks_before_download(
+async def test_restart_discards_manifest_but_preserves_throttle_until_manual_check(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 9, 13, 12, tzinfo=UTC)
@@ -162,9 +162,13 @@ async def test_restart_discards_unusable_available_state_and_rechecks_before_dow
         clock=lambda: now + timedelta(minutes=1),
     )
     assert restarted.snapshot().status is UpdateStatus.IDLE
-    assert restarted.snapshot().last_checked_at is None
+    assert restarted.snapshot().last_checked_at == now
 
-    checked = await restarted.automatic_check()
+    throttled = await restarted.automatic_check()
+    assert throttled.status is UpdateStatus.IDLE
+    assert restarted_client.check_calls == 0
+
+    checked = await restarted.check()
     assert checked.status is UpdateStatus.AVAILABLE
     assert restarted_client.check_calls == 1
     assert (await restarted.download()).status is UpdateStatus.READY
@@ -298,6 +302,15 @@ async def test_sync_shutdown_callback_is_scheduled_after_install_returns(tmp_pat
     assert callbacks == []
     await asyncio.sleep(0)
     assert callbacks == ["shutdown"]
+
+    for operation in (service.check, service.download):
+        with pytest.raises(UpdateOperationError) as error:
+            await operation()
+        assert error.value.code == "update_installing"
+    with pytest.raises(UpdateOperationError) as error:
+        await service.install(current_pid=123)
+    assert error.value.code == "update_installing"
+    assert service.snapshot().status is UpdateStatus.READY
 
 
 def test_helper_rejects_relative_missing_or_mismatched_paths(tmp_path: Path) -> None:

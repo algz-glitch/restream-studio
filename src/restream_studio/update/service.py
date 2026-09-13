@@ -164,6 +164,7 @@ class UpdateService:
         return await self._run_check(force=False)
 
     async def _run_check(self, *, force: bool) -> UpdateSnapshot:
+        self._raise_if_installing()
         now = self._aware_now()
         if (
             not force
@@ -193,7 +194,6 @@ class UpdateService:
                 return self._state
             checked_at = self._aware_now()
             self._installer = None
-            self._install_started = False
             if result.update_available and result.manifest is not None:
                 self._manifest = result.manifest
                 self._state = UpdateSnapshot(
@@ -223,6 +223,7 @@ class UpdateService:
             return self._state
 
     async def download(self) -> UpdateSnapshot:
+        self._raise_if_installing()
         if self._operation_lock.locked() or self._state.status is UpdateStatus.DOWNLOADING:
             raise UpdateOperationError("download_in_progress", "Download already in progress")
         if self._state.status is not UpdateStatus.AVAILABLE or self._manifest is None:
@@ -271,7 +272,8 @@ class UpdateService:
             return self._state
 
     async def install(self, *, current_pid: int) -> None:
-        if self._operation_lock.locked() or self._install_started:
+        self._raise_if_installing()
+        if self._operation_lock.locked():
             raise UpdateOperationError("install_in_progress", "Installation already requested")
         if (
             self._state.status is not UpdateStatus.READY
@@ -308,6 +310,12 @@ class UpdateService:
             task = asyncio.create_task(self._invoke_shutdown())
             self._shutdown_tasks.add(task)
             task.add_done_callback(self._shutdown_tasks.discard)
+
+    def _raise_if_installing(self) -> None:
+        if self._install_started:
+            raise UpdateOperationError(
+                "update_installing", "Update installation is pending"
+            )
 
     async def _invoke_shutdown(self) -> None:
         result = self._shutdown_callback()
@@ -400,17 +408,21 @@ class UpdateService:
             if payload["current_version"] != self._current_version:
                 return idle
             status = UpdateStatus(payload["status"])
+            timestamp = payload["last_checked_at"]
+            checked = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
+            if checked is not None and (checked.tzinfo is None or checked.utcoffset() is None):
+                return idle
             if status in {
                 UpdateStatus.CHECKING,
                 UpdateStatus.AVAILABLE,
                 UpdateStatus.DOWNLOADING,
                 UpdateStatus.READY,
             }:
-                return idle
-            timestamp = payload["last_checked_at"]
-            checked = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
-            if checked is not None and (checked.tzinfo is None or checked.utcoffset() is None):
-                return idle
+                return UpdateSnapshot(
+                    UpdateStatus.IDLE,
+                    self._current_version,
+                    last_checked_at=checked,
+                )
             available = payload["available_version"]
             error_code = payload["error_code"]
             if status is UpdateStatus.FAILED:

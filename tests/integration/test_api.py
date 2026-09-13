@@ -1195,6 +1195,60 @@ async def test_update_install_and_start_share_atomic_write_boundary(harness: Har
     assert harness.controller.started == 0
 
 
+def test_installed_update_gate_blocks_check_download_and_start(harness: Harness) -> None:
+    from restream_studio.update.service import UpdateOperationError, UpdateSnapshot, UpdateStatus
+
+    class InstalledUpdateService:
+        installation_pending = True
+
+        def snapshot(self) -> UpdateSnapshot:
+            return UpdateSnapshot(UpdateStatus.READY, "0.1.0", available_version="0.2.0")
+
+        async def check(self) -> UpdateSnapshot:
+            raise UpdateOperationError("update_installing", "Update installation is pending")
+
+        async def download(self) -> UpdateSnapshot:
+            raise UpdateOperationError("update_installing", "Update installation is pending")
+
+        async def install(self, *, current_pid: int) -> None:
+            del current_pid
+            raise UpdateOperationError("update_installing", "Update installation is pending")
+
+        def start_background(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    harness.db.source = SourceConfig(CANONICAL, "origin", False)
+    harness.db.set_destination(
+        DestinationKind.DOUYIN,
+        "rtmps://publish.invalid/live",
+        SECRET,
+        enabled=True,
+    )
+    application = create_app(
+        lambda: ApiDependencies(
+            harness.db, harness.controller, update_service=InstalledUpdateService()
+        )
+    )
+    with TestClient(application, headers={"host": "localhost"}) as update_client:
+        headers = {
+            "origin": "http://localhost",
+            "x-restream-session": application.state.session_token,
+        }
+        for path in (
+            "/api/update/check",
+            "/api/update/download",
+            "/api/update/install",
+            "/api/control/start",
+        ):
+            response = update_client.post(path, json={}, headers=headers)
+            assert response.status_code == 409
+            assert response.json()["error"]["code"] == "update_installing"
+            assert "path" not in response.text.casefold()
+
+
 def test_application_shutdown_callback_only_requests_uvicorn_exit(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

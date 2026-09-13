@@ -25,6 +25,7 @@ interface UpdateCardProps {
   sessionReady: boolean
   api: ApiClient
   onChange: (value: UpdateResponse) => void
+  onActionSettled?: () => void
   loadError?: string
   loading?: boolean
 }
@@ -42,7 +43,7 @@ function approvedReleaseUrl(value: string | null): string | null {
   }
 }
 
-export function UpdateCard({ update, desiredRunning, sessionReady, api, onChange, loadError = '', loading = false }: UpdateCardProps) {
+export function UpdateCard({ update, desiredRunning, sessionReady, api, onChange, onActionSettled, loadError = '', loading = false }: UpdateCardProps) {
   const [busy, setBusy] = useState<UpdateAction | null>(null)
   const [actionError, setActionError] = useState('')
   const [installNotice, setInstallNotice] = useState('')
@@ -77,6 +78,7 @@ export function UpdateCard({ update, desiredRunning, sessionReady, api, onChange
       if (controller.current === nextController) controller.current = null
       actionLock.current = false
       setBusy(null)
+      onActionSettled?.()
     }
   }
 

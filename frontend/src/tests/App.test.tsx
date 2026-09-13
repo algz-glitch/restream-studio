@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../App'
@@ -96,6 +96,45 @@ describe('播控台', () => {
     expect(screen.getByText('更新状态加载失败，请稍后重试。')).toBeVisible()
     expect(screen.getByRole('region', { name: '传输监控' })).toBeVisible()
     expect(screen.queryByText(/private|C:\\/)).not.toBeInTheDocument()
+  })
+
+  it('延迟轮询 GET 晚于 POST 返回时不会覆盖 mutation 新状态并立即刷新', async () => {
+    vi.useFakeTimers()
+    let resolveDownload: ((value: Response) => void) | undefined
+    let resolveStaleGet: ((value: Response) => void) | undefined
+    let updateReads = 0
+    const available = { ...updateBase, status: 'available' as const, available_version: '0.2.0' }
+    const ready = { ...updateBase, status: 'ready' as const, available_version: '0.2.0' }
+    const baseFetch = installApi({
+      '/api/update': available,
+      'POST /api/update/download': new Promise<Response>((resolve) => { resolveDownload = resolve }),
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/update' && (init?.method ?? 'GET') === 'GET') {
+        updateReads += 1
+        if (updateReads === 1) return json(available)
+        if (updateReads === 2) return new Promise<Response>((resolve) => { resolveStaleGet = resolve })
+        return json(ready)
+      }
+      return baseFetch(input, init)
+    }))
+    render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+    fireEvent.click(screen.getByRole('button', { name: '下载更新' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(30000) })
+    expect(updateReads).toBe(2)
+
+    resolveDownload?.(json(ready))
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByText('更新已准备就绪')).toBeVisible()
+    expect(updateReads).toBe(3)
+
+    resolveStaleGet?.(json(available))
+    await act(async () => { await Promise.resolve() })
+    expect(screen.getByText('更新已准备就绪')).toBeVisible()
+    expect(screen.queryByRole('button', { name: '下载更新' })).not.toBeInTheDocument()
   })
 
   it.each([

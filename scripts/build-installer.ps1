@@ -1,14 +1,70 @@
 [CmdletBinding()]
-param([switch]$Clean)
+param(
+    [switch]$Clean,
+    [string]$SourceRoot = '',
+    [switch]$ResolveVersionOnly
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Root = Split-Path -Parent $PSScriptRoot
-$PackageScript = Join-Path $PSScriptRoot 'package.ps1'
+$Root = if ($SourceRoot) {
+    (Resolve-Path -LiteralPath $SourceRoot -ErrorAction Stop).Path
+}
+else {
+    Split-Path -Parent $PSScriptRoot
+}
+$PackageScript = Join-Path $Root 'scripts\package.ps1'
 $InstallerScript = Join-Path $Root 'packaging\restream-studio.iss'
 $InstallerDirectory = Join-Path $Root 'dist\installer'
-$Installer = Join-Path $InstallerDirectory 'RestreamStudio-Setup-0.1.0.exe'
+
+function Get-ReleaseVersion {
+    param([Parameter(Mandatory)][string]$RootPath)
+
+    $issPath = Join-Path $RootPath 'packaging\restream-studio.iss'
+    $packagePath = Join-Path $RootPath 'package.json'
+    $pyprojectPath = Join-Path $RootPath 'pyproject.toml'
+    foreach ($path in ($issPath, $packagePath, $pyprojectPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "release version source is missing: $path"
+        }
+    }
+
+    $semverPattern = '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+    $issMatches = [Regex]::Matches(
+        [IO.File]::ReadAllText($issPath),
+        "(?m)^#define MyAppVersion `"($semverPattern)`"\s*$"
+    )
+    if ($issMatches.Count -ne 1) {
+        throw 'restream-studio.iss must contain exactly one canonical MyAppVersion'
+    }
+    $version = $issMatches[0].Groups[1].Value
+
+    $packageVersion = ([IO.File]::ReadAllText($packagePath) | ConvertFrom-Json).version
+    if ($packageVersion -isnot [string] -or $packageVersion -cnotmatch "^$semverPattern$") {
+        throw 'package.json version must be canonical SemVer'
+    }
+    $pyprojectMatches = [Regex]::Matches(
+        [IO.File]::ReadAllText($pyprojectPath),
+        "(?m)^version\s*=\s*`"($semverPattern)`"\s*$"
+    )
+    if ($pyprojectMatches.Count -ne 1) {
+        throw 'pyproject.toml must contain exactly one canonical project version'
+    }
+    $pyprojectVersion = $pyprojectMatches[0].Groups[1].Value
+    if ($packageVersion -cne $version -or $pyprojectVersion -cne $version) {
+        throw 'release versions differ across .iss, package.json, and pyproject.toml'
+    }
+    return $version
+}
+
+$Version = Get-ReleaseVersion -RootPath $Root
+$Installer = Join-Path $InstallerDirectory "RestreamStudio-Setup-$Version.exe"
+if ($ResolveVersionOnly) {
+    Write-Output "RELEASE_VERSION=$Version"
+    Write-Output "INSTALLER_PATH=$Installer"
+    exit 0
+}
 
 function Invoke-External {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())

@@ -23,7 +23,7 @@ GitHub Release 页面下载，并按同一 Release 中 `latest.json` 的 `size` 
 3. 浏览器打开 `http://127.0.0.1:8000`。服务不监听局域网地址。
 4. 数据默认写入 `%LOCALAPPDATA%\RestreamStudio`，不会写回程序目录。
 
-开发环境使用 `powershell -ExecutionPolicy Bypass -File scripts/dev.ps1`。脚本要求 Python 3.12 虚拟环境、真实 `package-lock.json` 和可复现的 `npm ci`。FFmpeg/ffprobe 的解析顺序为环境变量 `FFMPEG_PATH`/`FFPROBE_PATH`、仓库工具目录、最后 `PATH`。
+开发环境使用 `powershell -ExecutionPolicy Bypass -File scripts/dev.ps1`。发布环境固定 Python 3.12.10，Python 运行/开发传递依赖由 `requirements-release.lock` 精确锁定；Node 使用真实 `package-lock.json` 和可复现的 `npm ci`。FFmpeg/ffprobe 的解析顺序为环境变量 `FFMPEG_PATH`/`FFPROBE_PATH`、仓库工具目录、最后 `PATH`。
 
 ## 操作流程
 
@@ -99,7 +99,8 @@ powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
 
 - `.github/workflows/release.yml` 只响应严格 `v<major>.<minor>.<patch>` tag；普通分支 push 不发布。
 - tag 必须与 `pyproject.toml`、`package.json` 和 Inno Setup 版本完全一致。
-- Windows CI 固定 Python 3.12、Node.js 22.14.0，并通过 `package-lock.json` 执行 `npm ci`。
+- Windows CI 固定 Python 3.12.10、Node.js 22.14.0；Python 从 `requirements-release.lock`
+  安装全部精确版本后以 `--no-build-isolation --no-deps` 安装项目，Node 通过 `package-lock.json` 执行 `npm ci`。
 - CI 不依赖 runner 的 FFmpeg、ffprobe 或 MediaMTX PATH：`scripts/provision-release-tools.ps1`
   下载固定版本归档并先校验固定 SHA-256，再运行完整 `scripts/verify.ps1` 和安装器构建。
 - 所有门禁通过后，CI 上传安装器与 `latest.json` 为 workflow artifact，并使用 GitHub Actions

@@ -10,6 +10,8 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from restream_studio.update.contracts import MAX_INSTALLER_BYTES, UpdateManifest
+
 REPOSITORY = "algz-glitch/restream-studio"
 SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
@@ -44,6 +46,8 @@ def validate_inputs(arguments: argparse.Namespace) -> tuple[Path, Path]:
         raise ValueError("installer must be an existing regular file")
     if installer.stat().st_size <= 0:
         raise ValueError("installer must not be empty")
+    if installer.stat().st_size > MAX_INSTALLER_BYTES:
+        raise ValueError("installer exceeds the maximum installer size")
     expected_name = f"RestreamStudio-Setup-{arguments.version}.exe"
     if installer.name != expected_name:
         raise ValueError(f"installer filename must be exactly {expected_name}")
@@ -90,6 +94,7 @@ def write_manifest(arguments: argparse.Namespace) -> Path:
         "published_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "release_url": f"https://github.com/{repository}/releases/tag/{tag}",
     }
+    UpdateManifest.from_dict(manifest)
 
     temporary_name: str | None = None
     try:

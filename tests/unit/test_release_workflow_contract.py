@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -60,11 +61,39 @@ def test_release_workflow_pins_runtime_actions_and_locked_node_install() -> None
         "actions/upload-artifact",
     ):
         assert re.search(rf"uses:\s+{re.escape(action)}@[0-9a-f]{{40}}", workflow)
-    assert "python-version: '3.12'" in workflow
+    assert "python-version: '3.12.10'" in workflow
+    assert "cache-dependency-path: requirements-release.lock" in workflow
     assert "node-version: '22.14.0'" in workflow
     assert "cache: npm" in workflow
     assert "cache-dependency-path: package-lock.json" in workflow
     assert "npm ci --ignore-scripts --no-audit --no-fund" in workflow
+    assert "--requirement requirements-release.lock" in workflow
+    assert "--no-build-isolation --no-deps ." in workflow
+
+
+def test_release_workflow_never_interpolates_context_inside_powershell() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    lines = workflow.splitlines()
+    run_blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.startswith("        run:"):
+            continue
+        value = line.partition("run:")[2].strip()
+        if value != "|":
+            run_blocks.append(value)
+            continue
+        block: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if candidate and not candidate.startswith("          "):
+                break
+            block.append(candidate)
+        run_blocks.append("\n".join(block))
+    assert run_blocks
+    assert all("${{" not in block for block in run_blocks)
+    assert "RELEASE_TAG: ${{ github.ref_name }}" in workflow
+    assert "GH_REPOSITORY: ${{ github.repository }}" in workflow
+    assert "$env:RELEASE_TAG" in workflow
+    assert "^v(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$" in workflow
 
 
 def test_release_workflow_runs_all_gates_and_publishes_only_verified_assets() -> None:
@@ -95,6 +124,20 @@ def test_release_workflow_derives_and_checks_exact_semver_tag() -> None:
     assert "pyproject.toml" in workflow
     assert "package.json" in workflow
     assert "packaging/restream-studio.iss" in workflow
+
+
+def test_release_lock_contains_only_exact_transitive_pins() -> None:
+    lock = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
+    requirements = [
+        line.strip()
+        for line in lock.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert requirements
+    assert all(re.fullmatch(r"[A-Za-z0-9_.-]+==[^\s;]+", item) for item in requirements)
+    names = {item.partition("==")[0].casefold() for item in requirements}
+    for required in ("fastapi", "pydantic", "streamget", "pytest", "mypy", "ruff", "pyinstaller"):
+        assert required in names
 
 
 def test_release_tools_are_versioned_downloaded_and_sha256_verified() -> None:
@@ -212,6 +255,52 @@ def test_manifest_writer_rejects_an_empty_installer(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "installer must not be empty" in result.stderr
     assert not output.exists()
+
+
+def test_manifest_writer_rejects_sparse_installer_above_hard_limit(tmp_path: Path) -> None:
+    installer = tmp_path / "RestreamStudio-Setup-1.2.3.exe"
+    with installer.open("wb") as stream:
+        stream.truncate(512 * 1024 * 1024 + 1)
+    output = tmp_path / "latest.json"
+
+    result = _run_writer(*_valid_arguments(installer, output), cwd=tmp_path)
+
+    assert result.returncode != 0
+    assert "maximum installer size" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell unavailable")
+def test_installer_builder_derives_a_0_1_1_fixture_from_three_sources(tmp_path: Path) -> None:
+    (tmp_path / "packaging").mkdir()
+    (tmp_path / "packaging" / "restream-studio.iss").write_text(
+        '#define MyAppVersion "0.1.1"\n', encoding="utf-8"
+    )
+    (tmp_path / "package.json").write_text('{"version":"0.1.1"}\n', encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\nversion = "0.1.1"\n', encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(ROOT / "scripts" / "build-installer.ps1"),
+            "-SourceRoot",
+            str(tmp_path),
+            "-ResolveVersionOnly",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "RELEASE_VERSION=0.1.1" in result.stdout
+    assert str(tmp_path / "dist" / "installer" / "RestreamStudio-Setup-0.1.1.exe") in result.stdout
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support unavailable")

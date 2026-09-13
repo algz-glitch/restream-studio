@@ -236,7 +236,9 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
     assert "$output = @(& $Path $probe" in build
     assert "Compiler engine version: Inno Setup 6.7.3" in build
     assert "ISCC_PATH must point to Inno Setup 6.7.3" in build
-    assert "RestreamStudio-Setup-0.1.0.exe" in build
+    assert "function Get-ReleaseVersion" in build
+    assert "RestreamStudio-Setup-$Version.exe" in build
+    assert "RestreamStudio-Setup-0.1.0.exe" not in build
     assert "Get-FileHash" in build
     assert "SHA256=" in build
     assert "Start-Process -FilePath $copiedUpdateHelper" in build

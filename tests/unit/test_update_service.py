@@ -21,10 +21,12 @@ from restream_studio.update.helper import (
     HelperArguments,
     parse_arguments,
     run_helper,
+    wait_for_process,
 )
 from restream_studio.update.service import (
     UpdateOperationError,
     UpdateService,
+    UpdateSnapshot,
     UpdateStatus,
 )
 
@@ -145,6 +147,10 @@ async def test_automatic_check_is_throttled_for_24_hours_and_manual_check_is_not
     await service.automatic_check()
     assert client.check_calls == 3
 
+    moments[0] -= timedelta(hours=25)
+    await service.automatic_check()
+    assert client.check_calls == 4
+
 
 @pytest.mark.asyncio
 async def test_restart_discards_manifest_but_preserves_throttle_until_manual_check(
@@ -172,6 +178,135 @@ async def test_restart_discards_manifest_but_preserves_throttle_until_manual_che
     assert checked.status is UpdateStatus.AVAILABLE
     assert restarted_client.check_calls == 1
     assert (await restarted.download()).status is UpdateStatus.READY
+
+
+@pytest.mark.asyncio
+async def test_future_persisted_timestamp_is_discarded_and_does_not_throttle(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 13, 12, tzinfo=UTC)
+    first = UpdateService(
+        tmp_path / "update",
+        client=FakeClient(UpdateCheckResult.current()),
+        clock=lambda: now,
+    )
+    await first.check()
+    client = FakeClient(UpdateCheckResult.current())
+    restarted = UpdateService(
+        tmp_path / "update",
+        client=client,
+        clock=lambda: now - timedelta(minutes=1),
+    )
+    assert restarted.snapshot() == UpdateSnapshot(UpdateStatus.IDLE, "0.1.0")
+    assert not (tmp_path / "update" / "state.json").exists()
+    await restarted.automatic_check()
+    assert client.check_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        UpdateCheckResult.current(),
+        UpdateCheckResult.available(manifest()),
+        UpdateCheckResult.failed(UpdateErrorCode.NETWORK, "private detail"),
+    ],
+)
+async def test_check_persistence_failure_keeps_previous_state_for_every_result(
+    tmp_path: Path, result: UpdateCheckResult
+) -> None:
+    writes = 0
+
+    def writer(_candidate: UpdateSnapshot) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise PermissionError("private denied path")
+
+    service = UpdateService(
+        tmp_path / "update",
+        client=FakeClient(result),
+        state_writer=writer,
+    )
+    with pytest.raises(UpdateOperationError) as error:
+        await service.check()
+    assert error.value.code == "filesystem"
+    assert error.value.message == "Update state could not be saved"
+    assert service.snapshot().status is UpdateStatus.CHECKING
+
+
+@pytest.mark.asyncio
+async def test_denied_initial_state_write_does_not_start_check(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(UpdateCheckResult.current())
+    service = UpdateService(
+        tmp_path / "update",
+        client=client,
+        state_writer=lambda _candidate: (_ for _ in ()).throw(
+            PermissionError("private read-only path")
+        ),
+    )
+    with pytest.raises(UpdateOperationError) as error:
+        await service.check()
+    assert error.value.code == "filesystem"
+    assert service.snapshot().status is UpdateStatus.IDLE
+    assert client.check_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("download_succeeds", [True, False])
+async def test_download_persistence_failure_keeps_previous_state_for_all_results(
+    tmp_path: Path, download_succeeds: bool
+) -> None:
+    selected = manifest()
+
+    class DownloadClient(FakeClient):
+        def download_installer_result(
+            self, selected_manifest: UpdateManifest, destination: Path
+        ) -> DownloadResult:
+            if download_succeeds:
+                return super().download_installer_result(selected_manifest, destination)
+            return DownloadResult.failed(
+                selected_manifest, UpdateErrorCode.NETWORK, "private download detail"
+            )
+
+    service = UpdateService(
+        tmp_path / "update",
+        client=DownloadClient(UpdateCheckResult.available(selected)),
+    )
+    await service.check()
+    writes = 0
+
+    def writer(_candidate: UpdateSnapshot) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise PermissionError("private denied path")
+
+    service._state_writer = writer
+    with pytest.raises(UpdateOperationError) as error:
+        await service.download()
+    assert error.value.code == "filesystem"
+    assert service.snapshot().status is UpdateStatus.DOWNLOADING
+
+
+@pytest.mark.asyncio
+async def test_denied_download_transition_keeps_available_and_skips_network(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(UpdateCheckResult.available(manifest()))
+    service = UpdateService(tmp_path / "update", client=client)
+    await service.check()
+    previous = service.snapshot()
+    service._state_writer = lambda _candidate: (_ for _ in ()).throw(
+        PermissionError("private read-only path")
+    )
+    with pytest.raises(UpdateOperationError) as error:
+        await service.download()
+    assert error.value.code == "filesystem"
+    assert service.snapshot() == previous
+    assert client.download_calls == 0
 
 
 @pytest.mark.asyncio
@@ -222,6 +357,7 @@ async def test_download_becomes_ready_and_install_revalidates_before_launch(
         helper_command=("python", "-m", "restream_studio.update.helper"),
         launcher=lambda command: launched.append(list(command)),
         shutdown_callback=shutdown,
+        process_create_time=lambda pid: 1234.5 if pid == 4321 else 0.0,
     )
     await service.check()
     ready = await service.download()
@@ -240,6 +376,12 @@ async def test_download_becomes_ready_and_install_revalidates_before_launch(
         str((tmp_path / "update" / "RestreamStudio-Setup-0.2.0.exe").resolve()),
         "--executable",
         str(executable),
+        "--expected-sha256",
+        manifest().sha256,
+        "--expected-size",
+        str(manifest().size),
+        "--process-created-at",
+        "1234.5",
     ]]
     await asyncio.sleep(0)
     assert shutdowns == 1
@@ -250,6 +392,7 @@ async def test_download_becomes_ready_and_install_revalidates_before_launch(
         executable=executable,
         launcher=lambda command: launched.append(list(command)),
         shutdown_callback=shutdown,
+        process_create_time=lambda _pid: 1234.5,
     )
     await tampered_service.check()
     await tampered_service.download()
@@ -284,6 +427,28 @@ async def test_background_check_does_not_block_startup_and_shutdown_cancels_it(
 
 
 @pytest.mark.asyncio
+async def test_background_expected_error_is_consumed_without_loop_warning(tmp_path: Path) -> None:
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    service = UpdateService(tmp_path / "update", client=FakeClient(UpdateCheckResult.current()))
+
+    async def fail_expected() -> UpdateSnapshot:
+        raise UpdateOperationError("filesystem", "Update state could not be saved")
+
+    service.automatic_check = fail_expected  # type: ignore[method-assign]
+    try:
+        service.start_background()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await service.shutdown()
+        assert contexts == []
+    finally:
+        loop.set_exception_handler(previous)
+
+
+@pytest.mark.asyncio
 async def test_sync_shutdown_callback_is_scheduled_after_install_returns(tmp_path: Path) -> None:
     callbacks: list[str] = []
     client = FakeClient(UpdateCheckResult.available(manifest()))
@@ -295,6 +460,7 @@ async def test_sync_shutdown_callback_is_scheduled_after_install_returns(tmp_pat
         executable=executable,
         launcher=lambda _command: object(),
         shutdown_callback=lambda: callbacks.append("shutdown"),
+        process_create_time=lambda _pid: 123.0,
     )
     await service.check()
     await service.download()
@@ -317,12 +483,21 @@ def test_helper_rejects_relative_missing_or_mismatched_paths(tmp_path: Path) -> 
     installer = (tmp_path / "wrong.exe").resolve()
     installer.write_bytes(b"x")
     executable = (tmp_path / "RestreamStudio.exe").resolve()
+    digest = hashlib.sha256(b"x").hexdigest()
+
+    def arguments(pid: str, selected: str, app: str) -> list[str]:
+        return [
+            "--pid", pid, "--installer", selected, "--executable", app,
+            "--expected-sha256", digest, "--expected-size", "1",
+            "--process-created-at", "1.0",
+        ]
+
     with pytest.raises(ValueError, match="absolute"):
-        parse_arguments(["--pid", "4", "--installer", "setup.exe", "--executable", str(executable)])
+        parse_arguments(arguments("4", "setup.exe", str(executable)))
     with pytest.raises(ValueError, match="name"):
-        parse_arguments(["--pid", "4", "--installer", str(installer), "--executable", str(executable)])
+        parse_arguments(arguments("4", str(installer), str(executable)))
     with pytest.raises(ValueError, match="PID"):
-        parse_arguments(["--pid", "0", "--installer", str(installer), "--executable", str(executable)])
+        parse_arguments(arguments("0", str(installer), str(executable)))
     with pytest.raises(ValueError, match="invalid"):
         parse_arguments([
             "--pid", "4", "--pid", "5", "--installer", str(installer),
@@ -330,10 +505,31 @@ def test_helper_rejects_relative_missing_or_mismatched_paths(tmp_path: Path) -> 
         ])
     valid_installer = (tmp_path / "RestreamStudio-Setup-0.2.0.exe").resolve()
     valid_installer.write_bytes(b"installer")
+    parsed = parse_arguments(
+        arguments("4", str(valid_installer), str(executable))
+    )
+    assert (parsed.expected_sha256, parsed.expected_size, parsed.process_created_at) == (
+        digest,
+        1,
+        1.0,
+    )
+    for option, invalid in (
+        ("--expected-sha256", "A" * 64),
+        ("--expected-size", "-1"),
+        ("--process-created-at", "nan"),
+    ):
+        invalid_arguments = arguments("4", str(valid_installer), str(executable))
+        invalid_arguments[invalid_arguments.index(option) + 1] = invalid
+        with pytest.raises(ValueError, match="invalid"):
+            parse_arguments(invalid_arguments)
     with pytest.raises(ValueError, match="RestreamStudio.exe"):
-        HelperArguments(4, valid_installer, (tmp_path / "Other.exe").resolve())
+        HelperArguments(
+            4, valid_installer, (tmp_path / "Other.exe").resolve(),
+            hashlib.sha256(b"installer").hexdigest(), 9, 1.0,
+        )
     assert HelperArguments(
-        4, valid_installer, (tmp_path / "RESTREAMSTUDIO.EXE").resolve()
+        4, valid_installer, (tmp_path / "RESTREAMSTUDIO.EXE").resolve(),
+        hashlib.sha256(b"installer").hexdigest(), 9, 1.0,
     ).executable.name == "RESTREAMSTUDIO.EXE"
 
 
@@ -343,8 +539,8 @@ def test_helper_waits_runs_inno_and_only_then_starts_application(tmp_path: Path)
     executable = (tmp_path / "RestreamStudio.exe").resolve()
     order: list[object] = []
 
-    def wait(pid: int, timeout: float) -> bool:
-        order.append(("wait", pid, timeout))
+    def wait(pid: int, created_at: float, timeout: float) -> bool:
+        order.append(("wait", pid, created_at, timeout))
         return True
 
     def run(command: Sequence[str]) -> int:
@@ -357,14 +553,16 @@ def test_helper_waits_runs_inno_and_only_then_starts_application(tmp_path: Path)
         return object()
 
     result = run_helper(
-        HelperArguments(123, installer, executable),
+        HelperArguments(
+            123, installer, executable, hashlib.sha256(b"installer").hexdigest(), 9, 4.5
+        ),
         wait_for_pid=wait,
         run_installer=run,
         launch=launch,
     )
     assert result == 0
     assert order == [
-        ("wait", 123, 120.0),
+        ("wait", 123, 4.5, 120.0),
         [str(installer), *INSTALLER_ARGUMENTS],
         [str(executable)],
     ]
@@ -380,10 +578,60 @@ def test_helper_does_not_install_if_pid_wait_times_out(tmp_path: Path) -> None:
         return 0
 
     result = run_helper(
-        HelperArguments(123, installer, executable),
-        wait_for_pid=lambda _pid, _timeout: False,
+        HelperArguments(
+            123, installer, executable, hashlib.sha256(b"installer").hexdigest(), 9, 4.5
+        ),
+        wait_for_pid=lambda _pid, _created, _timeout: False,
         run_installer=record_install,
         launch=lambda command: launches.append(command),
     )
     assert result == 2
     assert launches == []
+
+
+def test_helper_revalidates_installer_after_wait_before_execution(tmp_path: Path) -> None:
+    original = b"verified-installer"
+    installer = (tmp_path / "RestreamStudio-Setup-0.2.0.exe").resolve()
+    installer.write_bytes(original)
+    executable = (tmp_path / "RestreamStudio.exe").resolve()
+    executions: list[Sequence[str]] = []
+
+    def replace_during_wait(_pid: int, _created: float, _timeout: float) -> bool:
+        installer.write_bytes(b"replaced-installer")
+        return True
+
+    def record_install(command: Sequence[str]) -> int:
+        executions.append(command)
+        return 0
+
+    result = run_helper(
+        HelperArguments(
+            123,
+            installer,
+            executable,
+            hashlib.sha256(original).hexdigest(),
+            len(original),
+            4.5,
+        ),
+        wait_for_pid=replace_during_wait,
+        run_installer=record_install,
+        launch=lambda command: executions.append(command),
+    )
+    assert result == 5
+    assert executions == []
+
+
+def test_helper_treats_reused_pid_as_original_process_exited() -> None:
+    class ReusedProcess:
+        def create_time(self) -> float:
+            return 99.0
+
+        def wait(self, timeout: float) -> None:
+            raise AssertionError(f"reused PID must not be waited: {timeout}")
+
+    assert wait_for_process(
+        123,
+        4.5,
+        120.0,
+        process_factory=lambda _pid: ReusedProcess(),
+    )

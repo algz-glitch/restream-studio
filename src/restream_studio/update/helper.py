@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import re
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import psutil  # type: ignore[import-untyped]
+
+from .contracts import MAX_INSTALLER_BYTES
 
 INSTALLER_ARGUMENTS = (
     "/VERYSILENT",
@@ -20,6 +25,7 @@ INSTALLER_ARGUMENTS = (
 )
 PID_WAIT_SECONDS = 120.0
 _INSTALLER_NAME = re.compile(r"RestreamStudio-Setup-(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.exe\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +33,9 @@ class HelperArguments:
     pid: int
     installer: Path
     executable: Path
+    expected_sha256: str
+    expected_size: int
+    process_created_at: float
 
     def __post_init__(self) -> None:
         if type(self.pid) is not int or self.pid <= 0:
@@ -39,36 +48,108 @@ class HelperArguments:
             raise ValueError("installer name does not match the release contract")
         if self.executable.name.casefold() != "restreamstudio.exe".casefold():
             raise ValueError("executable basename must be RestreamStudio.exe")
+        if (
+            not isinstance(self.expected_sha256, str)
+            or _SHA256.fullmatch(self.expected_sha256) is None
+        ):
+            raise ValueError("expected SHA-256 is invalid")
+        if (
+            type(self.expected_size) is not int
+            or self.expected_size <= 0
+            or self.expected_size > MAX_INSTALLER_BYTES
+        ):
+            raise ValueError("expected size is invalid")
+        if (
+            type(self.process_created_at) is not float
+            or not math.isfinite(self.process_created_at)
+            or self.process_created_at <= 0
+        ):
+            raise ValueError("process creation time is invalid")
 
 
 def parse_arguments(arguments: Sequence[str]) -> HelperArguments:
-    required = ("--pid", "--installer", "--executable")
-    if len(arguments) != 6 or any(arguments.count(option) != 1 for option in required):
+    required = (
+        "--pid",
+        "--installer",
+        "--executable",
+        "--expected-sha256",
+        "--expected-size",
+        "--process-created-at",
+    )
+    if len(arguments) != 12 or any(arguments.count(option) != 1 for option in required):
         raise ValueError("helper arguments are invalid")
     parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
     parser.add_argument("--pid", required=True)
     parser.add_argument("--installer", required=True)
     parser.add_argument("--executable", required=True)
+    parser.add_argument("--expected-sha256", required=True)
+    parser.add_argument("--expected-size", required=True)
+    parser.add_argument("--process-created-at", required=True)
     try:
         values = parser.parse_args(list(arguments))
         if not str(values.pid).isascii() or not str(values.pid).isdecimal():
             raise ValueError("PID must be a positive integer")
+        size = str(values.expected_size)
+        if not size.isascii() or not size.isdecimal():
+            raise ValueError("expected size is invalid")
+        try:
+            process_created_at = float(values.process_created_at)
+        except ValueError:
+            raise ValueError("process creation time is invalid") from None
         return HelperArguments(
-            int(values.pid), Path(values.installer), Path(values.executable)
+            int(values.pid),
+            Path(values.installer),
+            Path(values.executable),
+            str(values.expected_sha256),
+            int(size),
+            process_created_at,
         )
-    except argparse.ArgumentError as error:
+    except (argparse.ArgumentError, TypeError) as error:
         raise ValueError("helper arguments are invalid") from error
 
 
-def wait_for_process(pid: int, timeout: float) -> bool:
+class ProcessPort(Protocol):
+    def create_time(self) -> float: ...
+    def wait(self, timeout: float) -> object: ...
+
+
+ProcessFactory = Callable[[int], ProcessPort]
+
+
+def wait_for_process(
+    pid: int,
+    process_created_at: float,
+    timeout: float,
+    *,
+    process_factory: ProcessFactory = psutil.Process,
+) -> bool:
     try:
-        process = psutil.Process(pid)
+        process = process_factory(pid)
+        if not math.isclose(
+            process.create_time(), process_created_at, rel_tol=0.0, abs_tol=1e-6
+        ):
+            return True
         process.wait(timeout=timeout)
     except psutil.NoSuchProcess:
         return True
     except psutil.TimeoutExpired:
         return False
+    except psutil.Error:
+        return False
     return True
+
+
+def verify_installer(path: Path, expected_size: int, expected_sha256: str) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size != expected_size:
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == expected_sha256
+    except OSError:
+        return False
 
 
 def _run_installer(command: Sequence[str]) -> int:
@@ -83,12 +164,18 @@ def _launch(command: Sequence[str]) -> object:
 def run_helper(
     arguments: HelperArguments,
     *,
-    wait_for_pid: Callable[[int, float], bool] = wait_for_process,
+    wait_for_pid: Callable[[int, float, float], bool] = wait_for_process,
     run_installer: Callable[[Sequence[str]], int] = _run_installer,
     launch: Callable[[Sequence[str]], object] = _launch,
 ) -> int:
-    if not wait_for_pid(arguments.pid, PID_WAIT_SECONDS):
+    if not wait_for_pid(
+        arguments.pid, arguments.process_created_at, PID_WAIT_SECONDS
+    ):
         return 2
+    if not verify_installer(
+        arguments.installer, arguments.expected_size, arguments.expected_sha256
+    ):
+        return 5
     result = run_installer([str(arguments.installer), *INSTALLER_ARGUMENTS])
     if result != 0:
         return 3

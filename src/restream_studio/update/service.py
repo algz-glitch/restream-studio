@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import os
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+
+import psutil  # type: ignore[import-untyped]
 
 from restream_studio import __version__
 
@@ -90,6 +93,8 @@ class UpdateClientPort(Protocol):
 Clock = Callable[[], datetime]
 Launcher = Callable[[Sequence[str]], object]
 ShutdownCallback = Callable[[], Awaitable[None] | None]
+StateWriter = Callable[[UpdateSnapshot], None]
+ProcessCreateTime = Callable[[int], float]
 
 
 def _utc_now() -> datetime:
@@ -117,6 +122,10 @@ def _no_shutdown_callback() -> None:
     return None
 
 
+def _process_create_time(pid: int) -> float:
+    return float(psutil.Process(pid).create_time())
+
+
 class UpdateService:
     def __init__(
         self,
@@ -129,6 +138,8 @@ class UpdateService:
         shutdown_callback: ShutdownCallback = _no_shutdown_callback,
         helper_command: Sequence[str] | None = None,
         executable: Path | None = None,
+        state_writer: StateWriter | None = None,
+        process_create_time: ProcessCreateTime = _process_create_time,
     ) -> None:
         self._update_dir = Path(update_dir).resolve(strict=False)
         self._state_file = self._update_dir / "state.json"
@@ -139,6 +150,7 @@ class UpdateService:
         self._shutdown_callback = shutdown_callback
         self._helper_command = tuple(helper_command or _default_helper_command())
         self._executable = Path(executable or sys.executable).resolve(strict=False)
+        self._process_create_time = process_create_time
         self._operation_lock = asyncio.Lock()
         self._background_task: asyncio.Task[None] | None = None
         self._shutdown_tasks: set[asyncio.Task[None]] = set()
@@ -146,6 +158,7 @@ class UpdateService:
         self._installer: Path | None = None
         self._install_started = False
         self._state = self._load_state()
+        self._state_writer = state_writer or self._persist_state
 
     def snapshot(self) -> UpdateSnapshot:
         return self._state
@@ -169,34 +182,38 @@ class UpdateService:
         if (
             not force
             and self._state.last_checked_at is not None
-            and now - self._state.last_checked_at < CHECK_INTERVAL
+            and timedelta(0) <= now - self._state.last_checked_at < CHECK_INTERVAL
         ):
             return self._state
         if self._operation_lock.locked():
             raise UpdateOperationError("check_in_progress", "Update operation already in progress")
         async with self._operation_lock:
-            self._state = UpdateSnapshot(UpdateStatus.CHECKING, self._current_version)
+            await self._commit_state(
+                UpdateSnapshot(
+                    UpdateStatus.CHECKING,
+                    self._current_version,
+                    last_checked_at=self._state.last_checked_at,
+                )
+            )
+            self._manifest = None
+            self._installer = None
             try:
                 result = await asyncio.to_thread(
                     self._client.check_for_update, self._current_version
                 )
             except Exception:  # noqa: BLE001 - implementation details stay behind state API
-                self._manifest = None
-                self._installer = None
-                self._state = UpdateSnapshot(
+                candidate = UpdateSnapshot(
                     UpdateStatus.FAILED,
                     self._current_version,
                     last_checked_at=self._aware_now(),
                     error_code="check_failed",
                     error_message="Update check failed",
                 )
-                await asyncio.to_thread(self._persist_state)
+                await self._commit_state(candidate)
                 return self._state
             checked_at = self._aware_now()
-            self._installer = None
             if result.update_available and result.manifest is not None:
-                self._manifest = result.manifest
-                self._state = UpdateSnapshot(
+                candidate = UpdateSnapshot(
                     UpdateStatus.AVAILABLE,
                     self._current_version,
                     available_version=str(result.manifest.version),
@@ -204,8 +221,7 @@ class UpdateService:
                     last_checked_at=checked_at,
                 )
             elif result.error_code is not None:
-                self._manifest = None
-                self._state = UpdateSnapshot(
+                candidate = UpdateSnapshot(
                     UpdateStatus.FAILED,
                     self._current_version,
                     last_checked_at=checked_at,
@@ -213,13 +229,13 @@ class UpdateService:
                     error_message="Update check failed",
                 )
             else:
-                self._manifest = None
-                self._state = UpdateSnapshot(
+                candidate = UpdateSnapshot(
                     UpdateStatus.CURRENT,
                     self._current_version,
                     last_checked_at=checked_at,
                 )
-            await asyncio.to_thread(self._persist_state)
+            await self._commit_state(candidate)
+            self._manifest = result.manifest if result.update_available else None
             return self._state
 
     async def download(self) -> UpdateSnapshot:
@@ -233,14 +249,14 @@ class UpdateService:
             destination = (
                 self._update_dir / f"RestreamStudio-Setup-{selected.version}.exe"
             ).resolve(strict=False)
-            self._state = UpdateSnapshot(
+            candidate = UpdateSnapshot(
                 UpdateStatus.DOWNLOADING,
                 self._current_version,
                 available_version=str(selected.version),
                 release_url=selected.release_url,
                 last_checked_at=self._state.last_checked_at,
             )
-            self._update_dir.mkdir(parents=True, exist_ok=True)
+            await self._commit_state(candidate)
             try:
                 result = await asyncio.to_thread(
                     self._client.download_installer_result, selected, destination
@@ -250,8 +266,7 @@ class UpdateService:
                     selected, UpdateErrorCode.DOWNLOAD_FAILED, "download failed"
                 )
             if result.status is DownloadStatus.SUCCESS and result.path is not None:
-                self._installer = result.path.resolve(strict=False)
-                self._state = UpdateSnapshot(
+                candidate = UpdateSnapshot(
                     UpdateStatus.READY,
                     self._current_version,
                     available_version=str(selected.version),
@@ -259,16 +274,20 @@ class UpdateService:
                     last_checked_at=self._state.last_checked_at,
                 )
             else:
-                self._installer = None
                 code = result.error_code
-                self._state = UpdateSnapshot(
+                candidate = UpdateSnapshot(
                     UpdateStatus.FAILED,
                     self._current_version,
                     last_checked_at=self._state.last_checked_at,
                     error_code=code.value if code is not None else "download_failed",
                     error_message="Update download failed",
                 )
-            await asyncio.to_thread(self._persist_state)
+            await self._commit_state(candidate)
+            self._installer = (
+                result.path.resolve(strict=False)
+                if result.status is DownloadStatus.SUCCESS and result.path is not None
+                else None
+            )
             return self._state
 
     async def install(self, *, current_pid: int) -> None:
@@ -283,6 +302,16 @@ class UpdateService:
             raise UpdateOperationError("update_not_ready", "A verified installer is required")
         async with self._operation_lock:
             if current_pid <= 0:
+                raise UpdateOperationError("invalid_process", "Application process is invalid")
+            try:
+                process_created_at = await asyncio.to_thread(
+                    self._process_create_time, current_pid
+                )
+            except Exception as error:
+                raise UpdateOperationError(
+                    "invalid_process", "Application process is invalid"
+                ) from error
+            if not math.isfinite(process_created_at) or process_created_at <= 0:
                 raise UpdateOperationError("invalid_process", "Application process is invalid")
             valid = await asyncio.to_thread(
                 self._verify_installer, self._installer, self._manifest
@@ -299,6 +328,12 @@ class UpdateService:
                 str(self._installer),
                 "--executable",
                 str(self._executable),
+                "--expected-sha256",
+                self._manifest.sha256,
+                "--expected-size",
+                str(self._manifest.size),
+                "--process-created-at",
+                repr(process_created_at),
             ]
             try:
                 self._launcher(command)
@@ -325,12 +360,20 @@ class UpdateService:
     def start_background(self) -> None:
         if self._background_task is None or self._background_task.done():
             self._background_task = asyncio.create_task(self._background_check())
+            self._background_task.add_done_callback(self._consume_background_result)
+
+    @staticmethod
+    def _consume_background_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
     async def _background_check(self) -> None:
         try:
             await self.automatic_check()
-        except (UpdateOperationError, asyncio.CancelledError):
+        except asyncio.CancelledError:
             raise
+        except UpdateOperationError:
+            return
         except Exception:  # noqa: BLE001 - startup update failures cannot stop the app
             return
 
@@ -366,31 +409,47 @@ class UpdateService:
         except OSError:
             return False
 
-    def _persist_state(self) -> None:
+    async def _commit_state(self, candidate: UpdateSnapshot) -> None:
+        try:
+            await asyncio.to_thread(self._state_writer, candidate)
+        except Exception as error:
+            raise UpdateOperationError(
+                "filesystem", "Update state could not be saved"
+            ) from error
+        self._state = candidate
+
+    def _persist_state(self, candidate: UpdateSnapshot) -> None:
         self._update_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "available_version": self._state.available_version,
-            "current_version": self._state.current_version,
-            "error_code": self._state.error_code,
+            "available_version": candidate.available_version,
+            "current_version": candidate.current_version,
+            "error_code": candidate.error_code,
             "last_checked_at": (
-                self._state.last_checked_at.isoformat()
-                if self._state.last_checked_at is not None
+                candidate.last_checked_at.isoformat()
+                if candidate.last_checked_at is not None
                 else None
             ),
-            "status": self._state.status.value,
+            "status": candidate.status.value,
         }
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".state.", suffix=".json.tmp", dir=self._update_dir
         )
         temporary = Path(temporary_name)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            output = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+            descriptor = -1
+            with output:
                 json.dump(payload, output, ensure_ascii=True, sort_keys=True)
                 output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, self._state_file)
         finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             temporary.unlink(missing_ok=True)
 
     def _load_state(self) -> UpdateSnapshot:
@@ -411,6 +470,12 @@ class UpdateService:
             timestamp = payload["last_checked_at"]
             checked = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
             if checked is not None and (checked.tzinfo is None or checked.utcoffset() is None):
+                return idle
+            if checked is not None and checked.astimezone(UTC) > self._aware_now():
+                try:
+                    self._state_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 return idle
             if status in {
                 UpdateStatus.CHECKING,

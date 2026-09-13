@@ -1,0 +1,114 @@
+name: Verified Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.14.0'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Validate tag and source versions
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "release tag is not exact canonical SemVer: $tag"
+          }
+          $version = $tag.Substring(1)
+          $escaped = [Regex]::Escape($version)
+          if ((Get-Content pyproject.toml -Raw) -notmatch "(?m)^version = `"$escaped`"$") {
+            throw 'pyproject.toml version does not match the release tag'
+          }
+          if ((Get-Content package.json -Raw | ConvertFrom-Json).version -cne $version) {
+            throw 'package.json version does not match the release tag'
+          }
+          if ((Get-Content packaging/restream-studio.iss -Raw) -notmatch "(?m)^#define MyAppVersion `"$escaped`"$") {
+            throw 'Inno Setup version does not match the release tag'
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install Python build and test dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --disable-pip-version-check '.[dev]'
+
+      - name: Verify locked Node dependency closure
+        shell: pwsh
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Provision pinned release tools
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/provision-release-tools.ps1
+
+      - name: Run the complete release gate
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1
+
+      - name: Build the fixed Windows installer
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Clean
+
+      - name: Write verified update manifest
+        shell: pwsh
+        run: |
+          $version = '${{ steps.release.outputs.version }}'
+          $tag = '${{ steps.release.outputs.tag }}'
+          $installer = "dist/installer/RestreamStudio-Setup-$version.exe"
+          .venv\Scripts\python.exe scripts/write-update-manifest.py `
+            --version $version `
+            --installer $installer `
+            --repository algz-glitch/restream-studio `
+            --tag $tag `
+            --output dist/latest.json
+
+      - name: Upload verified workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RestreamStudio-${{ steps.release.outputs.version }}
+          path: |
+            dist/installer/RestreamStudio-Setup-${{ steps.release.outputs.version }}.exe
+            dist/latest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.release.outputs.tag }}'
+          $version = '${{ steps.release.outputs.version }}'
+          $installer = "dist/installer/RestreamStudio-Setup-$version.exe"
+          gh release create $tag $installer 'dist/latest.json' `
+            --repo '${{ github.repository }}' `
+            --verify-tag `
+            --generate-notes `
+            --title "Restream Studio $version"

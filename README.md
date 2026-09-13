@@ -4,10 +4,22 @@ Restream Studio 是仅监听 `127.0.0.1` 的 Windows 本地转播工作台。它
 
 ## 安装与启动
 
-### 目录分发包
+### 标准 Windows 安装器
+
+1. 从 GitHub Releases 下载 `RestreamStudio-Setup-<version>.exe`，运行后默认安装到
+   `%LOCALAPPDATA%\Programs\RestreamStudio`。
+2. 安装器创建桌面与开始菜单快捷方式，并在 Windows“已安装的应用”中登记卸载入口。
+3. 安装过程只为已安装的 `RestreamStudio.exe` 配置 IPv4 `127.0.0.1` 入站规则；防火墙步骤需要管理员确认，应用本身仍按当前用户安装和运行。
+4. 数据默认写入 `%LOCALAPPDATA%\RestreamStudio`。升级与默认卸载均保留数据；只有在卸载向导中显式选择删除用户数据时才清理。
+
+安装器和主程序当前均**未签名**，Windows SmartScreen 可能显示“未知发布者”。应从仓库的
+GitHub Release 页面下载，并按同一 Release 中 `latest.json` 的 `size` 和 `sha256` 核对资产。
+
+### 便携目录分发包
 
 1. 将整个 `RestreamStudio` 目录解压到固定位置；不要只复制 EXE。
-2. 双击 `RestreamStudio.exe`，或在 PowerShell 中运行它。
+2. 双击 `RestreamStudio.exe`，或在 PowerShell 中运行它；便携模式可运行
+   `Enable-Localhost.cmd` 配置仅绑定该 EXE 的 loopback 防火墙规则。
 3. 浏览器打开 `http://127.0.0.1:8000`。服务不监听局域网地址。
 4. 数据默认写入 `%LOCALAPPDATA%\RestreamStudio`，不会写回程序目录。
 
@@ -58,17 +70,22 @@ powershell -ExecutionPolicy Bypass -File scripts/e2e-local.ps1
 
 停止应用后再备份。配置数据库包含由当前 Windows 用户 DPAPI 保护的目标密钥，不能作为“无秘密”导出文件发送。无秘密导出只记录：应用版本、来源平台名称、目标类型、启用状态、时间戳、脱敏事件和测试结论；不要复制 SQLite、cookies、`.env`、密钥、日志原文或用户媒体。恢复真实目标时由账号持有人重新输入官方凭据。
 
-## 升级、回滚与卸载
+## 自动更新、回滚与卸载
 
-1. **升级前**：停止全部输出和 EXE；备份 `%LOCALAPPDATA%\RestreamStudio` 到仅当前用户可读的位置，并记录旧程序目录版本。
-2. **升级**：解压到新目录，不覆盖正在使用的旧目录；启动新版本并先检查 `/health` 和配置，再做 `local-test`。
-3. **回滚**：停止新版本，恢复升级前的数据目录备份，然后从保留的旧程序目录启动。不要让两个版本同时访问同一数据库。
-4. **卸载**：停止应用，删除程序目录。确认不再需要配置后，再手工删除 `%LOCALAPPDATA%\RestreamStudio`；保留该目录会保留本机配置。
+1. **检查**：应用从公开地址
+   `https://github.com/algz-glitch/restream-studio/releases/latest/download/latest.json`
+   检查更新。清单必须通过 schema 1、严格 SemVer、仓库 URL、文件大小和 SHA-256 校验。
+2. **下载**：应用不需要 GitHub Token，不读取浏览器 Cookie，也不保存 GitHub 凭据。安装器先写入临时文件，完整校验后才进入“待安装”状态。
+3. **安装**：先停止全部输出，再点击“安装并重启”。直播运行时更新安装会被阻止。独立更新助手等待主进程退出后执行安装器。
+4. **升级前备份**：把 `%LOCALAPPDATA%\RestreamStudio` 备份到仅当前用户可读的位置，并保留上一版安装器及其 SHA-256。
+5. **回滚**：停止新版本，运行保留的旧版安装器；只有数据格式兼容性出现问题时才恢复对应版本的数据备份。不要让两个版本同时访问同一数据库。
+6. **卸载**：从 Windows“已安装的应用”卸载。程序、快捷方式和安装版防火墙规则会被移除；用户数据默认保留，可在卸载向导中显式选择同时删除。
 
 ## 构建与验证
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+powershell -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Clean
 powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
 ```
 
@@ -78,10 +95,22 @@ powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
 `integrity`，并确认 Windows x64 所需的 esbuild/Rollup 可选运行时存在。可在不访问网络的
 前提下运行 `npm ci --dry-run --offline --ignore-scripts` 检查当前锁与缓存的安装闭包。
 
+## 发布
+
+- `.github/workflows/release.yml` 只响应严格 `v<major>.<minor>.<patch>` tag；普通分支 push 不发布。
+- tag 必须与 `pyproject.toml`、`package.json` 和 Inno Setup 版本完全一致。
+- Windows CI 固定 Python 3.12、Node.js 22.14.0，并通过 `package-lock.json` 执行 `npm ci`。
+- CI 不依赖 runner 的 FFmpeg、ffprobe 或 MediaMTX PATH：`scripts/provision-release-tools.ps1`
+  下载固定版本归档并先校验固定 SHA-256，再运行完整 `scripts/verify.ps1` 和安装器构建。
+- 所有门禁通过后，CI 上传安装器与 `latest.json` 为 workflow artifact，并使用 GitHub Actions
+  的短期仓库令牌将两项资产附加到对应 GitHub Release。令牌只存在于 CI 发布步骤，不进入应用、安装器或更新清单。
+- 发布者先更新三处版本并合并经过验证的提交，再由仓库维护者创建并推送签名或受保护的
+  `v*` tag。不要为测试创建 tag；推送 tag 会触发真实 Release 发布。
+
 ## 已知限制
 
 - 当前自动化不代替真实平台验收，也不能保证平台长期开放 RTMP 权限或接口行为不变。
-- 本地 E2E 依赖独立安装的 MediaMTX；它不是桌面运行时的一部分。
-- 目录包未提供代码签名、安装器或自动更新；Windows SmartScreen 可能提示未知发布者。
+- 本地开发 E2E 依赖独立的 MediaMTX；它不是桌面运行时的一部分。发布 CI 会临时下载并校验它，只用于门禁。
+- 安装器和主 EXE 尚无代码签名；Windows SmartScreen 信任未验收，未知发布者提示仍可能出现。
 - 默认待机文件随包提供，但具体待机选择和平台端画面仍需操作者确认。
 - 包仅面向构建时验证的 Windows x64 环境；跨架构运行未验收。

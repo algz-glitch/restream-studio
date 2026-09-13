@@ -16,14 +16,86 @@ def _read(relative: str) -> str:
 def test_windows_packaging_files_exist() -> None:
     required = (
         "packaging/restream-studio.spec",
+        "packaging/restream-studio.iss",
+        "packaging/firewall-install.ps1",
+        "packaging/firewall-remove.ps1",
         "packaging/Enable-Localhost.ps1",
         "packaging/Enable-Localhost.cmd",
         "scripts/dev.ps1",
         "scripts/verify.ps1",
         "scripts/package.ps1",
+        "scripts/build-installer.ps1",
         "README.md",
     )
     assert all((ROOT / item).is_file() for item in required)
+
+
+def test_inno_installer_has_stable_per_user_lifecycle_contract() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    assert "AppId={{6D5EE4A8-17C8-4DA0-84F8-28710EAB90F4}" in installer
+    assert "DefaultDirName={localappdata}\\Programs\\RestreamStudio" in installer
+    assert "PrivilegesRequired=lowest" in installer
+    assert "ArchitecturesAllowed=x64compatible" in installer
+    assert "ArchitecturesInstallIn64BitMode=x64compatible" in installer
+    assert "UninstallDisplayName=Restream Studio" in installer
+    assert 'Name: "{autodesktop}\\Restream Studio"' in installer
+    assert 'Name: "{group}\\Restream Studio"' in installer
+    assert "RestreamStudio.exe" in installer
+    assert "RestreamStudioUpdateHelper.exe" in installer
+    assert "firewall-install.ps1" in installer
+    assert "firewall-remove.ps1" in installer
+    assert "[UninstallRun]" in installer
+    assert "{localappdata}\\RestreamStudio" in installer
+    assert "ShouldDeleteUserData" in installer
+    assert "mbConfirmation" in installer
+    assert "MB_DEFBUTTON2" in installer
+
+
+def test_firewall_hooks_self_elevate_and_scope_both_loopback_ends_to_program() -> None:
+    install = _read("packaging/firewall-install.ps1")
+    remove = _read("packaging/firewall-remove.ps1")
+
+    for script in (install, remove):
+        assert "WindowsBuiltInRole]::Administrator" in script
+        assert "-Verb RunAs" in script
+        assert "RestreamStudio.exe" in script
+        assert "127.0.0.1" in script
+        assert "$application.Program -ieq $resolvedExecutable" in script
+        assert "$address.LocalAddress -contains '127.0.0.1'" in script
+        assert "$address.RemoteAddress -contains '127.0.0.1'" in script
+
+    assert "New-NetFirewallRule" in install
+    assert "-Program $resolvedExecutable" in install
+    assert "-Direction Inbound" in install
+    assert "-Protocol TCP" in install
+    assert "-LocalAddress '127.0.0.1'" in install
+    assert "-RemoteAddress '127.0.0.1'" in install
+    assert "Remove-NetFirewallRule" in remove
+
+
+def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery() -> None:
+    spec = _read("packaging/restream-studio.spec")
+    package = _read("scripts/package.ps1")
+    build = _read("scripts/build-installer.ps1")
+    verify = _read("scripts/verify.ps1")
+
+    assert '"packaging" / "update-helper-entry.py"' in spec
+    assert 'name="RestreamStudioUpdateHelper"' in spec
+    assert (
+        "from restream_studio.update.helper import main"
+        in _read("packaging/update-helper-entry.py")
+    )
+    assert "RestreamStudioUpdateHelper.exe" in package
+    assert "RestreamStudioUpdateHelper.exe" in verify
+    assert "ISCC_PATH" in build
+    assert "G:\\Apps\\Inno\\ISCC.exe" in build
+    assert "Get-Command 'ISCC.exe'" in build
+    assert "winget" not in build.casefold()
+    assert "RestreamStudio-Setup-0.1.0.exe" in build
+    assert "Get-FileHash" in build
+    assert "SHA256=" in build
+    assert "Start-Process -FilePath $updateHelper" in build
+    assert "$helperProcess.ExitCode -ne 2" in build
 
 
 def test_packaged_loopback_setup_is_program_scoped_and_loopback_only() -> None:

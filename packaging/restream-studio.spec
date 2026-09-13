@@ -56,6 +56,15 @@ analysis = Analysis(
     excludes=["pytest", "mypy", "ruff", "playwright", "tests"],
     noarchive=False,
 )
+helper_analysis = Analysis(
+    [str(ROOT / "packaging" / "update-helper-entry.py")],
+    pathex=[str(ROOT / "src")],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
+    excludes=["pytest", "mypy", "ruff", "playwright", "tests"],
+    noarchive=False,
+)
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz,
@@ -67,10 +76,24 @@ exe = EXE(
     disable_windowed_traceback=False,
     contents_directory="_internal",
 )
+helper_pyz = PYZ(helper_analysis.pure)
+helper_exe = EXE(
+    helper_pyz,
+    helper_analysis.scripts,
+    [],
+    exclude_binaries=True,
+    name="RestreamStudioUpdateHelper",
+    console=False,
+    disable_windowed_traceback=False,
+    contents_directory="_internal",
+)
 distribution = COLLECT(
     exe,
+    helper_exe,
     analysis.binaries,
     analysis.datas,
+    helper_analysis.binaries,
+    helper_analysis.datas,
     strip=False,
     upx=False,
     name="RestreamStudio",

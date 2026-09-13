@@ -6,14 +6,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$RuleName = 'Restream Studio (Loopback TCP)'
+$RuleName = 'RestreamStudio-Installed-Localhost'
 $resolvedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
 
-if ([IO.Path]::GetFileName($resolvedExecutable) -ine 'RestreamStudio.exe') {
-    throw 'firewall target must be RestreamStudio.exe'
-}
-if (-not (Test-Path -LiteralPath $resolvedExecutable -PathType Leaf)) {
-    throw "firewall target is missing: $resolvedExecutable"
+if (-not [IO.Path]::IsPathFullyQualified($resolvedExecutable) -or
+    [IO.Path]::GetFileName($resolvedExecutable) -ine 'RestreamStudio.exe') {
+    throw 'firewall target must be an absolute RestreamStudio.exe path'
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -29,22 +27,44 @@ if (-not $isAdministrator) {
     )
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments `
         -Verb RunAs -Wait -PassThru
-    if ($process.ExitCode -ne 0) {
-        throw "elevated firewall installation failed with exit code $($process.ExitCode)"
+    try {
+        if ($process.ExitCode -ne 0) {
+            throw "elevated firewall installation failed with exit code $($process.ExitCode)"
+        }
     }
+    finally { $process.Dispose() }
     exit 0
 }
 
-Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue |
-    Where-Object {
-        $application = $_ | Get-NetFirewallApplicationFilter
-        $address = $_ | Get-NetFirewallAddressFilter
-        $application.Program -ieq $resolvedExecutable -and
-        $address.LocalAddress -contains '127.0.0.1' -and
-        $address.RemoteAddress -contains '127.0.0.1'
-    } |
+Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule
 
-New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
-    -Program $resolvedExecutable -Protocol TCP -LocalAddress '127.0.0.1' `
-    -RemoteAddress '127.0.0.1' -Profile Any -EdgeTraversalPolicy Block | Out-Null
+try {
+    New-NetFirewallRule -Name $RuleName -DisplayName 'Restream Studio (Loopback TCP)' `
+        -Direction Inbound -Action Allow -Enabled True -Program $resolvedExecutable `
+        -Protocol TCP -LocalAddress '127.0.0.1' -RemoteAddress '127.0.0.1' `
+        -Profile Any -EdgeTraversalPolicy Block | Out-Null
+
+    $rules = @(Get-NetFirewallRule -Name $RuleName -ErrorAction Stop)
+    if ($rules.Count -ne 1) { throw 'firewall rule count verification failed' }
+    $rule = $rules[0]
+    $application = $rule | Get-NetFirewallApplicationFilter
+    $port = $rule | Get-NetFirewallPortFilter
+    $address = $rule | Get-NetFirewallAddressFilter
+    $exact = (
+        $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow' -and
+        $rule.Enabled -eq 'True' -and
+        $application.Program -ieq $resolvedExecutable -and
+        $port.Protocol -eq 'TCP' -and
+        @($address.LocalAddress).Count -eq 1 -and
+        @($address.LocalAddress)[0] -eq '127.0.0.1' -and
+        @($address.RemoteAddress).Count -eq 1 -and
+        @($address.RemoteAddress)[0] -eq '127.0.0.1'
+    )
+    if (-not $exact) { throw 'firewall rule scope verification failed' }
+}
+catch {
+    Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule
+    throw
+}

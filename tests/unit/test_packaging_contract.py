@@ -44,11 +44,37 @@ def test_inno_installer_has_stable_per_user_lifecycle_contract() -> None:
     assert "RestreamStudioUpdateHelper.exe" in installer
     assert "firewall-install.ps1" in installer
     assert "firewall-remove.ps1" in installer
-    assert "[UninstallRun]" in installer
     assert "{localappdata}\\RestreamStudio" in installer
     assert "ShouldDeleteUserData" in installer
+    assert "/DELETEUSERDATA=1" in installer
+    assert "UninstallSilent" in installer
+    assert "ExpandConstant('{localappdata}\\RestreamStudio')" in installer
     assert "mbConfirmation" in installer
     assert "MB_DEFBUTTON2" in installer
+    assert "[Run]" not in installer
+    assert "[UninstallRun]" not in installer
+
+
+def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    assert "function PrepareToInstall" in installer
+    assert "Exec(" in installer
+    assert "ResultCode" in installer
+    assert "ResultCode <> 0" in installer
+    assert "CurUninstallStepChanged" in installer
+    assert "CurUninstallStep = usUninstall" in installer
+    assert "Abort;" in installer
+    assert "ExtractTemporaryFile('firewall-install.ps1')" in installer
+    assert "Flags: dontcopy" in installer
+
+
+def test_inno_offers_checked_postinstall_launch_only_when_interactive() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    assert "LaunchAfterInstallCheck" in installer
+    assert "WizardForm.FinishedPage" in installer
+    assert "not WizardSilent" in installer
+    assert "CurPageID = wpFinished" in installer
+    assert "ewNoWait" in installer
 
 
 def test_firewall_hooks_self_elevate_and_scope_both_loopback_ends_to_program() -> None:
@@ -59,18 +85,23 @@ def test_firewall_hooks_self_elevate_and_scope_both_loopback_ends_to_program() -
         assert "WindowsBuiltInRole]::Administrator" in script
         assert "-Verb RunAs" in script
         assert "RestreamStudio.exe" in script
-        assert "127.0.0.1" in script
-        assert "$application.Program -ieq $resolvedExecutable" in script
-        assert "$address.LocalAddress -contains '127.0.0.1'" in script
-        assert "$address.RemoteAddress -contains '127.0.0.1'" in script
+        assert "$RuleName = 'RestreamStudio-Installed-Localhost'" in script
+        assert "Get-NetFirewallRule -Name $RuleName" in script
 
+    assert "127.0.0.1" in install
     assert "New-NetFirewallRule" in install
+    assert "-Name $RuleName" in install
     assert "-Program $resolvedExecutable" in install
     assert "-Direction Inbound" in install
     assert "-Protocol TCP" in install
     assert "-LocalAddress '127.0.0.1'" in install
     assert "-RemoteAddress '127.0.0.1'" in install
+    assert "$application.Program -ieq $resolvedExecutable" in install
+    assert "$port.Protocol -eq 'TCP'" in install
+    assert "$address.LocalAddress" in install
+    assert "$address.RemoteAddress" in install
     assert "Remove-NetFirewallRule" in remove
+    assert "firewall rule removal verification failed" in remove
 
 
 def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery() -> None:
@@ -90,12 +121,28 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
     assert "ISCC_PATH" in build
     assert "G:\\Apps\\Inno\\ISCC.exe" in build
     assert "Get-Command 'ISCC.exe'" in build
-    assert "winget" not in build.casefold()
+    assert "JRSoftware.InnoSetup" in build
+    assert "6.7.3" in build
+    assert "--exact" in build
+    assert build.index("G:\\Apps\\Inno\\ISCC.exe") < build.index("winget.exe")
     assert "RestreamStudio-Setup-0.1.0.exe" in build
     assert "Get-FileHash" in build
     assert "SHA256=" in build
-    assert "Start-Process -FilePath $updateHelper" in build
+    assert "Start-Process -FilePath $copiedUpdateHelper" in build
     assert "$helperProcess.ExitCode -ne 2" in build
+    assert "Copy-Item -LiteralPath $updateHelper" in build
+    assert "RestreamStudioUpdateHelper-smoke" in build
+
+
+def test_update_helper_is_a_standalone_onefile_executable() -> None:
+    spec = _read("packaging/restream-studio.spec")
+    helper = spec[spec.index("helper_exe = EXE(") : spec.index("distribution = COLLECT(")]
+    distribution = spec[spec.index("distribution = COLLECT(") :]
+    assert "helper_analysis.binaries" in helper
+    assert "helper_analysis.datas" in helper
+    assert "exclude_binaries=True" not in helper
+    assert "helper_analysis.binaries" not in distribution
+    assert "helper_analysis.datas" not in distribution
 
 
 def test_packaged_loopback_setup_is_program_scoped_and_loopback_only() -> None:

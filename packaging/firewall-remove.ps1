@@ -6,11 +6,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$RuleName = 'Restream Studio (Loopback TCP)'
+$RuleName = 'RestreamStudio-Installed-Localhost'
 $resolvedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
 
-if ([IO.Path]::GetFileName($resolvedExecutable) -ine 'RestreamStudio.exe') {
-    throw 'firewall target must be RestreamStudio.exe'
+if (-not [IO.Path]::IsPathFullyQualified($resolvedExecutable) -or
+    [IO.Path]::GetFileName($resolvedExecutable) -ine 'RestreamStudio.exe') {
+    throw 'firewall target must be an absolute RestreamStudio.exe path'
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -26,18 +27,17 @@ if (-not $isAdministrator) {
     )
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments `
         -Verb RunAs -Wait -PassThru
-    if ($process.ExitCode -ne 0) {
-        throw "elevated firewall removal failed with exit code $($process.ExitCode)"
+    try {
+        if ($process.ExitCode -ne 0) {
+            throw "elevated firewall removal failed with exit code $($process.ExitCode)"
+        }
     }
+    finally { $process.Dispose() }
     exit 0
 }
 
-Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue |
-    Where-Object {
-        $application = $_ | Get-NetFirewallApplicationFilter
-        $address = $_ | Get-NetFirewallAddressFilter
-        $application.Program -ieq $resolvedExecutable -and
-        $address.LocalAddress -contains '127.0.0.1' -and
-        $address.RemoteAddress -contains '127.0.0.1'
-    } |
+Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule
+if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) {
+    throw 'firewall rule removal verification failed'
+}

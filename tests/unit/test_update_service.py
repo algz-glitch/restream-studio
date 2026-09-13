@@ -425,6 +425,38 @@ async def test_download_becomes_ready_and_install_revalidates_before_launch(
 
 
 @pytest.mark.asyncio
+async def test_frozen_helper_is_copied_outside_app_before_launch(tmp_path: Path) -> None:
+    launched: list[list[str]] = []
+    app_dir = tmp_path / "installed"
+    app_dir.mkdir()
+    executable = (app_dir / "RestreamStudio.exe").resolve()
+    executable.write_bytes(b"app")
+    installed_helper = (app_dir / "RestreamStudioUpdateHelper.exe").resolve()
+    installed_helper.write_bytes(b"standalone-onefile-helper")
+    update_dir = (tmp_path / "user-data" / "update").resolve()
+    service = UpdateService(
+        update_dir,
+        client=FakeClient(UpdateCheckResult.available(manifest())),
+        executable=executable,
+        helper_command=(str(installed_helper),),
+        launcher=lambda command: launched.append(list(command)),
+        process_create_time=lambda _pid: 123.0,
+    )
+    await service.check()
+    await service.download()
+
+    await service.install(current_pid=123)
+
+    copied_helper = Path(launched[0][0])
+    assert copied_helper.is_absolute()
+    assert copied_helper != installed_helper
+    assert copied_helper.parent == update_dir / "temp"
+    assert copied_helper.name.startswith("RestreamStudioUpdateHelper-")
+    assert copied_helper.read_bytes() == installed_helper.read_bytes()
+    assert str(installed_helper) not in launched[0]
+
+
+@pytest.mark.asyncio
 async def test_background_check_does_not_block_startup_and_shutdown_cancels_it(
     tmp_path: Path,
 ) -> None:

@@ -22,7 +22,6 @@ function Resolve-Iscc {
         if (Test-Path -LiteralPath $configured -PathType Leaf) {
             return (Resolve-Path -LiteralPath $configured).Path
         }
-        throw 'ISCC_PATH points to a missing file'
     }
 
     $pinnedLocalPath = 'G:\Apps\Inno\ISCC.exe'
@@ -33,7 +32,24 @@ function Resolve-Iscc {
     $command = Get-Command 'ISCC.exe' -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($null -ne $command) { return $command.Source }
-    throw 'ISCC.exe is unavailable; set ISCC_PATH or install Inno Setup explicitly'
+
+    $winget = (Get-Command 'winget.exe' -CommandType Application -ErrorAction Stop).Source
+    Invoke-External $winget @(
+        'install', '--id', 'JRSoftware.InnoSetup', '--version', '6.7.3', '--exact',
+        '--scope', 'user', '--silent', '--accept-package-agreements',
+        '--accept-source-agreements', '--disable-interactivity'
+    )
+    $installedCandidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    )
+    foreach ($candidate in $installedCandidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    throw 'winget completed but Inno Setup 6.7.3 ISCC.exe was not found'
 }
 
 if ($Clean -and (Test-Path -LiteralPath $InstallerDirectory)) {
@@ -58,14 +74,21 @@ foreach ($required in ('RestreamStudio.exe', 'RestreamStudioUpdateHelper.exe')) 
     }
 }
 $updateHelper = Join-Path $distribution 'RestreamStudioUpdateHelper.exe'
-$helperProcess = Start-Process -FilePath $updateHelper -ArgumentList '--invalid' `
+$helperSmokeDirectory = Join-Path $Root "build\RestreamStudioUpdateHelper-smoke-$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Force -Path $helperSmokeDirectory | Out-Null
+$copiedUpdateHelper = Join-Path $helperSmokeDirectory 'RestreamStudioUpdateHelper.exe'
+Copy-Item -LiteralPath $updateHelper -Destination $copiedUpdateHelper
+$helperProcess = Start-Process -FilePath $copiedUpdateHelper -ArgumentList '--invalid' `
     -WindowStyle Hidden -Wait -PassThru
 try {
     if ($helperProcess.ExitCode -ne 2) {
         throw "packaged update helper smoke failed with exit code $($helperProcess.ExitCode)"
     }
 }
-finally { $helperProcess.Dispose() }
+finally {
+    $helperProcess.Dispose()
+    Remove-Item -LiteralPath $helperSmokeDirectory -Recurse -Force
+}
 
 $iscc = Resolve-Iscc
 New-Item -ItemType Directory -Force -Path $InstallerDirectory | Out-Null

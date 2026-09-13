@@ -8,9 +8,11 @@ import inspect
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -372,8 +374,16 @@ class UpdateService:
                 raise UpdateOperationError(
                     "installer_verification_failed", "Installer verification failed"
                 )
+            try:
+                helper_command, copied_helper = await asyncio.to_thread(
+                    self._prepare_helper_command
+                )
+            except OSError as error:
+                raise UpdateOperationError(
+                    "helper_launch_failed", "Update helper could not be prepared"
+                ) from error
             command = [
-                *self._helper_command,
+                *helper_command,
                 "--pid",
                 str(current_pid),
                 "--installer",
@@ -390,6 +400,8 @@ class UpdateService:
             try:
                 self._launcher(command)
             except OSError as error:
+                if copied_helper is not None:
+                    copied_helper.unlink(missing_ok=True)
                 raise UpdateOperationError(
                     "helper_launch_failed", "Update helper could not be started"
                 ) from error
@@ -397,6 +409,33 @@ class UpdateService:
             task = asyncio.create_task(self._invoke_shutdown())
             self._shutdown_tasks.add(task)
             task.add_done_callback(self._shutdown_tasks.discard)
+
+    def _prepare_helper_command(self) -> tuple[tuple[str, ...], Path | None]:
+        if len(self._helper_command) != 1:
+            return self._helper_command, None
+        source = Path(self._helper_command[0]).resolve(strict=False)
+        if source.name.casefold() != "restreamstudioupdatehelper.exe".casefold():
+            return self._helper_command, None
+        if not source.is_file():
+            raise FileNotFoundError(source)
+
+        temp_dir = (self._update_dir / "temp").resolve(strict=False)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for stale in temp_dir.glob("RestreamStudioUpdateHelper-*.exe"):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+        destination = (
+            temp_dir / f"RestreamStudioUpdateHelper-{uuid.uuid4().hex}.exe"
+        ).resolve(strict=False)
+        partial = destination.with_suffix(".exe.partial")
+        try:
+            shutil.copyfile(source, partial)
+            os.replace(partial, destination)
+        finally:
+            partial.unlink(missing_ok=True)
+        return (str(destination),), destination
 
     def _raise_if_installing(self) -> None:
         if self._install_started:

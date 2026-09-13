@@ -16,22 +16,66 @@ function Invoke-External {
     if ($LASTEXITCODE -ne 0) { throw "$FilePath failed with exit code $LASTEXITCODE" }
 }
 
+function Assert-IsccVersion {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$SourceLabel
+    )
+    $probeRoot = Join-Path $Root "build\iscc-version-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
+        $probe = Join-Path $probeRoot 'version-probe.iss'
+        @'
+[Setup]
+AppName=ISCC Version Probe
+AppVersion=1.0
+DefaultDirName={tmp}\ISCC-Version-Probe
+PrivilegesRequired=lowest
+Uninstallable=no
+OutputDir=.
+OutputBaseFilename=version-probe
+'@ | Set-Content -LiteralPath $probe -Encoding UTF8
+        $output = @(& $Path $probe 2>&1 | ForEach-Object { [string]$_ })
+        $exitCode = $LASTEXITCODE
+        $output | ForEach-Object { Write-Verbose $_ }
+        $expected = 'Compiler engine version: Inno Setup 6.7.3'
+        if ($exitCode -ne 0 -or $output -notcontains $expected) {
+            throw "$SourceLabel must point to Inno Setup 6.7.3"
+        }
+        return (Resolve-Path -LiteralPath $Path).Path
+    }
+    finally {
+        if (Test-Path -LiteralPath $probeRoot) {
+            Remove-Item -LiteralPath $probeRoot -Recurse -Force
+        }
+    }
+}
+
 function Resolve-Iscc {
     $configured = [Environment]::GetEnvironmentVariable('ISCC_PATH')
     if ($configured) {
-        if (Test-Path -LiteralPath $configured -PathType Leaf) {
-            return (Resolve-Path -LiteralPath $configured).Path
+        if (-not (Test-Path -LiteralPath $configured -PathType Leaf)) {
+            throw 'ISCC_PATH points to a missing file'
         }
+        try {
+            return Assert-IsccVersion -Path $configured -SourceLabel 'ISCC_PATH'
+        }
+        catch { throw 'ISCC_PATH must point to Inno Setup 6.7.3' }
     }
 
-    $pinnedLocalPath = 'G:\Apps\Inno\ISCC.exe'
+    $pinnedLocalPath = 'F:\printflow-ai\workbench-v4-functional\dist\tools\inno-setup-6.7.3\ISCC.exe'
     if (Test-Path -LiteralPath $pinnedLocalPath -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $pinnedLocalPath).Path
+        return Assert-IsccVersion -Path $pinnedLocalPath -SourceLabel 'pinned local ISCC'
     }
 
     $command = Get-Command 'ISCC.exe' -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
-    if ($null -ne $command) { return $command.Source }
+    if ($null -ne $command) {
+        try {
+            return Assert-IsccVersion -Path $command.Source -SourceLabel 'PATH ISCC.exe'
+        }
+        catch { Write-Verbose $_.Exception.Message }
+    }
 
     $winget = (Get-Command 'winget.exe' -CommandType Application -ErrorAction Stop).Source
     Invoke-External $winget @(
@@ -46,7 +90,7 @@ function Resolve-Iscc {
     )
     foreach ($candidate in $installedCandidates) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return (Resolve-Path -LiteralPath $candidate).Path
+            return Assert-IsccVersion -Path $candidate -SourceLabel 'winget ISCC.exe'
         }
     }
     throw 'winget completed but Inno Setup 6.7.3 ISCC.exe was not found'
@@ -75,19 +119,31 @@ foreach ($required in ('RestreamStudio.exe', 'RestreamStudioUpdateHelper.exe')) 
 }
 $updateHelper = Join-Path $distribution 'RestreamStudioUpdateHelper.exe'
 $helperSmokeDirectory = Join-Path $Root "build\RestreamStudioUpdateHelper-smoke-$([Guid]::NewGuid().ToString('N'))"
-New-Item -ItemType Directory -Force -Path $helperSmokeDirectory | Out-Null
-$copiedUpdateHelper = Join-Path $helperSmokeDirectory 'RestreamStudioUpdateHelper.exe'
-Copy-Item -LiteralPath $updateHelper -Destination $copiedUpdateHelper
-$helperProcess = Start-Process -FilePath $copiedUpdateHelper -ArgumentList '--invalid' `
-    -WindowStyle Hidden -Wait -PassThru
+$helperProcess = $null
 try {
+    New-Item -ItemType Directory -Force -Path $helperSmokeDirectory | Out-Null
+    $copiedUpdateHelper = Join-Path $helperSmokeDirectory `
+        "RestreamStudioUpdateHelper-smoke-$([Guid]::NewGuid().ToString('N')).exe"
+    Copy-Item -LiteralPath $updateHelper -Destination $copiedUpdateHelper
+    $helperProcess = Start-Process -FilePath $copiedUpdateHelper -ArgumentList '--invalid' `
+        -WindowStyle Hidden -Wait -PassThru
     if ($helperProcess.ExitCode -ne 2) {
         throw "packaged update helper smoke failed with exit code $($helperProcess.ExitCode)"
     }
+    $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ((Test-Path -LiteralPath $helperSmokeDirectory) -and
+        [DateTime]::UtcNow -lt $cleanupDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (Test-Path -LiteralPath $helperSmokeDirectory) {
+        throw 'packaged update helper did not clean its unique runtime directory'
+    }
 }
 finally {
-    $helperProcess.Dispose()
-    Remove-Item -LiteralPath $helperSmokeDirectory -Recurse -Force
+    if ($null -ne $helperProcess) { $helperProcess.Dispose() }
+    if (Test-Path -LiteralPath $helperSmokeDirectory) {
+        Remove-Item -LiteralPath $helperSmokeDirectory -Recurse -Force
+    }
 }
 
 $iscc = Resolve-Iscc

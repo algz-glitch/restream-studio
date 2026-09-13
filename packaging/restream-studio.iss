@@ -25,9 +25,9 @@ RestartApplications=no
 DisableProgramGroupPage=yes
 
 [Files]
-Source: "..\dist\RestreamStudio\*"; DestDir: "{app}"; Excludes: "RestreamStudioUpdateHelper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\RestreamStudio\RestreamStudio.exe"; DestDir: "{app}"; Flags: ignoreversion; AfterInstall: ConfigureInstalledFirewall
+Source: "..\dist\RestreamStudio\*"; DestDir: "{app}"; Excludes: "RestreamStudio.exe,RestreamStudioUpdateHelper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\dist\RestreamStudio\RestreamStudioUpdateHelper.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "firewall-install.ps1"; Flags: dontcopy
 Source: "firewall-install.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion
 Source: "firewall-remove.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion
 
@@ -59,6 +59,143 @@ begin
   end;
 end;
 
+function HexDigit(const Value: Integer): String;
+begin
+  if Value < 10 then
+    Result := Chr(Ord('0') + Value)
+  else
+    Result := Chr(Ord('a') + Value - 10);
+end;
+
+function HexEncode(const Value: String): String;
+var
+  Index: Integer;
+  Character: Integer;
+begin
+  Result := '';
+  for Index := 1 to Length(Value) do
+  begin
+    Character := Ord(Value[Index]);
+    Result := Result + HexDigit((Character shr 12) and 15) +
+      HexDigit((Character shr 8) and 15) +
+      HexDigit((Character shr 4) and 15) + HexDigit(Character and 15);
+  end;
+end;
+
+function RunElevatedPowerShell(const Command, ApplicationPath: String;
+  var ResultCode: Integer): Boolean;
+var
+  Parameters: String;
+begin
+  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& { ' +
+    Command + ' }" ' + HexEncode(ApplicationPath);
+  Result := ShellExec('runas',
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function InstalledFirewallCommand(): String;
+begin
+  Result :=
+    '$ErrorActionPreference=''Stop'';' +
+    '$h=$args[0];if(($h.Length%4)-ne 0){throw ''bad path''};' +
+    '$p=-join (for($i=0;$i-lt $h.Length;$i+=4){' +
+      '[char][Convert]::ToUInt16($h.Substring($i,4),16)});' +
+    'if((-not [IO.Path]::IsPathFullyQualified($p))-or' +
+      '([IO.Path]::GetFileName($p)-ine ''RestreamStudio.exe'')){throw ''bad path''};' +
+    '$n=''RestreamStudio-Installed-Localhost'';' +
+    '$legacy=''Restream Studio (Loopback TCP)'';' +
+    '$hadValid=$false;' +
+    'foreach($r in @(Get-NetFirewallRule -Name $n -EA SilentlyContinue)){' +
+      '$a=$r|Get-NetFirewallApplicationFilter;$q=$r|Get-NetFirewallPortFilter;' +
+      '$d=$r|Get-NetFirewallAddressFilter;' +
+      'if(($r.Direction-eq ''Inbound'')-and($r.Action-eq ''Allow'')-and' +
+      '($r.Enabled-eq ''True'')-and($a.Program-ieq $p)-and' +
+      '($q.Protocol-eq ''TCP'')-and(@($d.LocalAddress).Count-eq 1)-and' +
+      '(@($d.LocalAddress)[0]-eq ''127.0.0.1'')-and' +
+      '(@($d.RemoteAddress).Count-eq 1)-and' +
+      '(@($d.RemoteAddress)[0]-eq ''127.0.0.1'')){$hadValid=$true}};' +
+    'try{' +
+      'Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue|' +
+        'Where-Object{$_.Name-ne $n}|Remove-NetFirewallRule -EA Stop;' +
+      'Get-NetFirewallRule -Name $n -EA SilentlyContinue|' +
+        'Remove-NetFirewallRule -EA Stop;' +
+      'New-NetFirewallRule -Name $n -DisplayName ''Restream Studio Installed localhost''' +
+        ' -Direction Inbound -Action Allow -Enabled True -Program $p' +
+        ' -Protocol TCP -LocalAddress ''127.0.0.1''' +
+        ' -RemoteAddress ''127.0.0.1'' -Profile Any' +
+        ' -EdgeTraversalPolicy Block|Out-Null;' +
+      '$rs=@(Get-NetFirewallRule -Name $n -EA Stop);' +
+      'if($rs.Count-ne 1){throw ''bad count''};$r=$rs[0];' +
+      '$a=$r|Get-NetFirewallApplicationFilter;$q=$r|Get-NetFirewallPortFilter;' +
+      '$d=$r|Get-NetFirewallAddressFilter;' +
+      'if(($r.Direction-ne ''Inbound'')-or($r.Action-ne ''Allow'')-or' +
+      '($r.Enabled-ne ''True'')-or($a.Program-ine $p)-or' +
+      '($q.Protocol-ne ''TCP'')-or(@($d.LocalAddress).Count-ne 1)-or' +
+      '(@($d.LocalAddress)[0]-ne ''127.0.0.1'')-or' +
+      '(@($d.RemoteAddress).Count-ne 1)-or' +
+      '(@($d.RemoteAddress)[0]-ne ''127.0.0.1'')){throw ''bad scope''}' +
+    '}catch{' +
+      'Get-NetFirewallRule -Name $n -EA SilentlyContinue|Remove-NetFirewallRule;' +
+      'if($hadValid){New-NetFirewallRule -Name $n' +
+        ' -DisplayName ''Restream Studio Installed localhost''' +
+        ' -Direction Inbound -Action Allow -Enabled True -Program $p' +
+        ' -Protocol TCP -LocalAddress ''127.0.0.1''' +
+        ' -RemoteAddress ''127.0.0.1'' -Profile Any' +
+        ' -EdgeTraversalPolicy Block|Out-Null};throw}';
+end;
+
+function RemoveInstalledFirewallCommand(): String;
+begin
+  Result :=
+    '$ErrorActionPreference=''Stop'';' +
+    '$h=$args[0];if(($h.Length%4)-ne 0){throw ''bad path''};' +
+    '$p=-join (for($i=0;$i-lt $h.Length;$i+=4){' +
+      '[char][Convert]::ToUInt16($h.Substring($i,4),16)});' +
+    'if([IO.Path]::GetFileName($p)-ine ''RestreamStudio.exe''){throw ''bad path''};' +
+    '$n=''RestreamStudio-Installed-Localhost'';' +
+    '$legacy=''Restream Studio (Loopback TCP)'';' +
+    'Get-NetFirewallRule -Name $n -EA SilentlyContinue|' +
+      'Remove-NetFirewallRule -EA Stop;' +
+    'Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue|' +
+      'Remove-NetFirewallRule -EA Stop;' +
+    'if((Get-NetFirewallRule -Name $n -EA SilentlyContinue)-or' +
+      '(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue)){' +
+      'throw ''firewall removal verification failed''}';
+end;
+
+procedure ConfigureInstalledFirewall;
+var
+  ResultCode: Integer;
+  ApplicationPath: String;
+begin
+  ResultCode := -1;
+  ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
+  if (not RunElevatedPowerShell(InstalledFirewallCommand(), ApplicationPath,
+    ResultCode)) or (ResultCode <> 0) then
+    RaiseException('Firewall configuration failed; installation was rolled back.');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+  ApplicationPath: String;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    ResultCode := -1;
+    ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
+    if (not RunElevatedPowerShell(RemoveInstalledFirewallCommand(),
+      ApplicationPath, ResultCode)) or (ResultCode <> 0) then
+    begin
+      SuppressibleMsgBox(
+        'Firewall cleanup failed. Uninstall was stopped before deleting files.',
+        mbError, MB_OK, IDOK);
+      Abort;
+    end;
+  end;
+end;
+
 function ShouldDeleteUserData(): Boolean;
 var
   DataPath: String;
@@ -68,7 +205,6 @@ begin
     Result := HasCommandLineArgument('/DELETEUSERDATA=1');
     Exit;
   end;
-
   if not DeleteDataDecisionMade then
   begin
     DataPath := ExpandConstant('{localappdata}\RestreamStudio');
@@ -80,61 +216,6 @@ begin
     DeleteDataDecisionMade := True;
   end;
   Result := DeleteUserData;
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  ResultCode: Integer;
-  PowerShellPath: String;
-  ScriptPath: String;
-  ApplicationPath: String;
-  Parameters: String;
-begin
-  Result := '';
-  ResultCode := -1;
-  ExtractTemporaryFile('firewall-install.ps1');
-  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
-  ScriptPath := ExpandConstant('{tmp}\firewall-install.ps1');
-  ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
-  Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath +
-    '" -ExecutablePath "' + ApplicationPath + '"';
-  if not Exec(PowerShellPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated,
-    ResultCode) then
-  begin
-    Result := 'Unable to start the required firewall configuration.';
-    Exit;
-  end;
-  if ResultCode <> 0 then
-    Result := 'Firewall configuration failed. Installation was not started.';
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  ResultCode: Integer;
-  PowerShellPath: String;
-  ScriptPath: String;
-  ApplicationPath: String;
-  Parameters: String;
-  Started: Boolean;
-begin
-  if CurUninstallStep = usUninstall then
-  begin
-    ResultCode := -1;
-    PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
-    ScriptPath := ExpandConstant('{app}\packaging\firewall-remove.ps1');
-    ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
-    Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath +
-      '" -ExecutablePath "' + ApplicationPath + '"';
-    Started := Exec(PowerShellPath, Parameters, '', SW_HIDE,
-      ewWaitUntilTerminated, ResultCode);
-    if (not Started) or (ResultCode <> 0) then
-    begin
-      SuppressibleMsgBox(
-        'Firewall cleanup failed. Uninstall was stopped before deleting files.',
-        mbError, MB_OK, IDOK);
-      Abort;
-    end;
-  end;
 end;
 
 procedure InitializeWizard;

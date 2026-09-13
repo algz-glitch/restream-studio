@@ -6,6 +6,7 @@ import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -21,8 +22,10 @@ from restream_studio.update.helper import (
     HelperArguments,
     parse_arguments,
     run_helper,
+    schedule_self_cleanup,
     wait_for_process,
 )
+from restream_studio.update.helper import main as helper_main
 from restream_studio.update.service import (
     UpdateOperationError,
     UpdateService,
@@ -427,13 +430,13 @@ async def test_download_becomes_ready_and_install_revalidates_before_launch(
 @pytest.mark.asyncio
 async def test_frozen_helper_is_copied_outside_app_before_launch(tmp_path: Path) -> None:
     launched: list[list[str]] = []
-    app_dir = tmp_path / "installed"
+    app_dir = tmp_path / "installed app's files"
     app_dir.mkdir()
     executable = (app_dir / "RestreamStudio.exe").resolve()
     executable.write_bytes(b"app")
     installed_helper = (app_dir / "RestreamStudioUpdateHelper.exe").resolve()
     installed_helper.write_bytes(b"standalone-onefile-helper")
-    update_dir = (tmp_path / "user-data" / "update").resolve()
+    update_dir = (tmp_path / "user data's files" / "update").resolve()
     service = UpdateService(
         update_dir,
         client=FakeClient(UpdateCheckResult.available(manifest())),
@@ -450,10 +453,77 @@ async def test_frozen_helper_is_copied_outside_app_before_launch(tmp_path: Path)
     copied_helper = Path(launched[0][0])
     assert copied_helper.is_absolute()
     assert copied_helper != installed_helper
-    assert copied_helper.parent == update_dir / "temp"
+    assert copied_helper.parent.parent == update_dir / "temp"
     assert copied_helper.name.startswith("RestreamStudioUpdateHelper-")
     assert copied_helper.read_bytes() == installed_helper.read_bytes()
     assert str(installed_helper) not in launched[0]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_services_keep_distinct_helper_copies(tmp_path: Path) -> None:
+    app_dir = tmp_path / "installed"
+    app_dir.mkdir()
+    executable = (app_dir / "RestreamStudio.exe").resolve()
+    executable.write_bytes(b"app")
+    installed_helper = (app_dir / "RestreamStudioUpdateHelper.exe").resolve()
+    installed_helper.write_bytes(b"onefile")
+    launched: list[list[str]] = []
+
+    async def prepare_service() -> UpdateService:
+        service = UpdateService(
+            tmp_path / "updates",
+            client=FakeClient(UpdateCheckResult.available(manifest())),
+            executable=executable,
+            helper_command=(str(installed_helper),),
+            launcher=lambda command: launched.append(list(command)),
+            process_create_time=lambda _pid: 123.0,
+        )
+        await service.check()
+        await service.download()
+        return service
+
+    first, second = await asyncio.gather(prepare_service(), prepare_service())
+    await asyncio.gather(first.install(current_pid=1), second.install(current_pid=2))
+
+    copies = [Path(command[0]) for command in launched]
+    assert len(set(copies)) == 2
+    assert all(copy.is_file() for copy in copies)
+    assert copies[0].parent != copies[1].parent
+
+
+def test_helper_schedules_encoded_self_cleanup_for_quoted_path(tmp_path: Path) -> None:
+    helper = tmp_path / "user data's files" / "run 1" / "RestreamStudioUpdateHelper-a.exe"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"onefile")
+    launched: list[list[str]] = []
+
+    schedule_self_cleanup(
+        helper, pid=4321, launcher=lambda command: launched.append(list(command))
+    )
+
+    assert len(launched) == 1
+    command = launched[0]
+    assert command[1:3] == ["-NoProfile", "-EncodedCommand"]
+    assert str(helper) not in command
+    decoded = __import__("base64").b64decode(command[3]).decode("utf-16le")
+    assert "Wait-Process -Id 4321" in decoded
+    assert "for($i=0;$i-lt 150" in decoded
+    assert "Start-Sleep -Milliseconds 100" in decoded
+    assert str(helper).replace("'", "''") in decoded
+    assert str(helper.parent).replace("'", "''") in decoded
+
+
+@pytest.mark.parametrize("result", [0, 3])
+def test_helper_main_schedules_cleanup_after_success_or_failure(result: int) -> None:
+    events: list[str] = []
+    actual = helper_main(
+        [],
+        runner=lambda _arguments: result,
+        cleanup_scheduler=lambda: events.append("cleanup"),
+        parser=lambda _arguments: cast(HelperArguments, object()),
+    )
+    assert actual == result
+    assert events == ["cleanup"]
 
 
 @pytest.mark.asyncio

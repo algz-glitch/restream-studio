@@ -402,6 +402,10 @@ class UpdateService:
             except OSError as error:
                 if copied_helper is not None:
                     copied_helper.unlink(missing_ok=True)
+                    try:
+                        copied_helper.parent.rmdir()
+                    except OSError:
+                        pass
                 raise UpdateOperationError(
                     "helper_launch_failed", "Update helper could not be started"
                 ) from error
@@ -419,20 +423,23 @@ class UpdateService:
         if not source.is_file():
             raise FileNotFoundError(source)
 
-        temp_dir = (self._update_dir / "temp").resolve(strict=False)
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        for stale in temp_dir.glob("RestreamStudioUpdateHelper-*.exe"):
-            try:
-                stale.unlink(missing_ok=True)
-            except OSError:
-                pass
+        helper_id = uuid.uuid4().hex
+        temp_dir = (self._update_dir / "temp" / helper_id).resolve(strict=False)
+        temp_dir.mkdir(parents=True, exist_ok=False)
         destination = (
-            temp_dir / f"RestreamStudioUpdateHelper-{uuid.uuid4().hex}.exe"
+            temp_dir / f"RestreamStudioUpdateHelper-{helper_id}.exe"
         ).resolve(strict=False)
         partial = destination.with_suffix(".exe.partial")
         try:
             shutil.copyfile(source, partial)
             os.replace(partial, destination)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            try:
+                temp_dir.rmdir()
+            except OSError:
+                pass
+            raise
         finally:
             partial.unlink(missing_ok=True)
         return (str(destination),), destination

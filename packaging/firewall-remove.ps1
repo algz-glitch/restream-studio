@@ -7,6 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $RuleName = 'RestreamStudio-Installed-Localhost'
+$LegacyDisplayName = 'Restream Studio (Loopback TCP)'
 $resolvedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
 
 if (-not [IO.Path]::IsPathFullyQualified($resolvedExecutable) -or
@@ -37,7 +38,10 @@ if (-not $isAdministrator) {
 }
 
 Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule
-if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) {
+    Remove-NetFirewallRule -ErrorAction Stop
+Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction Stop
+if ((Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) -or
+    (Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue)) {
     throw 'firewall rule removal verification failed'
 }

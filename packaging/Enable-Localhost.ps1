@@ -5,7 +5,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Executable = Join-Path $PSScriptRoot 'RestreamStudio.exe'
-$RuleName = 'RestreamStudio-Installed-Localhost'
 
 if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
     throw "RestreamStudio.exe is missing beside this setup script: $Executable"
@@ -24,6 +23,13 @@ if (-not $isAdministrator) {
 }
 
 $resolvedExecutable = (Resolve-Path -LiteralPath $Executable).Path
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $pathBytes = [Text.Encoding]::UTF8.GetBytes($resolvedExecutable.ToLowerInvariant())
+    $pathHash = ([BitConverter]::ToString($sha256.ComputeHash($pathBytes))).Replace('-', '').Substring(0, 16)
+}
+finally { $sha256.Dispose() }
+$RuleName = "RestreamStudio-Portable-Localhost-$pathHash"
 Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule -ErrorAction Stop
 New-NetFirewallRule -Name $RuleName -DisplayName 'Restream Studio localhost only' `
@@ -34,12 +40,14 @@ New-NetFirewallRule -Name $RuleName -DisplayName 'Restream Studio localhost only
 
 $rule = Get-NetFirewallRule -Name $RuleName -ErrorAction Stop
 $application = $rule | Get-NetFirewallApplicationFilter
+$port = $rule | Get-NetFirewallPortFilter
 $address = $rule | Get-NetFirewallAddressFilter
 if (
     $rule.Enabled -ne 'True' -or
     $rule.Direction -ne 'Inbound' -or
     $rule.Action -ne 'Allow' -or
     $application.Program -ne $resolvedExecutable -or
+    $port.Protocol -ne 'TCP' -or
     $address.LocalAddress -notcontains '127.0.0.1' -or
     $address.RemoteAddress -notcontains '127.0.0.1'
 ) {

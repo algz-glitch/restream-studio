@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import math
+import os
 import re
 import subprocess
 import sys
@@ -114,6 +116,7 @@ class ProcessPort(Protocol):
 
 
 ProcessFactory = Callable[[int], ProcessPort]
+CleanupLauncher = Callable[[Sequence[str]], object]
 
 
 def wait_for_process(
@@ -161,6 +164,54 @@ def _launch(command: Sequence[str]) -> object:
     return subprocess.Popen(list(command), close_fds=True)
 
 
+def _launch_cleanup(command: Sequence[str]) -> object:
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NO_WINDOW
+    return subprocess.Popen(
+        list(command),
+        close_fds=True,
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def schedule_self_cleanup(
+    executable: Path | None = None,
+    *,
+    pid: int | None = None,
+    launcher: CleanupLauncher = _launch_cleanup,
+) -> None:
+    if executable is None:
+        if not getattr(sys, "frozen", False):
+            return
+        executable = Path(sys.executable)
+    executable = executable.resolve(strict=False)
+    if not executable.name.startswith("RestreamStudioUpdateHelper-"):
+        return
+    process_id = os.getpid() if pid is None else pid
+    if process_id <= 0:
+        return
+    quoted_file = str(executable).replace("'", "''")
+    quoted_directory = str(executable.parent).replace("'", "''")
+    cleanup = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        f"Wait-Process -Id {process_id};"
+        "for($i=0;$i-lt 150;$i++){"
+        f"Remove-Item -LiteralPath '{quoted_file}' -Force;"
+        f"if(-not (Test-Path -LiteralPath '{quoted_file}')){{break}};"
+        "Start-Sleep -Milliseconds 100};"
+        f"Remove-Item -LiteralPath '{quoted_directory}' -Force"
+    )
+    encoded = base64.b64encode(cleanup.encode("utf-16le")).decode("ascii")
+    powershell = Path(
+        os.environ.get("SystemRoot", r"C:\Windows")
+    ) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    launcher((str(powershell), "-NoProfile", "-EncodedCommand", encoded))
+
+
 def run_helper(
     arguments: HelperArguments,
     *,
@@ -185,13 +236,25 @@ def run_helper(
     return 0
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
+def main(
+    arguments: Sequence[str] | None = None,
+    *,
+    parser: Callable[[Sequence[str]], HelperArguments] = parse_arguments,
+    runner: Callable[[HelperArguments], int] = run_helper,
+    cleanup_scheduler: Callable[[], None] = schedule_self_cleanup,
+) -> int:
     try:
-        parsed = parse_arguments(sys.argv[1:] if arguments is None else arguments)
-    except (ValueError, SystemExit) as error:
-        print(f"update helper: {error}", file=sys.stderr)
-        return 2
-    return run_helper(parsed)
+        try:
+            parsed = parser(sys.argv[1:] if arguments is None else arguments)
+        except (ValueError, SystemExit) as error:
+            print(f"update helper: {error}", file=sys.stderr)
+            return 2
+        return runner(parsed)
+    finally:
+        try:
+            cleanup_scheduler()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $RuleName = 'RestreamStudio-Installed-Localhost'
+$LegacyDisplayName = 'Restream Studio (Loopback TCP)'
 $resolvedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
 
 if (-not [IO.Path]::IsPathFullyQualified($resolvedExecutable) -or
@@ -36,11 +37,29 @@ if (-not $isAdministrator) {
     exit 0
 }
 
-Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule
+$hadValid = $false
+foreach ($candidate in @(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue)) {
+    $candidateApplication = $candidate | Get-NetFirewallApplicationFilter
+    $candidatePort = $candidate | Get-NetFirewallPortFilter
+    $candidateAddress = $candidate | Get-NetFirewallAddressFilter
+    if (
+        $candidate.Direction -eq 'Inbound' -and $candidate.Action -eq 'Allow' -and
+        $candidate.Enabled -eq 'True' -and
+        $candidateApplication.Program -ieq $resolvedExecutable -and
+        $candidatePort.Protocol -eq 'TCP' -and
+        @($candidateAddress.LocalAddress).Count -eq 1 -and
+        @($candidateAddress.LocalAddress)[0] -eq '127.0.0.1' -and
+        @($candidateAddress.RemoteAddress).Count -eq 1 -and
+        @($candidateAddress.RemoteAddress)[0] -eq '127.0.0.1'
+    ) { $hadValid = $true }
+}
 
 try {
-    New-NetFirewallRule -Name $RuleName -DisplayName 'Restream Studio (Loopback TCP)' `
+    Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue |
+        Where-Object Name -ne $RuleName | Remove-NetFirewallRule -ErrorAction Stop
+    Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule -ErrorAction Stop
+    New-NetFirewallRule -Name $RuleName -DisplayName 'Restream Studio Installed localhost' `
         -Direction Inbound -Action Allow -Enabled True -Program $resolvedExecutable `
         -Protocol TCP -LocalAddress '127.0.0.1' -RemoteAddress '127.0.0.1' `
         -Profile Any -EdgeTraversalPolicy Block | Out-Null
@@ -66,5 +85,12 @@ try {
 catch {
     Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
         Remove-NetFirewallRule
+    if ($hadValid) {
+        New-NetFirewallRule -Name $RuleName `
+            -DisplayName 'Restream Studio Installed localhost' `
+            -Direction Inbound -Action Allow -Enabled True -Program $resolvedExecutable `
+            -Protocol TCP -LocalAddress '127.0.0.1' -RemoteAddress '127.0.0.1' `
+            -Profile Any -EdgeTraversalPolicy Block | Out-Null
+    }
     throw
 }

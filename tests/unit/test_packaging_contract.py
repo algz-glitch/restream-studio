@@ -57,15 +57,24 @@ def test_inno_installer_has_stable_per_user_lifecycle_contract() -> None:
 
 def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation() -> None:
     installer = _read("packaging/restream-studio.iss")
-    assert "function PrepareToInstall" in installer
-    assert "Exec(" in installer
+    assert "function PrepareToInstall" not in installer
+    assert 'Source: "..\\dist\\RestreamStudio\\RestreamStudio.exe"' in installer
+    assert "AfterInstall: ConfigureInstalledFirewall" in installer
+    assert "procedure ConfigureInstalledFirewall" in installer
+    assert "ShellExec('runas'" in installer
     assert "ResultCode" in installer
     assert "ResultCode <> 0" in installer
+    assert "RaiseException(" in installer
     assert "CurUninstallStepChanged" in installer
     assert "CurUninstallStep = usUninstall" in installer
     assert "Abort;" in installer
-    assert "ExtractTemporaryFile('firewall-install.ps1')" in installer
-    assert "Flags: dontcopy" in installer
+    assert "-File" not in installer
+    assert "Flags: dontcopy" not in installer
+    assert "HexEncode(ApplicationPath)" in installer
+    assert "-Command" in installer
+    assert "RestreamStudio-Installed-Localhost" in installer
+    assert "Restream Studio (Loopback TCP)" in installer
+    assert "$hadValid" in installer
 
 
 def test_inno_offers_checked_postinstall_launch_only_when_interactive() -> None:
@@ -100,7 +109,10 @@ def test_firewall_hooks_self_elevate_and_scope_both_loopback_ends_to_program() -
     assert "$port.Protocol -eq 'TCP'" in install
     assert "$address.LocalAddress" in install
     assert "$address.RemoteAddress" in install
+    assert "$hadValid" in install
+    assert "Restream Studio (Loopback TCP)" in install
     assert "Remove-NetFirewallRule" in remove
+    assert "Restream Studio (Loopback TCP)" in remove
     assert "firewall rule removal verification failed" in remove
 
 
@@ -119,19 +131,31 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
     assert "RestreamStudioUpdateHelper.exe" in package
     assert "RestreamStudioUpdateHelper.exe" in verify
     assert "ISCC_PATH" in build
-    assert "G:\\Apps\\Inno\\ISCC.exe" in build
+    pinned = (
+        "F:\\printflow-ai\\workbench-v4-functional\\dist\\tools\\"
+        "inno-setup-6.7.3\\ISCC.exe"
+    )
+    assert pinned in build
     assert "Get-Command 'ISCC.exe'" in build
     assert "JRSoftware.InnoSetup" in build
     assert "6.7.3" in build
     assert "--exact" in build
-    assert build.index("G:\\Apps\\Inno\\ISCC.exe") < build.index("winget.exe")
+    assert build.index(pinned) < build.index("winget.exe")
+    assert "function Assert-IsccVersion" in build
+    assert "$output = @(& $Path $probe" in build
+    assert "Compiler engine version: Inno Setup 6.7.3" in build
+    assert "ISCC_PATH must point to Inno Setup 6.7.3" in build
     assert "RestreamStudio-Setup-0.1.0.exe" in build
     assert "Get-FileHash" in build
     assert "SHA256=" in build
     assert "Start-Process -FilePath $copiedUpdateHelper" in build
     assert "$helperProcess.ExitCode -ne 2" in build
+    assert "did not clean its unique runtime directory" in build
     assert "Copy-Item -LiteralPath $updateHelper" in build
     assert "RestreamStudioUpdateHelper-smoke" in build
+    smoke = build[build.index("$helperSmokeDirectory") : build.index("$iscc =")]
+    assert smoke.index("try {") < smoke.index("New-Item")
+    assert "finally" in smoke
 
 
 def test_update_helper_is_a_standalone_onefile_executable() -> None:
@@ -156,6 +180,17 @@ def test_packaged_loopback_setup_is_program_scoped_and_loopback_only() -> None:
     assert "-RemoteAddress '127.0.0.1'" in script
     assert "-Profile Any" in script
     assert "RemoteAddress -notcontains '127.0.0.1'" in script
+    assert '$RuleName = "RestreamStudio-Portable-Localhost-$pathHash"' in script
+    assert "SHA256" in script
+    assert "RestreamStudio-Installed-Localhost" not in script
+
+
+def test_installer_never_elevates_a_user_writable_script() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    assert "ShellExec('runas'" in installer
+    assert "firewall-install.ps1'" not in installer
+    assert "firewall-remove.ps1'" not in installer
+    assert "ExtractTemporaryFile" not in installer
 
 
 def test_npm_lock_is_complete_for_windows_x64() -> None:

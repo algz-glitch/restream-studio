@@ -6,20 +6,72 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: windows-2022
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       GH_REPOSITORY: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Validate trusted tag ancestry and source versions
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "release tag is not exact canonical SemVer: $tag"
+          }
+          if ($env:GH_REPOSITORY -cne 'algz-glitch/restream-studio') {
+            throw 'release repository identity is invalid'
+          }
+          $defaultBranch = $env:DEFAULT_BRANCH
+          if ($defaultBranch -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?$' -or
+              $defaultBranch.Contains('..') -or $defaultBranch.Contains('//')) {
+            throw 'default branch name is not safe'
+          }
+          git check-ref-format --branch $defaultBranch *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'default branch name is not a valid git ref' }
+          git fetch --no-tags origin "+refs/heads/$defaultBranch`:refs/remotes/origin/$defaultBranch"
+          if ($LASTEXITCODE -ne 0) { throw 'failed to fetch repository default branch' }
+          git merge-base --is-ancestor HEAD "refs/remotes/origin/$defaultBranch"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'tag commit is not an ancestor of the repository default branch'
+          }
+          $commit = (git rev-parse --verify HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
+            throw 'tag commit identity is invalid'
+          }
+          $version = $tag.Substring(1)
+          $escaped = [Regex]::Escape($version)
+          if ((Get-Content pyproject.toml -Raw) -notmatch "(?m)^version = `"$escaped`"$") {
+            throw 'pyproject.toml version does not match the release tag'
+          }
+          if ((Get-Content package.json -Raw | ConvertFrom-Json).version -cne $version) {
+            throw 'package.json version does not match the release tag'
+          }
+          if ((Get-Content packaging/restream-studio.iss -Raw) -notmatch "(?m)^#define MyAppVersion `"$escaped`"$") {
+            throw 'Inno Setup version does not match the release tag'
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "commit=$commit" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python 3.12
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -35,35 +87,15 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: Validate tag and source versions
-        id: release
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = $env:RELEASE_TAG
-          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
-            throw "release tag is not exact canonical SemVer: $tag"
-          }
-          $version = $tag.Substring(1)
-          $escaped = [Regex]::Escape($version)
-          if ((Get-Content pyproject.toml -Raw) -notmatch "(?m)^version = `"$escaped`"$") {
-            throw 'pyproject.toml version does not match the release tag'
-          }
-          if ((Get-Content package.json -Raw | ConvertFrom-Json).version -cne $version) {
-            throw 'package.json version does not match the release tag'
-          }
-          if ((Get-Content packaging/restream-studio.iss -Raw) -notmatch "(?m)^#define MyAppVersion `"$escaped`"$") {
-            throw 'Inno Setup version does not match the release tag'
-          }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Install Python build and test dependencies
+      - name: Install hashed Python dependency closure
         shell: pwsh
         run: |
           python -m venv .venv
-          .venv\Scripts\python.exe -m pip install --disable-pip-version-check --requirement requirements-release.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Python virtual environment creation failed' }
+          .venv\Scripts\python.exe -m pip install --disable-pip-version-check --require-hashes --requirement requirements-release.lock
+          if ($LASTEXITCODE -ne 0) { throw 'hashed Python dependency installation failed' }
           .venv\Scripts\python.exe -m pip install --disable-pip-version-check --no-build-isolation --no-deps .
+          if ($LASTEXITCODE -ne 0) { throw 'project installation failed' }
 
       - name: Verify locked Node dependency closure
         shell: pwsh
@@ -79,7 +111,9 @@ jobs:
 
       - name: Build the fixed Windows installer
         shell: pwsh
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Clean
+        env:
+          RESTREAM_STUDIO_VERIFIED_COMMIT: ${{ steps.release.outputs.commit }}
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Clean -ReuseVerifiedPackage
 
       - name: Write verified update manifest
         shell: pwsh
@@ -95,28 +129,44 @@ jobs:
           }
           $installer = "dist/installer/RestreamStudio-Setup-$version.exe"
           .venv\Scripts\python.exe scripts/write-update-manifest.py `
-            --version $version `
-            --installer $installer `
-            --repository algz-glitch/restream-studio `
-            --tag $tag `
+            --version $version --installer $installer `
+            --repository algz-glitch/restream-studio --tag $tag `
             --output dist/latest.json
 
-      - name: Upload verified workflow artifact
+      - name: Upload one verified release-assets artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: RestreamStudio-${{ steps.release.outputs.version }}
+          name: release-assets
           path: |
             dist/installer/RestreamStudio-Setup-${{ steps.release.outputs.version }}.exe
             dist/latest.json
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub Release assets
+  publish:
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      GH_REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Verify, publish idempotently, and verify remote assets
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = $env:RELEASE_TAG
           $version = $env:RELEASE_VERSION
           if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
@@ -127,9 +177,70 @@ jobs:
           if ($env:GH_REPOSITORY -cne 'algz-glitch/restream-studio') {
             throw 'release repository identity is invalid'
           }
-          $installer = "dist/installer/RestreamStudio-Setup-$version.exe"
-          gh release create $tag $installer 'dist/latest.json' `
-            --repo $env:GH_REPOSITORY `
-            --verify-tag `
-            --generate-notes `
-            --title "Restream Studio $version"
+          $ghVersion = (& gh --version | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or $ghVersion -notmatch '^gh version \d+\.\d+\.\d+') {
+            throw 'GitHub CLI version probe failed'
+          }
+          Write-Output "GH_CLI=$ghVersion"
+          $installerName = "RestreamStudio-Setup-$version.exe"
+          $installer = Join-Path 'release-assets' $installerName
+          $manifest = Join-Path 'release-assets' 'latest.json'
+
+          function Compare-VerifiedFile {
+            param([string]$Expected, [string]$Actual)
+            if (-not (Test-Path -LiteralPath $Expected -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $Actual -PathType Leaf)) { return $false }
+            $a = Get-Item -LiteralPath $Expected
+            $b = Get-Item -LiteralPath $Actual
+            return $a.Length -eq $b.Length -and
+              (Get-FileHash -LiteralPath $Expected -Algorithm SHA256).Hash -ceq
+              (Get-FileHash -LiteralPath $Actual -Algorithm SHA256).Hash
+          }
+
+          function Assert-Manifest {
+            param([string]$ManifestPath, [string]$InstallerPath)
+            $data = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $keys = @($data.PSObject.Properties.Name)
+            $expectedKeys = @('schema_version','version','installer_url','sha256','size','published_at','release_url')
+            if ((($keys | Sort-Object) -join ',') -cne
+                (($expectedKeys | Sort-Object) -join ',')) {
+              throw 'latest.json does not have the exact schema 1 fields'
+            }
+            $file = Get-Item -LiteralPath $InstallerPath
+            if ($file.Length -le 0 -or $file.Length -gt 512MB) {
+              throw 'installer size is outside the release contract'
+            }
+            $hash = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash
+            $expectedDownload = "https://github.com/$($env:GH_REPOSITORY)/releases/download/$tag/$installerName"
+            $expectedRelease = "https://github.com/$($env:GH_REPOSITORY)/releases/tag/$tag"
+            if ($data.schema_version -ne 1 -or $data.version -cne $version -or
+                $data.installer_url -cne $expectedDownload -or $data.sha256 -cne $hash -or
+                $data.size -ne $file.Length -or
+                $data.published_at -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$' -or
+                $data.release_url -cne $expectedRelease) {
+              throw 'latest.json does not match the independently hashed installer'
+            }
+          }
+
+          Assert-Manifest -ManifestPath $manifest -InstallerPath $installer
+          & gh release view $tag --repo $env:GH_REPOSITORY *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          if (-not $releaseExists) {
+            gh release create $tag $installer $manifest `
+              --repo $env:GH_REPOSITORY --verify-tag --generate-notes `
+              --title "Restream Studio $version"
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
+          }
+
+          $remote = Join-Path $env:RUNNER_TEMP "release-check-$([Guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory -Path $remote | Out-Null
+          gh release download $tag --repo $env:GH_REPOSITORY --dir $remote `
+            --pattern $installerName --pattern latest.json
+          if ($LASTEXITCODE -ne 0) { throw 'remote release asset download failed' }
+          $remoteInstaller = Join-Path $remote $installerName
+          $remoteManifest = Join-Path $remote 'latest.json'
+          if (-not (Compare-VerifiedFile $installer $remoteInstaller) -or
+              -not (Compare-VerifiedFile $manifest $remoteManifest)) {
+            throw 'remote assets differ from verified build outputs'
+          }
+          Assert-Manifest -ManifestPath $remoteManifest -InstallerPath $remoteInstaller

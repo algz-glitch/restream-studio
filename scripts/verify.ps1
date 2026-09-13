@@ -9,6 +9,24 @@ $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $Package = Join-Path $PSScriptRoot 'package.ps1'
 $Distribution = Join-Path $Root 'dist\RestreamStudio'
 
+function Get-ProjectVersion {
+    $semver = '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+    $pyproject = [IO.File]::ReadAllText((Join-Path $Root 'pyproject.toml'))
+    $matches = [Regex]::Matches($pyproject, "(?m)^version\s*=\s*`"($semver)`"\s*$")
+    if ($matches.Count -ne 1) {
+        throw 'pyproject.toml must contain exactly one canonical project version'
+    }
+    $version = $matches[0].Groups[1].Value
+    $packageVersion = ([IO.File]::ReadAllText((Join-Path $Root 'package.json')) |
+        ConvertFrom-Json).version
+    if ($packageVersion -isnot [string] -or $packageVersion -cne $version) {
+        throw 'package.json version must exactly match pyproject.toml'
+    }
+    return $version
+}
+
+$ProjectVersion = Get-ProjectVersion
+
 function Invoke-External {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
     & $FilePath @Arguments | ForEach-Object { [Console]::Error.WriteLine([string]$_) }
@@ -118,7 +136,7 @@ function Test-PackageHealth {
                 if (
                     $health.status -eq 'ok' -and
                     $health.app -eq 'restream-studio' -and
-                    $health.version -eq '0.1.0' -and
+                    $health.version -eq $ProjectVersion -and
                     $homepage.StatusCode -eq 200 -and
                     $homepage.Content -match '<title>\s*Restream Studio\s*</title>'
                 ) { return }

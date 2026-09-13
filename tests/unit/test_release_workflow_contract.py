@@ -48,8 +48,14 @@ def test_release_workflow_is_tag_only_windows_and_least_privilege() -> None:
     assert re.search(r"(?ms)^on:\s*\n\s+push:\s*\n\s+tags:\s*\n\s+- ['\"]v\*['\"]", workflow)
     assert "workflow_dispatch:" not in workflow
     assert "branches:" not in workflow
-    assert re.search(r"(?ms)^permissions:\s*\n\s+contents:\s+write\s*$", workflow)
-    assert "runs-on: windows-2022" in workflow
+    assert re.search(r"(?ms)^permissions:\s*\n\s+contents:\s+read\s*$", workflow)
+    assert re.search(r"(?ms)^  build:.*?permissions:\s*\n\s+contents:\s+read", workflow)
+    assert re.search(
+        r"(?ms)^  publish:.*?needs:\s+build.*?permissions:\s*\n\s+contents:\s+write",
+        workflow,
+    )
+    assert "environment: release" in workflow
+    assert workflow.count("runs-on: windows-2022") == 2
 
 
 def test_release_workflow_pins_runtime_actions_and_locked_node_install() -> None:
@@ -68,6 +74,7 @@ def test_release_workflow_pins_runtime_actions_and_locked_node_install() -> None
     assert "cache-dependency-path: package-lock.json" in workflow
     assert "npm ci --ignore-scripts --no-audit --no-fund" in workflow
     assert "--requirement requirements-release.lock" in workflow
+    assert "--require-hashes --requirement requirements-release.lock" in workflow
     assert "--no-build-isolation --no-deps ." in workflow
 
 
@@ -104,13 +111,20 @@ def test_release_workflow_runs_all_gates_and_publishes_only_verified_assets() ->
         "scripts/build-installer.ps1 -Clean",
         "scripts/write-update-manifest.py",
         "actions/upload-artifact@",
+        "actions/download-artifact@",
+        "ConvertFrom-Json",
         "gh release create",
     )
-    positions = [workflow.index(marker) for marker in ordered]
+    positions = []
+    cursor = 0
+    for marker in ordered:
+        cursor = workflow.index(marker, cursor)
+        positions.append(cursor)
     assert positions == sorted(positions)
     assert "RestreamStudio-Setup-$version.exe" in workflow
     assert "dist/latest.json" in workflow
     assert "if-no-files-found: error" in workflow
+    assert workflow.count("name: release-assets") == 2
     assert "--verify-tag" in workflow
     assert "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in workflow
     assert "persist-credentials: false" in workflow
@@ -124,18 +138,21 @@ def test_release_workflow_derives_and_checks_exact_semver_tag() -> None:
     assert "pyproject.toml" in workflow
     assert "package.json" in workflow
     assert "packaging/restream-studio.iss" in workflow
+    assert "git fetch --no-tags origin" in workflow
+    assert "git merge-base --is-ancestor" in workflow
+    assert "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in workflow
 
 
 def test_release_lock_contains_only_exact_transitive_pins() -> None:
     lock = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
-    requirements = [
-        line.strip()
-        for line in lock.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+    assert "--hash=sha256:" in lock
+    assert "# via" in lock
+    requirement_lines = [
+        line.strip() for line in lock.splitlines() if re.match(r"^[A-Za-z0-9_.-]+==", line)
     ]
-    assert requirements
-    assert all(re.fullmatch(r"[A-Za-z0-9_.-]+==[^\s;]+", item) for item in requirements)
-    names = {item.partition("==")[0].casefold() for item in requirements}
+    assert requirement_lines
+    assert all("==" in item for item in requirement_lines)
+    names = {item.partition("==")[0].casefold() for item in requirement_lines}
     for required in ("fastapi", "pydantic", "streamget", "pytest", "mypy", "ruff", "pyinstaller"):
         assert required in names
 
@@ -149,7 +166,8 @@ def test_release_tools_are_versioned_downloaded_and_sha256_verified() -> None:
     assert "8A58A9B8C25EE99A96C23DC0A17F39ACE3072C01D2E148329073C64DDF83493D" in script
     assert "Get-FileHash" in script
     assert "-Algorithm SHA256" in script
-    assert "Invoke-WebRequest" in script
+    assert "System.Net.Http.HttpClient" in script
+    assert "Invoke-WebRequest" not in script
     assert "Get-Command ffmpeg" not in script
     assert "Get-Command mediamtx" not in script
     assert "function Resolve-SingleFile" in script
@@ -157,6 +175,16 @@ def test_release_tools_are_versioned_downloaded_and_sha256_verified() -> None:
     for variable in ("FFMPEG_PATH", "FFPROBE_PATH", "MEDIAMTX_PATH"):
         assert variable in script
         assert "$env:GITHUB_ENV" in script
+    for marker in (
+        "Content-Length",
+        "MaxDownloadBytes",
+        "ZipArchive",
+        "MaxZipEntries",
+        "MaxExpandedBytes",
+        "GetFullPath",
+        "ReparsePoint",
+    ):
+        assert marker in script
 
 
 def test_manifest_writer_calculates_strict_schema_and_atomic_output(tmp_path: Path) -> None:
@@ -195,6 +223,9 @@ def test_manifest_writer_calculates_strict_schema_and_atomic_output(tmp_path: Pa
     assert "tempfile.NamedTemporaryFile(" in writer
     assert "os.fsync(" in writer
     assert "os.replace(" in writer
+    assert "os.fstat(" in writer
+    assert '.open("rb")' in writer
+    assert "installer.read_bytes()" not in writer
 
 
 @pytest.mark.parametrize(
@@ -270,6 +301,25 @@ def test_manifest_writer_rejects_sparse_installer_above_hard_limit(tmp_path: Pat
     assert not output.exists()
 
 
+def test_manifest_writer_verify_existing_detects_asset_drift(tmp_path: Path) -> None:
+    installer = tmp_path / "RestreamStudio-Setup-1.2.3.exe"
+    installer.write_bytes(b"original")
+    output = tmp_path / "latest.json"
+    assert _run_writer(*_valid_arguments(installer, output), cwd=tmp_path).returncode == 0
+
+    verified = _run_writer(
+        *_valid_arguments(installer, output), "--verify-existing", cwd=tmp_path
+    )
+    assert verified.returncode == 0, verified.stderr
+
+    installer.write_bytes(b"changed")
+    drifted = _run_writer(
+        *_valid_arguments(installer, output), "--verify-existing", cwd=tmp_path
+    )
+    assert drifted.returncode != 0
+    assert "does not match installer identity" in drifted.stderr
+
+
 @pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell unavailable")
 def test_installer_builder_derives_a_0_1_1_fixture_from_three_sources(tmp_path: Path) -> None:
     (tmp_path / "packaging").mkdir()
@@ -301,6 +351,18 @@ def test_installer_builder_derives_a_0_1_1_fixture_from_three_sources(tmp_path: 
     assert result.returncode == 0, result.stderr
     assert "RELEASE_VERSION=0.1.1" in result.stdout
     assert str(tmp_path / "dist" / "installer" / "RestreamStudio-Setup-0.1.1.exe") in result.stdout
+
+
+def test_release_publish_is_clean_idempotent_and_reverifies_remote_assets() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    publish = workflow[workflow.index("  publish:") :]
+    assert "actions/checkout@" not in publish
+    assert "gh --version" in publish
+    assert "gh release view" in publish
+    assert "gh release download" in publish
+    assert "Compare-VerifiedFile" in publish
+    assert "--clobber" not in publish
+    assert "remote assets differ from verified build outputs" in publish
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support unavailable")

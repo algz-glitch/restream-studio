@@ -226,16 +226,20 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
         "F:\\printflow-ai\\workbench-v4-functional\\dist\\tools\\"
         "inno-setup-6.7.3\\ISCC.exe"
     )
-    assert pinned in build
-    assert "Get-Command 'ISCC.exe'" in build
+    assert pinned not in build
+    assert "Get-Command 'ISCC.exe'" not in build
     assert "JRSoftware.InnoSetup" in build
     assert "6.7.3" in build
     assert "--exact" in build
-    assert build.index(pinned) < build.index("winget.exe")
     assert "function Assert-IsccVersion" in build
     assert "$output = @(& $Path $probe" in build
     assert "Compiler engine version: Inno Setup 6.7.3" in build
     assert "ISCC_PATH must point to Inno Setup 6.7.3" in build
+    assert "Get-AuthenticodeSignature" in build
+    assert "Pyrsys B.V." in build
+    assert "ReuseVerifiedPackage" in build
+    assert "ReuseVerifiedOutput" in package
+    assert "RESTREAM_STUDIO_VERIFIED_COMMIT" in package
     assert "function Get-ReleaseVersion" in build
     assert "RestreamStudio-Setup-$Version.exe" in build
     assert "RestreamStudio-Setup-0.1.0.exe" not in build
@@ -353,7 +357,9 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
     assert "Invoke-RestMethod" in script
     assert "/health" in script
     assert "restream-studio" in script
-    assert "0.1.0" in script
+    assert "function Get-ProjectVersion" in script
+    assert "$health.version -eq $ProjectVersion" in script
+    assert "$health.version -eq '0.1.0'" not in script
     assert "Restream Studio" in script
     assert "WaitForExit" in script
     assert "Test-LocalPortAvailable" in script

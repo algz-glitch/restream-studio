@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$OutputDirectory = '',
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$ReuseVerifiedOutput
 )
 
 Set-StrictMode -Version Latest
@@ -61,6 +62,27 @@ function Remove-WorkspaceDirectory {
 
 if (-not (Test-Path -LiteralPath $LockFile -PathType Leaf)) {
     throw 'package-lock.json is required; generate it with npm, never by hand'
+}
+
+if ($ReuseVerifiedOutput) {
+    $verifiedCommit = [Environment]::GetEnvironmentVariable('RESTREAM_STUDIO_VERIFIED_COMMIT')
+    $currentCommit = (& git -C $Root rev-parse --verify HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $verifiedCommit -notmatch '^[0-9a-f]{40}$' -or
+        $currentCommit -cne $verifiedCommit) {
+        throw 'verified package reuse requires the exact current git commit identity'
+    }
+    $trackedChanges = @(& git -C $Root status --porcelain --untracked-files=no)
+    if ($LASTEXITCODE -ne 0 -or $trackedChanges.Count -ne 0) {
+        throw 'verified package reuse requires a clean tracked worktree'
+    }
+    $verifiedDistribution = Join-Path $OutputDirectory 'RestreamStudio'
+    foreach ($required in ('RestreamStudio.exe', 'RestreamStudioUpdateHelper.exe')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $verifiedDistribution $required) -PathType Leaf)) {
+            throw "verified package reuse output is missing: $required"
+        }
+    }
+    Write-Output "REUSED_VERIFIED_PACKAGE=$verifiedDistribution"
+    exit 0
 }
 
 $Npm = Resolve-Tool -Name 'npm.cmd' -EnvironmentName 'NPM_PATH' `

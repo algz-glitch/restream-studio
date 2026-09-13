@@ -2,7 +2,8 @@
 param(
     [switch]$Clean,
     [string]$SourceRoot = '',
-    [switch]$ResolveVersionOnly
+    [switch]$ResolveVersionOnly,
+    [switch]$ReuseVerifiedPackage
 )
 
 Set-StrictMode -Version Latest
@@ -77,6 +78,13 @@ function Assert-IsccVersion {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$SourceLabel
     )
+    $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    $signature = Get-AuthenticodeSignature -LiteralPath $resolved
+    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+        $null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Pyrsys B\.V\.(,|$)') {
+        throw "$SourceLabel does not have a valid trusted Pyrsys B.V. Authenticode signature"
+    }
     $probeRoot = Join-Path $Root "build\iscc-version-$([Guid]::NewGuid().ToString('N'))"
     try {
         New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
@@ -98,7 +106,7 @@ OutputBaseFilename=version-probe
         if ($exitCode -ne 0 -or $output -notcontains $expected) {
             throw "$SourceLabel must point to Inno Setup 6.7.3"
         }
-        return (Resolve-Path -LiteralPath $Path).Path
+        return $resolved
     }
     finally {
         if (Test-Path -LiteralPath $probeRoot) {
@@ -116,21 +124,7 @@ function Resolve-Iscc {
         try {
             return Assert-IsccVersion -Path $configured -SourceLabel 'ISCC_PATH'
         }
-        catch { throw 'ISCC_PATH must point to Inno Setup 6.7.3' }
-    }
-
-    $pinnedLocalPath = 'F:\printflow-ai\workbench-v4-functional\dist\tools\inno-setup-6.7.3\ISCC.exe'
-    if (Test-Path -LiteralPath $pinnedLocalPath -PathType Leaf) {
-        return Assert-IsccVersion -Path $pinnedLocalPath -SourceLabel 'pinned local ISCC'
-    }
-
-    $command = Get-Command 'ISCC.exe' -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -ne $command) {
-        try {
-            return Assert-IsccVersion -Path $command.Source -SourceLabel 'PATH ISCC.exe'
-        }
-        catch { Write-Verbose $_.Exception.Message }
+        catch { throw 'ISCC_PATH must point to Inno Setup 6.7.3 with a valid trusted Pyrsys B.V. signature' }
     }
 
     $winget = (Get-Command 'winget.exe' -CommandType Application -ErrorAction Stop).Source
@@ -164,7 +158,7 @@ if ($Clean -and (Test-Path -LiteralPath $InstallerDirectory)) {
     Remove-Item -LiteralPath $resolvedInstallerDirectory -Recurse -Force
 }
 
-& $PackageScript -Clean:$Clean
+& $PackageScript -Clean:$Clean -ReuseVerifiedOutput:$ReuseVerifiedPackage
 if ($LASTEXITCODE -ne 0) { throw "package.ps1 failed with exit code $LASTEXITCODE" }
 
 $distribution = Join-Path $Root 'dist\RestreamStudio'

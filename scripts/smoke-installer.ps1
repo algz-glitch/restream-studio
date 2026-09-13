@@ -17,28 +17,43 @@ function Stop-KnownProcessTree {
     $script:LifecycleProcessStillRunning = $true
     $killer = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
         -ArgumentList @('/PID', [string]$Target.Id, '/T', '/F') -PassThru -WindowStyle Hidden
-    $taskkillFailure = ''
+    $taskkillCompleted = $false
+    $taskkillExitCode = $null
+    $taskkillError = ''
     try {
-        if (-not $killer.WaitForExit(15000)) {
-            Stop-Process -Id $killer.Id -Force
-            if (-not $killer.WaitForExit(5000)) {
-                $taskkillFailure = 'taskkill did not exit after its bounded timeout'
+        $taskkillCompleted = $killer.WaitForExit(15000)
+        if (-not $taskkillCompleted) {
+            try { Stop-Process -Id $killer.Id -Force }
+            catch { $taskkillError = "unable to stop timed-out taskkill: $($_.Exception.Message)" }
+            try {
+                if (-not $killer.WaitForExit(5000)) {
+                    $taskkillError = 'taskkill did not exit after its bounded timeout'
+                }
             }
+            catch { $taskkillError = "unable to confirm taskkill termination: $($_.Exception.Message)" }
         }
         $killer.Refresh()
-        if ($killer.HasExited -and $killer.ExitCode -ne 0) {
-            $taskkillFailure = "taskkill exited with code $($killer.ExitCode)"
+        if ($taskkillCompleted -and $killer.HasExited) {
+            $taskkillExitCode = $killer.ExitCode
         }
     }
+    catch { $taskkillError = "taskkill status check failed: $($_.Exception.Message)" }
     finally { $killer.Dispose() }
 
-    $targetWaitCompleted = $Target.WaitForExit(15000)
-    $Target.Refresh()
-    if (-not $targetWaitCompleted -or -not $Target.HasExited) {
-        throw 'CRITICAL: installer or uninstaller process tree may still be running; no restore or delete is permitted; manual intervention required'
+    $targetWaitCompleted = $false
+    $targetHasExited = $false
+    $targetError = ''
+    try {
+        $targetWaitCompleted = $Target.WaitForExit(15000)
+        $Target.Refresh()
+        $targetHasExited = $Target.HasExited
+    }
+    catch { $targetError = $_.Exception.Message }
+    if (-not ($taskkillCompleted -and $taskkillExitCode -eq 0 -and
+        $targetWaitCompleted -and $targetHasExited)) {
+        throw "CRITICAL: installer or uninstaller process tree may still be running because termination was not fully verified; taskkillCompleted=$taskkillCompleted; taskkillExitCode=$taskkillExitCode; targetWaitCompleted=$targetWaitCompleted; targetHasExited=$targetHasExited; taskkillError=$taskkillError; targetError=$targetError; no restore or delete is permitted; manual intervention required"
     }
     $script:LifecycleProcessStillRunning = $false
-    if ($taskkillFailure) { throw $taskkillFailure }
 }
 
 function Invoke-BoundedProcess {

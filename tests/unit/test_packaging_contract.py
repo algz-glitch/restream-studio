@@ -166,9 +166,16 @@ def test_installer_processes_are_bounded_and_smoke_requires_administrator() -> N
     assert "WaitForExit($TimeoutSeconds * 1000)" in smoke
     assert "taskkill.exe" in smoke
     assert "$killer.ExitCode" in smoke
+    assert "$taskkillCompleted = $false" in smoke
+    assert "$taskkillExitCode = $null" in smoke
     assert "$LifecycleProcessStillRunning" in smoke
     assert smoke.count("if ($LifecycleProcessStillRunning)") >= 3
     assert "$Target.Refresh()" in smoke
+    assert "$taskkillCompleted -and $taskkillExitCode -eq 0 -and" in smoke
+    stopped = smoke[smoke.index("function Stop-KnownProcessTree") : smoke.index("function Invoke-BoundedProcess")]
+    assert stopped.index("$taskkillCompleted -and $taskkillExitCode -eq 0 -and") < stopped.index(
+        "$script:LifecycleProcessStillRunning = $false"
+    )
     assert "CRITICAL: installer or uninstaller process tree may still be running" in smoke
     cleanup = smoke[smoke.rindex("\nfinally {\n") :]
     assert cleanup.index("$LifecycleProcessStillRunning") < cleanup.index(

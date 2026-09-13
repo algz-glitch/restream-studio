@@ -26,6 +26,7 @@ def test_windows_packaging_files_exist() -> None:
         "scripts/package.ps1",
         "scripts/build-installer.ps1",
         "scripts/smoke-installer.ps1",
+        "scripts/run-smoke-installer-elevated.ps1",
         "README.md",
     )
     assert all((ROOT / item).is_file() for item in required)
@@ -121,7 +122,9 @@ def test_installer_smoke_restores_only_complete_exact_snapshots() -> None:
     assert "Get-NetFirewallInterfaceFilter" in smoke
     assert "Get-NetFirewallInterfaceTypeFilter" in smoke
     assert "Get-NetFirewallServiceFilter" in smoke
-    assert "if ($SnapshotCaptured -and $FirewallMutationPossible)" in smoke
+    assert "existing canonical/legacy firewall rules prevent isolated smoke" in smoke
+    assert "Remove-IsolatedFirewallRules" in smoke
+    assert "New-NetFirewallRule" not in smoke
     assert "non-standard pre-existing Restream Studio firewall rule" in smoke
 
 
@@ -134,6 +137,8 @@ def test_installer_smoke_shortcut_backups_are_independent_and_hash_verified() ->
     assert "$StartMenuBackupHash" in smoke
     assert "Backup-Shortcut" in smoke
     assert "Restore-ShortcutAtomically" in smoke
+    assert "desktop shortcut restore failed" in smoke
+    assert "start menu shortcut restore failed" in smoke
     assert "File]::Replace" in smoke
     assert "backup hash verification failed" in smoke
 
@@ -149,22 +154,26 @@ def test_smoke_paths_reject_reparse_ancestors_and_cleanup_fixed_appid_only() -> 
     assert "DeleteSubKeyTree($UninstallSubKey" in smoke
     assert "Remove-IsolatedUninstallRegistration" in smoke
     assert "HasReparsePointAncestor" in installer
-    assert "[IO.FileAttributes]::ReparsePoint" in installer
+    assert "GetFileAttributesW@kernel32.dll stdcall" in installer
+    reparse = installer[installer.index("function HasReparsePointAncestor") : installer.index("function IsTempSmokePath")]
+    assert "powershell.exe" not in reparse
 
 
-def test_installer_processes_are_bounded_and_smoke_self_elevates_once() -> None:
+def test_installer_processes_are_bounded_and_smoke_requires_administrator() -> None:
     smoke = _read("scripts/smoke-installer.ps1")
 
     assert "Invoke-BoundedProcess" in smoke
     assert "WaitForExit($TimeoutSeconds * 1000)" in smoke
     assert "taskkill.exe" in smoke
-    assert "'RunAs'" in smoke
-    assert "$ElevatedChild" in smoke
-    assert "$ElevatedPayload" in smoke
-    assert "ConvertTo-Json -Compress" in smoke
-    assert "ToBase64String" in smoke
-    assert "elevation broker timed out" in smoke
+    assert "installer lifecycle smoke requires administrator PowerShell" in smoke
+    assert "RunAs" not in smoke
+    assert "ElevatedChild" not in smoke
     assert "Invoke-NativeChecked" not in smoke
+    broker = _read("scripts/run-smoke-installer-elevated.ps1")
+    assert "-Verb RunAs" in broker
+    assert "-EncodedCommand" in broker
+    assert "-Wait -PassThru" in broker
+    assert "taskkill" not in broker
 
 
 def test_smoke_build_uses_real_upgrade_version_and_failure_injection_fixture() -> None:
@@ -192,6 +201,13 @@ def test_smoke_build_uses_real_upgrade_version_and_failure_injection_fixture() -
     assert "-BuildSmokeFixtures" in verify
     assert "-BuildSmokeFixtures" not in release
     assert "/DSmokeTestBuild" not in release
+    assert "VersionOverride is restricted to the smoke-only 0.1.1 payload build" in _read(
+        "scripts/package.ps1"
+    )
+    assert '(str(version_file), "restream_studio")' in _read(
+        "packaging/restream-studio.spec"
+    )
+    assert '$health.version -eq $ExpectedVersion' in smoke
 
 
 def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> None:
@@ -212,7 +228,7 @@ def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> No
 def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation() -> None:
     installer = _read("packaging/restream-studio.iss")
     assert "function PrepareToInstall" not in installer
-    assert 'Source: "..\\dist\\RestreamStudio\\RestreamStudio.exe"' in installer
+    assert 'Source: "{#MyDistributionDir}\\RestreamStudio.exe"' in installer
     files = installer[installer.index("[Files]") : installer.index("[Icons]")]
     assert "AfterInstall: ConfigureFirewall" in files
     assert "procedure CurStepChanged(CurStep: TSetupStep)" in installer

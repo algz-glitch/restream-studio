@@ -96,6 +96,7 @@ function Assert-Distribution {
         'Enable-Localhost.ps1',
         'Enable-Localhost.cmd',
         '_internal\restream_studio\static\index.html',
+        '_internal\restream_studio\version.txt',
         '_internal\ffmpeg.exe',
         '_internal\ffprobe.exe',
         '_internal\defaults\default-standby.mp4',

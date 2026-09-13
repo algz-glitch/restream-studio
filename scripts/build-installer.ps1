@@ -66,6 +66,8 @@ $Installer = Join-Path $InstallerDirectory "RestreamStudio-Setup-$Version.exe"
 $SmokeUpgradeVersion = '0.1.1'
 $SmokeUpgradeInstaller = Join-Path $InstallerDirectory `
     "RestreamStudio-Setup-$SmokeUpgradeVersion.exe"
+$SmokeDistributionRoot = Join-Path $Root 'dist\smoke-upgrade'
+$SmokeDistribution = Join-Path $SmokeDistributionRoot 'RestreamStudio'
 if ($ResolveVersionOnly) {
     Write-Output "RELEASE_VERSION=$Version"
     Write-Output "INSTALLER_PATH=$Installer"
@@ -272,9 +274,17 @@ if ($BuildSmokeFixtures) {
     if ($Version -cne '0.1.0') {
         throw 'smoke upgrade fixture is defined only for the 0.1.0 release baseline'
     }
-    Invoke-External $iscc @(
-        '/DMyAppVersion=0.1.1', '/DSmokeTestBuild=1', $InstallerScript
-    )
+    & $PackageScript -OutputDirectory $SmokeDistributionRoot -SmokeBuild `
+        -VersionOverride $SmokeUpgradeVersion
+    if ($LASTEXITCODE -ne 0) { throw 'smoke payload package build failed' }
+    $releaseExe = Join-Path $distribution 'RestreamStudio.exe'
+    $smokeExe = Join-Path $SmokeDistribution 'RestreamStudio.exe'
+    if ((Get-FileHash $releaseExe -Algorithm SHA256).Hash -ceq
+        (Get-FileHash $smokeExe -Algorithm SHA256).Hash) {
+        throw 'smoke upgrade executable must differ from the release executable'
+    }
+    Invoke-External $iscc @('/DMyAppVersion=0.1.1', '/DSmokeTestBuild=1',
+        "/DMyDistributionDir=$SmokeDistribution", $InstallerScript)
     if (-not (Test-Path -LiteralPath $SmokeUpgradeInstaller -PathType Leaf)) {
         throw "smoke upgrade installer is missing: $SmokeUpgradeInstaller"
     }

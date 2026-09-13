@@ -5,7 +5,9 @@ param(
     [switch]$ReuseVerifiedOutput,
     [string]$PackageManifest = '',
     [switch]$ReuseFrontend,
-    [string]$FrontendManifest = ''
+    [string]$FrontendManifest = '',
+    [switch]$SmokeBuild,
+    [string]$VersionOverride = ''
 )
 
 Set-StrictMode -Version Latest
@@ -21,6 +23,13 @@ $Spec = Join-Path $Root 'packaging\restream-studio.spec'
 $LockFile = Join-Path $Root 'package-lock.json'
 $TreeManifestTool = Join-Path $Root 'scripts\write-tree-manifest.py'
 $ProjectVersion = ([IO.File]::ReadAllText((Join-Path $Root 'package.json')) | ConvertFrom-Json).version
+if ($VersionOverride) {
+    if (-not $SmokeBuild -or $VersionOverride -cne '0.1.1') {
+        throw 'VersionOverride is restricted to the smoke-only 0.1.1 payload build'
+    }
+    $ProjectVersion = $VersionOverride
+}
+elseif ($SmokeBuild) { throw 'SmokeBuild requires VersionOverride' }
 $CurrentCommit = ''
 if ($ReuseVerifiedOutput -or $ReuseFrontend) {
     $CurrentCommit = (& git -C $Root rev-parse --verify HEAD).Trim()
@@ -135,6 +144,8 @@ $Ffprobe = Resolve-Tool -Name 'ffprobe.exe' -EnvironmentName 'FFPROBE_PATH' `
 
 Remove-WorkspaceDirectory $InputDirectory
 New-Item -ItemType Directory -Force -Path (Join-Path $InputDirectory 'licenses') | Out-Null
+[IO.File]::WriteAllText((Join-Path $InputDirectory 'version.txt'), $ProjectVersion,
+    [Text.Encoding]::ASCII)
 Copy-Item -LiteralPath $Ffmpeg -Destination (Join-Path $InputDirectory 'ffmpeg.exe')
 Copy-Item -LiteralPath $Ffprobe -Destination (Join-Path $InputDirectory 'ffprobe.exe')
 Copy-Item -LiteralPath (Join-Path $Root 'packaging\licenses\THIRD-PARTY-NOTICES.txt') `

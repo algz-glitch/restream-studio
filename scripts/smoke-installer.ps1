@@ -1,6 +1,6 @@
 [CmdletBinding()]
-param([string]$Installer = '', [string]$UpgradeInstaller = '', [string]$WorkspaceRoot = '',
-    [switch]$ElevatedChild, [string]$ElevatedPayload = '')
+param([Parameter(Mandatory)][string]$Installer,
+    [Parameter(Mandatory)][string]$UpgradeInstaller, [string]$WorkspaceRoot = '')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -21,9 +21,9 @@ function Stop-KnownProcessTree {
 
 function Invoke-BoundedProcess {
     param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds = 300,
-        [string]$Verb = '', [string]$TimeoutMessage = 'process timed out', [switch]$AllowNonZero)
+        [string]$TimeoutMessage = 'process timed out', [switch]$AllowNonZero)
     $p = @{ FilePath = $FilePath; ArgumentList = $Arguments; PassThru = $true }
-    if ($Verb) { $p['Verb'] = $Verb } else { $p['WindowStyle'] = 'Hidden' }
+    $p['WindowStyle'] = 'Hidden'
     $child = Start-Process @p
     try {
         if (-not $child.WaitForExit($TimeoutSeconds * 1000)) {
@@ -38,35 +38,6 @@ function Invoke-BoundedProcess {
     finally { $child.Dispose() }
 }
 
-function Invoke-ElevatedSelf {
-    param([string]$Payload)
-    $powershell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
-    $scriptPath = (Resolve-Path -LiteralPath $PSCommandPath).Path
-    $args = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',
-        "`"$scriptPath`"",'-ElevatedChild','-ElevatedPayload',$Payload)
-    return Invoke-BoundedProcess $powershell $args 900 'RunAs' 'elevation broker timed out'
-}
-
-if ($ElevatedChild) {
-    if (-not (Test-IsAdministrator)) { throw 'elevated child is not administrator' }
-    try { $payload = [Text.Encoding]::UTF8.GetString(
-            [Convert]::FromBase64String($ElevatedPayload)) | ConvertFrom-Json }
-    catch { throw 'invalid elevated payload' }
-    if ((@($payload.PSObject.Properties.Name | Sort-Object) -join ',') -cne
-        'installer,upgrade_installer,workspace_root') { throw 'invalid elevated payload schema' }
-    $Installer = $payload.installer; $UpgradeInstaller = $payload.upgrade_installer
-    $WorkspaceRoot = $payload.workspace_root
-}
-elseif (-not (Test-IsAdministrator)) {
-    foreach ($value in ($Installer,$UpgradeInstaller,$WorkspaceRoot)) {
-        if (-not [IO.Path]::IsPathFullyQualified($value)) { throw 'elevation paths must be absolute' }
-    }
-    $json = [ordered]@{installer=$Installer;upgrade_installer=$UpgradeInstaller;
-        workspace_root=$WorkspaceRoot} | ConvertTo-Json -Compress
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-    exit (Invoke-ElevatedSelf $encoded)
-}
-
 $Root = if ($WorkspaceRoot) {
     [IO.Path]::GetFullPath($WorkspaceRoot)
 }
@@ -75,12 +46,14 @@ else {
 }
 $Installer = (Resolve-Path -LiteralPath $Installer -ErrorAction Stop).Path
 $UpgradeInstaller = (Resolve-Path -LiteralPath $UpgradeInstaller -ErrorAction Stop).Path
+if (-not (Test-IsAdministrator)) { throw 'installer lifecycle smoke requires administrator PowerShell' }
 $SmokeParent = Join-Path $Root 'artifacts\smoke'
 $SmokeRoot = Join-Path $SmokeParent "RestreamStudioInstallerSmoke-$([Guid]::NewGuid().ToString('N'))"
 $InstallDir = Join-Path $SmokeRoot 'app'
 $UserDataDir = Join-Path $SmokeRoot 'data'
 $BackupDir = Join-Path $SmokeRoot 'backup'
 $Distribution = Join-Path $Root 'dist\RestreamStudio'
+$UpgradeDistribution = Join-Path $Root 'dist\smoke-upgrade\RestreamStudio'
 $RuleName = 'RestreamStudio-Installed-Localhost'
 $LegacyRuleDisplayName = 'Restream Studio (Loopback TCP)'
 $UninstallRegistryPath = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -265,38 +238,30 @@ function Get-FirewallSnapshot {
     })
 }
 
-function Remove-SmokeFirewallRules {
-    @(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) |
-        Remove-NetFirewallRule -ErrorAction Stop
-    @(Get-NetFirewallRule -DisplayName $LegacyRuleDisplayName -ErrorAction SilentlyContinue) |
-        Remove-NetFirewallRule -ErrorAction Stop
-}
-
-function Restore-FirewallSnapshot {
-    Remove-SmokeFirewallRules
-    foreach ($rule in $InitialFirewall) {
-        $arguments = @{
-            Name=$rule.Name; DisplayName=$rule.DisplayName; Enabled='True'; Profile='Any'
-            Direction='Inbound'; Action='Allow'; EdgeTraversalPolicy='Block'; Program=$rule.Program
-            Protocol='TCP'; LocalPort='Any'; RemotePort='Any'
-            LocalAddress='127.0.0.1'; RemoteAddress='127.0.0.1'
-            InterfaceAlias='Any'; InterfaceType='Any'; Service='Any'
+function Remove-IsolatedFirewallRules {
+    $rules = @(@(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) +
+        @(Get-NetFirewallRule -DisplayName $LegacyRuleDisplayName -ErrorAction SilentlyContinue) |
+        Sort-Object Name -Unique)
+    foreach ($rule in $rules) {
+        $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
+        if (Test-PathInside $application.Program $InstallDir) {
+            $rule | Remove-NetFirewallRule -ErrorAction Stop
         }
-        if ($rule.Description) { $arguments.Description = $rule.Description }
-        if ($rule.Group) { $arguments.Group = $rule.Group }
-        New-NetFirewallRule @arguments -ErrorAction Stop | Out-Null
     }
-    $restored = @(Get-FirewallSnapshot) | ConvertTo-Json -Depth 5 -Compress
-    if ($restored -cne $InitialFirewallFingerprint) {
-        throw 'targeted firewall state was not restored exactly'
+    $remaining = @(@(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) +
+        @(Get-NetFirewallRule -DisplayName $LegacyRuleDisplayName -ErrorAction SilentlyContinue) |
+        Sort-Object Name -Unique)
+    if ($remaining.Count -ne 0) {
+        throw 'refusing to remove non-isolated Restream Studio firewall rule'
     }
 }
 
 function Assert-InstalledFiles {
-    $sourceFiles = @(Get-ChildItem -LiteralPath $Distribution -File -Recurse)
+    param([string]$ExpectedDistribution=$Distribution)
+    $sourceFiles = @(Get-ChildItem -LiteralPath $ExpectedDistribution -File -Recurse)
     if ($sourceFiles.Count -eq 0) { throw 'packaged distribution is empty' }
     foreach ($source in $sourceFiles) {
-        $relative = $source.FullName.Substring($Distribution.Length).TrimStart('\')
+        $relative = $source.FullName.Substring($ExpectedDistribution.Length).TrimStart('\')
         $target = Join-Path $InstallDir $relative
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
             throw "installed file is missing: $relative"
@@ -358,6 +323,7 @@ function Assert-FirewallRule {
 }
 
 function Start-And-TestInstalledApplication {
+    param([string]$ExpectedVersion)
     $script:Port = Get-DynamicPort
     $stdout = Join-Path $SmokeRoot "app-$Port.stdout.log"
     $stderr = Join-Path $SmokeRoot "app-$Port.stderr.log"
@@ -382,6 +348,7 @@ function Start-And-TestInstalledApplication {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
             $ui = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -TimeoutSec 2
             if ($health.status -eq 'ok' -and $health.app -eq 'restream-studio' -and
+                $health.version -eq $ExpectedVersion -and
                 $ui.StatusCode -eq 200 -and $ui.Content -match '<title>\s*Restream Studio\s*</title>') {
                 return
             }
@@ -474,6 +441,9 @@ try {
     Backup-Shortcut $DesktopShortcut $DesktopBackup ([ref]$DesktopBackupSucceeded) ([ref]$DesktopBackupHash)
     Backup-Shortcut $StartMenuShortcut $StartMenuBackup ([ref]$StartMenuBackupSucceeded) ([ref]$StartMenuBackupHash)
     $InitialFirewall = @(Get-FirewallSnapshot)
+    if ($InitialFirewall.Count -ne 0) {
+        throw 'existing canonical/legacy firewall rules prevent isolated smoke'
+    }
     $InitialFirewallFingerprint = ConvertTo-Json -InputObject @($InitialFirewall) -Depth 5 -Compress
     $SnapshotCaptured = $true
 
@@ -489,7 +459,7 @@ try {
     Assert-Shortcuts
     Assert-UninstallRegistration '0.1.0' | Out-Null
     Assert-FirewallRule
-    Start-And-TestInstalledApplication
+    Start-And-TestInstalledApplication '0.1.0'
     Stop-InstalledApplication
 
     New-Item -ItemType Directory -Path $UserDataDir -Force | Out-Null
@@ -499,11 +469,13 @@ try {
     $markerHash = (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash
 
     $program=Join-Path $InstallDir 'RestreamStudio.exe'
-    $expectedProgramHash=(Get-FileHash (Join-Path $Distribution 'RestreamStudio.exe') -Algorithm SHA256).Hash
+    $releaseProgramHash=(Get-FileHash (Join-Path $Distribution 'RestreamStudio.exe') -Algorithm SHA256).Hash
+    $expectedProgramHash=(Get-FileHash (Join-Path $UpgradeDistribution 'RestreamStudio.exe') -Algorithm SHA256).Hash
+    if($releaseProgramHash -ceq $expectedProgramHash){throw 'upgrade payload executable is not distinct'}
     $bytes=[IO.File]::ReadAllBytes($program); $bytes[0]=$bytes[0] -bxor 1; [IO.File]::WriteAllBytes($program,$bytes)
     $tamperedProgramHash=(Get-FileHash $program -Algorithm SHA256).Hash
     Invoke-Install -Setup $UpgradeInstaller
-    Assert-InstalledFiles
+    Assert-InstalledFiles $UpgradeDistribution
     Assert-Shortcuts
     Assert-UninstallRegistration '0.1.1' | Out-Null
     Assert-FirewallRule
@@ -514,7 +486,7 @@ try {
     $upgradedProgramHash=(Get-FileHash $program -Algorithm SHA256).Hash
     if($upgradedProgramHash -cne $expectedProgramHash -or $upgradedProgramHash -ceq $tamperedProgramHash){throw 'program file was not replaced by upgrade'}
 
-    Start-And-TestInstalledApplication
+    Start-And-TestInstalledApplication '0.1.1'
     Invoke-Uninstall
     $Process.WaitForExit(15000) | Out-Null
     if (-not (Wait-LocalPortReleased -PortNumber $Port)) { throw 'uninstall did not release the API port' }
@@ -544,8 +516,9 @@ try {
 finally {
     $cleanupErrors = [Collections.Generic.List[string]]::new()
     try { Stop-InstalledApplication } catch { $cleanupErrors.Add($_.Exception.Message) }
-    $testEntry = Get-UninstallEntry
-    if ($null -ne $testEntry -and $testEntry.InstallLocation -and
+    try {
+      $testEntry = Get-UninstallEntry
+      if ($null -ne $testEntry -and $testEntry.InstallLocation -and
         (Test-PathInside -Path $testEntry.InstallLocation -Parent $SmokeParent)) {
         $uninstaller = Join-Path $testEntry.InstallLocation 'unins000.exe'
         if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
@@ -557,20 +530,25 @@ finally {
             }
             catch { $cleanupErrors.Add($_.Exception.Message) }
         }
-        if($null -ne (Get-UninstallEntry)){Remove-IsolatedUninstallRegistration}
-    }
+        if ($null -ne (Get-UninstallEntry)) { Remove-IsolatedUninstallRegistration }
+      }
+    } catch { $cleanupErrors.Add("registry cleanup failed: $($_.Exception.Message)") }
     if ($SnapshotCaptured -and $FirewallMutationPossible) {
-        try { Restore-FirewallSnapshot } catch { $cleanupErrors.Add("firewall restore failed: $($_.Exception.Message)") }
+        try { Remove-IsolatedFirewallRules } catch { $cleanupErrors.Add("firewall cleanup failed: $($_.Exception.Message)") }
     }
+    try { Restore-ShortcutAtomically $DesktopShortcut $DesktopExisted `
+        $DesktopBackupSucceeded $DesktopBackup $DesktopBackupHash }
+    catch { $cleanupErrors.Add("desktop shortcut restore failed: $($_.Exception.Message)") }
+    try { Restore-ShortcutAtomically $StartMenuShortcut $StartMenuExisted `
+        $StartMenuBackupSucceeded $StartMenuBackup $StartMenuBackupHash }
+    catch { $cleanupErrors.Add("start menu shortcut restore failed: $($_.Exception.Message)") }
     try {
-        Restore-ShortcutAtomically $DesktopShortcut $DesktopExisted $DesktopBackupSucceeded $DesktopBackup $DesktopBackupHash
-        Restore-ShortcutAtomically $StartMenuShortcut $StartMenuExisted $StartMenuBackupSucceeded $StartMenuBackup $StartMenuBackupHash
         if (-not $StartMenuGroupExisted -and (Test-Path -LiteralPath $StartMenuGroup -PathType Container) -and
             @(Get-ChildItem -LiteralPath $StartMenuGroup -Force).Count -eq 0) {
             Remove-Item -LiteralPath $StartMenuGroup -Force
         }
     }
-    catch { $cleanupErrors.Add("shortcut restore failed: $($_.Exception.Message)") }
+    catch { $cleanupErrors.Add("start menu group cleanup failed: $($_.Exception.Message)") }
     try { Remove-SafeTree -Path $SmokeRoot } catch { $cleanupErrors.Add($_.Exception.Message) }
     if ($cleanupErrors.Count -gt 0) {
         throw "installer lifecycle cleanup failed: $($cleanupErrors -join '; ')"

@@ -20,8 +20,9 @@ if not PACKAGE_INPUT.is_dir():
 ffmpeg = PACKAGE_INPUT / "ffmpeg.exe"
 ffprobe = PACKAGE_INPUT / "ffprobe.exe"
 standby = PACKAGE_INPUT / "default-standby.mp4"
+version_file = PACKAGE_INPUT / "version.txt"
 licenses = PACKAGE_INPUT / "licenses"
-for required in (ffmpeg, ffprobe, standby, licenses):
+for required in (ffmpeg, ffprobe, standby, licenses, version_file):
     if not required.exists():
         raise RuntimeError(f"required package input is missing: {required.name}")
 
@@ -34,6 +35,7 @@ datas = [
     (str(STATIC), "restream_studio/static"),
     (str(standby), "defaults"),
     (str(licenses), "licenses"),
+    (str(version_file), "restream_studio"),
     *((str(ROOT / filename), "metadata") for filename in metadata_files),
 ]
 datas += collect_data_files("streamget")

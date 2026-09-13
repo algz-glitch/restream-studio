@@ -5,6 +5,9 @@
 #ifndef SmokeTestBuild
 #define SmokeTestBuild 0
 #endif
+#ifndef MyDistributionDir
+#define MyDistributionDir "..\dist\RestreamStudio"
+#endif
 #define MyAppPublisher "Restream Studio"
 #define MyAppExeName "RestreamStudio.exe"
 
@@ -30,9 +33,9 @@ RestartApplications=no
 DisableProgramGroupPage=yes
 
 [Files]
-Source: "..\dist\RestreamStudio\RestreamStudio.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\RestreamStudio\*"; DestDir: "{app}"; Excludes: "RestreamStudio.exe,RestreamStudioUpdateHelper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\dist\RestreamStudio\RestreamStudioUpdateHelper.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyDistributionDir}\RestreamStudio.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyDistributionDir}\*"; DestDir: "{app}"; Excludes: "RestreamStudio.exe,RestreamStudioUpdateHelper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MyDistributionDir}\RestreamStudioUpdateHelper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "firewall-install.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion
 Source: "firewall-remove.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion; AfterInstall: ConfigureFirewall
 
@@ -44,6 +47,10 @@ Name: "{group}\Restream Studio"; Filename: "{app}\RestreamStudio.exe"
 Type: filesandordirs; Name: "{code:GetUserDataDir}"; Check: ShouldDeleteUserData
 
 [Code]
+const
+  MY_FILE_ATTRIBUTE_REPARSE_POINT = $400;
+  MY_INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+
 var
   DeleteDataDecisionMade: Boolean;
   DeleteUserData: Boolean;
@@ -93,24 +100,28 @@ begin
     (FullValue[Length(FullRoot) + 1] = '\');
 end;
 
+function GetFileAttributesW(lpFileName: String): LongWord;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
 function HasReparsePointAncestor(const Value: String): Boolean;
 var
-  EscapedPath: String;
-  Parameters: String;
-  ResultCode: Integer;
-  Started: Boolean;
+  CurrentPath: String;
+  ParentPath: String;
+  Attributes: LongWord;
 begin
-  EscapedPath := ExpandFileName(Value);
-  StringChangeEx(EscapedPath, '''', '''''', True);
-  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& {' +
-    '$p=''' + EscapedPath + ''';while($p){if(Test-Path -LiteralPath $p){' +
-    '$i=Get-Item -LiteralPath $p -Force -EA Stop;' +
-    'if(($i.Attributes-band [IO.FileAttributes]::ReparsePoint)-ne 0){exit 10}};' +
-    '$n=[IO.Path]::GetDirectoryName($p);if((-not $n)-or($n-eq $p)){break};$p=$n};exit 0}"';
-  ResultCode := -1;
-  Started := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Result := (not Started) or (ResultCode <> 0);
+  Result := False;
+  CurrentPath := RemoveBackslashUnlessRoot(ExpandFileName(Value));
+  while CurrentPath <> '' do begin
+    Attributes := GetFileAttributesW(CurrentPath);
+    if (Attributes <> MY_INVALID_FILE_ATTRIBUTES) and
+       ((Attributes and MY_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then begin
+      Result := True;
+      Exit;
+    end;
+    ParentPath := ExtractFileDir(CurrentPath);
+    if CompareText(ParentPath, CurrentPath) = 0 then Exit;
+    CurrentPath := ParentPath;
+  end;
 end;
 
 function IsTempSmokePath(const Value: String): Boolean;

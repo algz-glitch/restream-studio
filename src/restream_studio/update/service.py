@@ -188,6 +188,9 @@ class UpdateService:
         if self._operation_lock.locked():
             raise UpdateOperationError("check_in_progress", "Update operation already in progress")
         async with self._operation_lock:
+            stable_state = self._state
+            stable_manifest = self._manifest
+            stable_installer = self._installer
             await self._commit_state(
                 UpdateSnapshot(
                     UpdateStatus.CHECKING,
@@ -209,7 +212,13 @@ class UpdateService:
                     error_code="check_failed",
                     error_message="Update check failed",
                 )
-                await self._commit_state(candidate)
+                try:
+                    await self._commit_state(candidate)
+                except UpdateOperationError:
+                    self._restore_stable_state(
+                        stable_state, stable_manifest, stable_installer
+                    )
+                    raise
                 return self._state
             checked_at = self._aware_now()
             if result.update_available and result.manifest is not None:
@@ -234,7 +243,13 @@ class UpdateService:
                     self._current_version,
                     last_checked_at=checked_at,
                 )
-            await self._commit_state(candidate)
+            try:
+                await self._commit_state(candidate)
+            except UpdateOperationError:
+                self._restore_stable_state(
+                    stable_state, stable_manifest, stable_installer
+                )
+                raise
             self._manifest = result.manifest if result.update_available else None
             return self._state
 
@@ -245,6 +260,9 @@ class UpdateService:
         if self._state.status is not UpdateStatus.AVAILABLE or self._manifest is None:
             raise UpdateOperationError("update_check_required", "Check for an update first")
         async with self._operation_lock:
+            stable_state = self._state
+            stable_manifest = self._manifest
+            stable_installer = self._installer
             selected = self._manifest
             destination = (
                 self._update_dir / f"RestreamStudio-Setup-{selected.version}.exe"
@@ -282,13 +300,47 @@ class UpdateService:
                     error_code=code.value if code is not None else "download_failed",
                     error_message="Update download failed",
                 )
-            await self._commit_state(candidate)
+            try:
+                await self._commit_state(candidate)
+            except UpdateOperationError:
+                self._restore_stable_state(
+                    stable_state, stable_manifest, stable_installer
+                )
+                await asyncio.to_thread(self._cleanup_download_artifacts, destination)
+                raise
             self._installer = (
                 result.path.resolve(strict=False)
                 if result.status is DownloadStatus.SUCCESS and result.path is not None
                 else None
             )
             return self._state
+
+    def _restore_stable_state(
+        self,
+        state: UpdateSnapshot,
+        manifest: UpdateManifest | None,
+        installer: Path | None,
+    ) -> None:
+        self._state = state
+        self._manifest = manifest
+        self._installer = installer
+
+    @staticmethod
+    def _cleanup_download_artifacts(destination: Path) -> None:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            partials = tuple(destination.parent.glob(f".{destination.name}.*.partial"))
+        except OSError:
+            return
+        for partial in partials:
+            try:
+                if partial.parent == destination.parent:
+                    partial.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def install(self, *, current_pid: int) -> None:
         self._raise_if_installing()

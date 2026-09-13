@@ -228,11 +228,20 @@ async def test_check_persistence_failure_keeps_previous_state_for_every_result(
         client=FakeClient(result),
         state_writer=writer,
     )
+    previous = service.snapshot()
     with pytest.raises(UpdateOperationError) as error:
         await service.check()
     assert error.value.code == "filesystem"
     assert error.value.message == "Update state could not be saved"
-    assert service.snapshot().status is UpdateStatus.CHECKING
+    assert service.snapshot() == previous
+    retried = await service.check()
+    assert retried.status is (
+        UpdateStatus.AVAILABLE
+        if result.update_available
+        else UpdateStatus.FAILED
+        if result.error_code is not None
+        else UpdateStatus.CURRENT
+    )
 
 
 @pytest.mark.asyncio
@@ -262,18 +271,22 @@ async def test_download_persistence_failure_keeps_previous_state_for_all_results
     selected = manifest()
 
     class DownloadClient(FakeClient):
+        attempts = 0
+
         def download_installer_result(
             self, selected_manifest: UpdateManifest, destination: Path
         ) -> DownloadResult:
+            self.attempts += 1
             if download_succeeds:
                 return super().download_installer_result(selected_manifest, destination)
             return DownloadResult.failed(
                 selected_manifest, UpdateErrorCode.NETWORK, "private download detail"
             )
 
+    client = DownloadClient(UpdateCheckResult.available(selected))
     service = UpdateService(
         tmp_path / "update",
-        client=DownloadClient(UpdateCheckResult.available(selected)),
+        client=client,
     )
     await service.check()
     writes = 0
@@ -288,7 +301,14 @@ async def test_download_persistence_failure_keeps_previous_state_for_all_results
     with pytest.raises(UpdateOperationError) as error:
         await service.download()
     assert error.value.code == "filesystem"
-    assert service.snapshot().status is UpdateStatus.DOWNLOADING
+    assert service.snapshot().status is UpdateStatus.AVAILABLE
+    destination = tmp_path / "update" / "RestreamStudio-Setup-0.2.0.exe"
+    assert not destination.exists()
+    retried = await service.download()
+    assert retried.status is (
+        UpdateStatus.READY if download_succeeds else UpdateStatus.FAILED
+    )
+    assert client.attempts == 2
 
 
 @pytest.mark.asyncio

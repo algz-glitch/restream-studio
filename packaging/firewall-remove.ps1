@@ -37,11 +37,26 @@ if (-not $isAdministrator) {
     exit 0
 }
 
-Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule -ErrorAction Stop
-Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule -ErrorAction Stop
-if ((Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) -or
-    (Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue)) {
-    throw 'firewall rule removal verification failed'
+$candidates = @(
+    @(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) +
+    @(Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue)
+) | Sort-Object -Property Name -Unique
+foreach ($rule in $candidates) {
+    try { $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop }
+    catch { continue }
+    if ($application.Program -ieq $resolvedExecutable) {
+        $rule | Remove-NetFirewallRule -ErrorAction Stop
+    }
+}
+
+$remaining = @(
+    @(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) +
+    @(Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue)
+) | Sort-Object -Property Name -Unique
+foreach ($rule in $remaining) {
+    try { $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop }
+    catch { continue }
+    if ($application.Program -ieq $resolvedExecutable) {
+        throw 'firewall rule removal verification failed'
+    }
 }

@@ -59,7 +59,10 @@ def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation()
     installer = _read("packaging/restream-studio.iss")
     assert "function PrepareToInstall" not in installer
     assert 'Source: "..\\dist\\RestreamStudio\\RestreamStudio.exe"' in installer
-    assert "AfterInstall: ConfigureInstalledFirewall" in installer
+    files = installer[installer.index("[Files]") : installer.index("[Icons]")]
+    assert "AfterInstall" not in files
+    assert "procedure CurStepChanged(CurStep: TSetupStep)" in installer
+    assert "CurStep = ssPostInstall" in installer
     assert "procedure ConfigureInstalledFirewall" in installer
     assert "ShellExec('runas'" in installer
     assert "ResultCode" in installer
@@ -71,10 +74,45 @@ def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation()
     assert "-File" not in installer
     assert "Flags: dontcopy" not in installer
     assert "HexEncode(ApplicationPath)" in installer
+    assert "$p='''';for($i=0;" in installer
+    assert "-join (for(" not in installer
     assert "-Command" in installer
     assert "RestreamStudio-Installed-Localhost" in installer
     assert "Restream Studio (Loopback TCP)" in installer
-    assert "$hadValid" in installer
+    assert "$restoreProgram" in installer
+    assert "$a.Program" in installer
+    assert "$a.Program -ieq $p" in installer
+    assert "[IO.Path]::GetFileName($a.Program)" in installer
+    assert "-Program $restoreProgram" in installer
+    assert "Sort-Object Name -Unique" in installer
+    install_command = installer[
+        installer.index("function InstalledFirewallCommand") :
+        installer.index("function RemoveInstalledFirewallCommand")
+    ]
+    capture = install_command[: install_command.index("'try{' +")]
+    assert "$a.Program-ieq $p" not in capture
+
+
+def test_inno_firewall_runs_after_every_file_and_before_only_optional_launch() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    last_file = installer.index('Source: "firewall-remove.ps1"')
+    post_install = installer.index("CurStep = ssPostInstall")
+    launch = installer.index("CurPageID = wpFinished")
+    assert last_file < post_install < launch
+
+
+def test_old_uninstaller_filters_canonical_and_legacy_rules_by_current_program() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    removal = installer[
+        installer.index("function RemoveInstalledFirewallCommand") :
+        installer.index("procedure ConfigureInstalledFirewall")
+    ]
+    assert "foreach($r in $candidates)" in removal
+    assert "$a.Program -ieq $p" in removal
+    assert "$r|Remove-NetFirewallRule" in removal
+    assert "Sort-Object Name -Unique" in removal
+    assert "firewall removal verification failed" in removal
+    assert "Get-NetFirewallRule -Name $n -EA SilentlyContinue|" not in removal
 
 
 def test_inno_offers_checked_postinstall_launch_only_when_interactive() -> None:
@@ -109,10 +147,12 @@ def test_firewall_hooks_self_elevate_and_scope_both_loopback_ends_to_program() -
     assert "$port.Protocol -eq 'TCP'" in install
     assert "$address.LocalAddress" in install
     assert "$address.RemoteAddress" in install
-    assert "$hadValid" in install
+    assert "$restoreProgram" in install
+    assert "-Program $restoreProgram" in install
     assert "Restream Studio (Loopback TCP)" in install
     assert "Remove-NetFirewallRule" in remove
     assert "Restream Studio (Loopback TCP)" in remove
+    assert "$application.Program -ieq $resolvedExecutable" in remove
     assert "firewall rule removal verification failed" in remove
 
 

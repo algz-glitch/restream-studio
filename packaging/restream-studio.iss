@@ -25,7 +25,7 @@ RestartApplications=no
 DisableProgramGroupPage=yes
 
 [Files]
-Source: "..\dist\RestreamStudio\RestreamStudio.exe"; DestDir: "{app}"; Flags: ignoreversion; AfterInstall: ConfigureInstalledFirewall
+Source: "..\dist\RestreamStudio\RestreamStudio.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\RestreamStudio\*"; DestDir: "{app}"; Excludes: "RestreamStudio.exe,RestreamStudioUpdateHelper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\dist\RestreamStudio\RestreamStudioUpdateHelper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "firewall-install.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion
@@ -99,22 +99,29 @@ begin
   Result :=
     '$ErrorActionPreference=''Stop'';' +
     '$h=$args[0];if(($h.Length%4)-ne 0){throw ''bad path''};' +
-    '$p=-join (for($i=0;$i-lt $h.Length;$i+=4){' +
-      '[char][Convert]::ToUInt16($h.Substring($i,4),16)});' +
+    '$p='''';for($i=0;$i-lt $h.Length;$i+=4){' +
+      '$p+=[char][Convert]::ToUInt16($h.Substring($i,4),16)};' +
     'if((-not [IO.Path]::IsPathFullyQualified($p))-or' +
       '([IO.Path]::GetFileName($p)-ine ''RestreamStudio.exe'')){throw ''bad path''};' +
     '$n=''RestreamStudio-Installed-Localhost'';' +
     '$legacy=''Restream Studio (Loopback TCP)'';' +
-    '$hadValid=$false;' +
-    'foreach($r in @(Get-NetFirewallRule -Name $n -EA SilentlyContinue)){' +
-      '$a=$r|Get-NetFirewallApplicationFilter;$q=$r|Get-NetFirewallPortFilter;' +
-      '$d=$r|Get-NetFirewallAddressFilter;' +
+    '$restoreProgram=$null;' +
+    '$candidates=@(@(Get-NetFirewallRule -Name $n -EA SilentlyContinue)+' +
+      '@(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue))|' +
+      'Sort-Object Name -Unique;' +
+    'foreach($r in $candidates){try{' +
+      '$a=$r|Get-NetFirewallApplicationFilter -EA Stop;' +
+      '$q=$r|Get-NetFirewallPortFilter -EA Stop;' +
+      '$d=$r|Get-NetFirewallAddressFilter -EA Stop;' +
       'if(($r.Direction-eq ''Inbound'')-and($r.Action-eq ''Allow'')-and' +
-      '($r.Enabled-eq ''True'')-and($a.Program-ieq $p)-and' +
+      '($r.Enabled-eq ''True'')-and' +
+      '([IO.Path]::IsPathFullyQualified($a.Program))-and' +
+      '([IO.Path]::GetFileName($a.Program)-ieq ''RestreamStudio.exe'')-and' +
       '($q.Protocol-eq ''TCP'')-and(@($d.LocalAddress).Count-eq 1)-and' +
       '(@($d.LocalAddress)[0]-eq ''127.0.0.1'')-and' +
       '(@($d.RemoteAddress).Count-eq 1)-and' +
-      '(@($d.RemoteAddress)[0]-eq ''127.0.0.1'')){$hadValid=$true}};' +
+      '(@($d.RemoteAddress)[0]-eq ''127.0.0.1'')){' +
+        '$restoreProgram=$a.Program;break}}catch{}};' +
     'try{' +
       'Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue|' +
         'Where-Object{$_.Name-ne $n}|Remove-NetFirewallRule -EA Stop;' +
@@ -137,9 +144,9 @@ begin
       '(@($d.RemoteAddress)[0]-ne ''127.0.0.1'')){throw ''bad scope''}' +
     '}catch{' +
       'Get-NetFirewallRule -Name $n -EA SilentlyContinue|Remove-NetFirewallRule;' +
-      'if($hadValid){New-NetFirewallRule -Name $n' +
+      'if($null-ne $restoreProgram){New-NetFirewallRule -Name $n' +
         ' -DisplayName ''Restream Studio Installed localhost''' +
-        ' -Direction Inbound -Action Allow -Enabled True -Program $p' +
+        ' -Direction Inbound -Action Allow -Enabled True -Program $restoreProgram' +
         ' -Protocol TCP -LocalAddress ''127.0.0.1''' +
         ' -RemoteAddress ''127.0.0.1'' -Profile Any' +
         ' -EdgeTraversalPolicy Block|Out-Null};throw}';
@@ -150,18 +157,23 @@ begin
   Result :=
     '$ErrorActionPreference=''Stop'';' +
     '$h=$args[0];if(($h.Length%4)-ne 0){throw ''bad path''};' +
-    '$p=-join (for($i=0;$i-lt $h.Length;$i+=4){' +
-      '[char][Convert]::ToUInt16($h.Substring($i,4),16)});' +
+    '$p='''';for($i=0;$i-lt $h.Length;$i+=4){' +
+      '$p+=[char][Convert]::ToUInt16($h.Substring($i,4),16)};' +
     'if([IO.Path]::GetFileName($p)-ine ''RestreamStudio.exe''){throw ''bad path''};' +
     '$n=''RestreamStudio-Installed-Localhost'';' +
     '$legacy=''Restream Studio (Loopback TCP)'';' +
-    'Get-NetFirewallRule -Name $n -EA SilentlyContinue|' +
-      'Remove-NetFirewallRule -EA Stop;' +
-    'Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue|' +
-      'Remove-NetFirewallRule -EA Stop;' +
-    'if((Get-NetFirewallRule -Name $n -EA SilentlyContinue)-or' +
-      '(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue)){' +
-      'throw ''firewall removal verification failed''}';
+    '$candidates=@(@(Get-NetFirewallRule -Name $n -EA SilentlyContinue)+' +
+      '@(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue))|' +
+    'Sort-Object Name -Unique;' +
+    'foreach($r in $candidates){try{' +
+      '$a=$r|Get-NetFirewallApplicationFilter -EA Stop;' +
+      'if($a.Program -ieq $p){$r|Remove-NetFirewallRule -EA Stop}}catch{continue}};' +
+    '$remaining=@(@(Get-NetFirewallRule -Name $n -EA SilentlyContinue)+' +
+      '@(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue))|' +
+      'Sort-Object Name -Unique;' +
+    'foreach($r in $remaining){$a=$null;try{' +
+      '$a=$r|Get-NetFirewallApplicationFilter -EA Stop}catch{continue};' +
+      'if($a.Program -ieq $p){throw ''firewall removal verification failed''}}';
 end;
 
 procedure ConfigureInstalledFirewall;
@@ -174,6 +186,12 @@ begin
   if (not RunElevatedPowerShell(InstalledFirewallCommand(), ApplicationPath,
     ResultCode)) or (ResultCode <> 0) then
     RaiseException('Firewall configuration failed; installation was rolled back.');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    ConfigureInstalledFirewall;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

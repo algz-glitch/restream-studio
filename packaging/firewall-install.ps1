@@ -37,21 +37,32 @@ if (-not $isAdministrator) {
     exit 0
 }
 
-$hadValid = $false
-foreach ($candidate in @(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue)) {
-    $candidateApplication = $candidate | Get-NetFirewallApplicationFilter
-    $candidatePort = $candidate | Get-NetFirewallPortFilter
-    $candidateAddress = $candidate | Get-NetFirewallAddressFilter
+$restoreProgram = $null
+$candidates = @(
+    @(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) +
+    @(Get-NetFirewallRule -DisplayName $LegacyDisplayName -ErrorAction SilentlyContinue)
+) | Sort-Object -Property Name -Unique
+foreach ($candidate in $candidates) {
+    try {
+        $candidateApplication = $candidate | Get-NetFirewallApplicationFilter
+        $candidatePort = $candidate | Get-NetFirewallPortFilter
+        $candidateAddress = $candidate | Get-NetFirewallAddressFilter
+    }
+    catch { continue }
     if (
         $candidate.Direction -eq 'Inbound' -and $candidate.Action -eq 'Allow' -and
         $candidate.Enabled -eq 'True' -and
-        $candidateApplication.Program -ieq $resolvedExecutable -and
+        [IO.Path]::IsPathFullyQualified($candidateApplication.Program) -and
+        [IO.Path]::GetFileName($candidateApplication.Program) -ieq 'RestreamStudio.exe' -and
         $candidatePort.Protocol -eq 'TCP' -and
         @($candidateAddress.LocalAddress).Count -eq 1 -and
         @($candidateAddress.LocalAddress)[0] -eq '127.0.0.1' -and
         @($candidateAddress.RemoteAddress).Count -eq 1 -and
         @($candidateAddress.RemoteAddress)[0] -eq '127.0.0.1'
-    ) { $hadValid = $true }
+    ) {
+        $restoreProgram = $candidateApplication.Program
+        break
+    }
 }
 
 try {
@@ -85,10 +96,10 @@ try {
 catch {
     Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue |
         Remove-NetFirewallRule
-    if ($hadValid) {
+    if ($null -ne $restoreProgram) {
         New-NetFirewallRule -Name $RuleName `
             -DisplayName 'Restream Studio Installed localhost' `
-            -Direction Inbound -Action Allow -Enabled True -Program $resolvedExecutable `
+            -Direction Inbound -Action Allow -Enabled True -Program $restoreProgram `
             -Protocol TCP -LocalAddress '127.0.0.1' -RemoteAddress '127.0.0.1' `
             -Profile Any -EdgeTraversalPolicy Block | Out-Null
     }

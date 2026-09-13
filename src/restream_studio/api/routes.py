@@ -294,10 +294,18 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
                 "relay_must_be_stopped",
                 "Stop all outputs before installing",
             )
-        try:
-            await update_service().install(current_pid=os.getpid())
-        except UpdateOperationError as error:
-            raise ApiError(409, error.code, error.message) from error
+        async with deps.write_lock:
+            snapshot = await deps.controller.snapshot()
+            if snapshot.desired_running:
+                raise ApiError(
+                    409,
+                    "relay_must_be_stopped",
+                    "Stop all outputs before installing",
+                )
+            try:
+                await update_service().install(current_pid=os.getpid())
+            except UpdateOperationError as error:
+                raise ApiError(409, error.code, error.message) from error
         return InstallResponse(status="restart_scheduled")
 
     @router.get("/api/source", response_model=SourceResponse)
@@ -434,6 +442,14 @@ def install_routes(deps: ApiDependencies) -> APIRouter:
     @router.post("/api/control/start", response_model=ControlResponse)
     async def start(value: StartRequest) -> ControlResponse:
         async with deps.write_lock:
+            if bool(
+                getattr(deps.update_service, "installation_pending", False)
+            ):
+                raise ApiError(
+                    409,
+                    "update_installing",
+                    "Update installation is pending",
+                )
             source, destinations = deps.database.configuration_snapshot()
             configured = {
                 item.kind: item for item in destinations if item.configured and item.enabled

@@ -113,8 +113,8 @@ def _default_helper_command() -> tuple[str, ...]:
     return (sys.executable, "-m", "restream_studio.update.helper")
 
 
-def _default_shutdown() -> None:
-    os.kill(os.getpid(), 15)
+def _no_shutdown_callback() -> None:
+    return None
 
 
 class UpdateService:
@@ -126,7 +126,7 @@ class UpdateService:
         client: UpdateClientPort | None = None,
         clock: Clock = _utc_now,
         launcher: Launcher = _launch,
-        shutdown_callback: ShutdownCallback = _default_shutdown,
+        shutdown_callback: ShutdownCallback = _no_shutdown_callback,
         helper_command: Sequence[str] | None = None,
         executable: Path | None = None,
     ) -> None:
@@ -149,6 +149,13 @@ class UpdateService:
 
     def snapshot(self) -> UpdateSnapshot:
         return self._state
+
+    @property
+    def installation_pending(self) -> bool:
+        return self._install_started
+
+    def set_shutdown_callback(self, callback: ShutdownCallback) -> None:
+        self._shutdown_callback = callback
 
     async def check(self) -> UpdateSnapshot:
         return await self._run_check(force=True)
@@ -393,7 +400,12 @@ class UpdateService:
             if payload["current_version"] != self._current_version:
                 return idle
             status = UpdateStatus(payload["status"])
-            if status in {UpdateStatus.CHECKING, UpdateStatus.DOWNLOADING, UpdateStatus.READY}:
+            if status in {
+                UpdateStatus.CHECKING,
+                UpdateStatus.AVAILABLE,
+                UpdateStatus.DOWNLOADING,
+                UpdateStatus.READY,
+            }:
                 return idle
             timestamp = payload["last_checked_at"]
             checked = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
@@ -401,15 +413,6 @@ class UpdateService:
                 return idle
             available = payload["available_version"]
             error_code = payload["error_code"]
-            if status is UpdateStatus.AVAILABLE:
-                if not isinstance(available, str) or error_code is not None:
-                    return idle
-                return UpdateSnapshot(
-                    status,
-                    self._current_version,
-                    available_version=available,
-                    last_checked_at=checked,
-                )
             if status is UpdateStatus.FAILED:
                 if (
                     not isinstance(error_code, str)

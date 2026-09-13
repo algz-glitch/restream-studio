@@ -147,6 +147,30 @@ async def test_automatic_check_is_throttled_for_24_hours_and_manual_check_is_not
 
 
 @pytest.mark.asyncio
+async def test_restart_discards_unusable_available_state_and_rechecks_before_download(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 13, 12, tzinfo=UTC)
+    first_client = FakeClient(UpdateCheckResult.available(manifest()))
+    first = UpdateService(tmp_path / "update", client=first_client, clock=lambda: now)
+    await first.check()
+
+    restarted_client = FakeClient(UpdateCheckResult.available(manifest()))
+    restarted = UpdateService(
+        tmp_path / "update",
+        client=restarted_client,
+        clock=lambda: now + timedelta(minutes=1),
+    )
+    assert restarted.snapshot().status is UpdateStatus.IDLE
+    assert restarted.snapshot().last_checked_at is None
+
+    checked = await restarted.automatic_check()
+    assert checked.status is UpdateStatus.AVAILABLE
+    assert restarted_client.check_calls == 1
+    assert (await restarted.download()).status is UpdateStatus.READY
+
+
+@pytest.mark.asyncio
 async def test_check_is_single_flight_and_sync_client_does_not_block_event_loop(
     tmp_path: Path,
 ) -> None:
@@ -291,6 +315,13 @@ def test_helper_rejects_relative_missing_or_mismatched_paths(tmp_path: Path) -> 
             "--pid", "4", "--pid", "5", "--installer", str(installer),
             "--executable", str(executable),
         ])
+    valid_installer = (tmp_path / "RestreamStudio-Setup-0.2.0.exe").resolve()
+    valid_installer.write_bytes(b"installer")
+    with pytest.raises(ValueError, match="RestreamStudio.exe"):
+        HelperArguments(4, valid_installer, (tmp_path / "Other.exe").resolve())
+    assert HelperArguments(
+        4, valid_installer, (tmp_path / "RESTREAMSTUDIO.EXE").resolve()
+    ).executable.name == "RESTREAMSTUDIO.EXE"
 
 
 def test_helper_waits_runs_inno_and_only_then_starts_application(tmp_path: Path) -> None:

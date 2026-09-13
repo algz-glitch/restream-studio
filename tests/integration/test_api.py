@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -1121,3 +1123,128 @@ def test_update_install_requires_stopped_relay_before_service_call(harness: Harn
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "relay_must_be_stopped"
     assert updates.installs == 0
+
+
+@pytest.mark.asyncio
+async def test_update_install_and_start_share_atomic_write_boundary(harness: Harness) -> None:
+    from restream_studio.update.service import UpdateSnapshot, UpdateStatus
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BarrierUpdateService:
+        installation_pending = False
+
+        def snapshot(self) -> UpdateSnapshot:
+            return UpdateSnapshot(UpdateStatus.READY, "0.1.0", available_version="0.2.0")
+
+        async def check(self) -> UpdateSnapshot:
+            return self.snapshot()
+
+        async def download(self) -> UpdateSnapshot:
+            return self.snapshot()
+
+        async def install(self, *, current_pid: int) -> None:
+            assert current_pid > 0
+            self.installation_pending = True
+            entered.set()
+            await release.wait()
+
+        def start_background(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    harness.db.source = SourceConfig(CANONICAL, "origin", False)
+    harness.db.set_destination(
+        DestinationKind.DOUYIN,
+        "rtmps://publish.invalid/live",
+        SECRET,
+        enabled=True,
+    )
+    updates = BarrierUpdateService()
+    application = create_app(
+        lambda: ApiDependencies(harness.db, harness.controller, update_service=updates)
+    )
+    async with application.router.lifespan_context(application):
+        headers = {
+            "host": "localhost",
+            "origin": "http://localhost",
+            "x-restream-session": application.state.session_token,
+        }
+        async with AsyncClient(
+            transport=ASGITransport(app=application), base_url="http://localhost"
+        ) as concurrent_client:
+            install_task = asyncio.create_task(
+                concurrent_client.post("/api/update/install", json={}, headers=headers)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            start_task = asyncio.create_task(
+                concurrent_client.post("/api/control/start", json={}, headers=headers)
+            )
+            await asyncio.sleep(0)
+            assert not start_task.done()
+            release.set()
+            install_response, start_response = await asyncio.gather(
+                install_task, start_task
+            )
+    assert install_response.status_code == 200
+    assert start_response.status_code == 409
+    assert start_response.json()["error"]["code"] == "update_installing"
+    assert harness.controller.started == 0
+
+
+def test_application_shutdown_callback_only_requests_uvicorn_exit(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Awaitable, Callable
+
+    from restream_studio.update.service import UpdateSnapshot, UpdateStatus
+
+    class ShutdownAwareService:
+        callback: Callable[[], Awaitable[None] | None] | None = None
+
+        def set_shutdown_callback(
+            self, callback: Callable[[], Awaitable[None] | None]
+        ) -> None:
+            self.callback = callback
+
+        def snapshot(self) -> UpdateSnapshot:
+            return UpdateSnapshot(UpdateStatus.IDLE, "0.1.0")
+
+        async def check(self) -> UpdateSnapshot:
+            return self.snapshot()
+
+        async def download(self) -> UpdateSnapshot:
+            return self.snapshot()
+
+        async def install(self, *, current_pid: int) -> None:
+            del current_pid
+
+        def start_background(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    updates = ShutdownAwareService()
+    application = create_app(
+        lambda: ApiDependencies(harness.db, harness.controller, update_service=updates)
+    )
+
+    class Server:
+        should_exit = False
+
+    server = Server()
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("os.kill must not be used"))
+    assert updates.callback is not None
+    with TestClient(application, headers={"host": "localhost"}):
+        application.state.uvicorn_server = server
+        result = updates.callback()
+        assert result is None
+        assert application.state.shutdown_requested is True
+        assert server.should_exit is True
+        assert harness.db.opened is True and harness.db.closed is False
+    assert harness.db.closed is True
+    assert harness.controller.stopped == 1

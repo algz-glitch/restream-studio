@@ -37,8 +37,8 @@ class HelperArguments:
             raise ValueError("installer must exist")
         if _INSTALLER_NAME.fullmatch(self.installer.name) is None:
             raise ValueError("installer name does not match the release contract")
-        if self.executable.suffix.casefold() != ".exe":
-            raise ValueError("executable path must identify an EXE")
+        if self.executable.name.casefold() != "restreamstudio.exe".casefold():
+            raise ValueError("executable basename must be RestreamStudio.exe")
 
 
 def parse_arguments(arguments: Sequence[str]) -> HelperArguments:

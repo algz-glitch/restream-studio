@@ -24,6 +24,8 @@ from restream_studio.persistence.database import Database
 from restream_studio.runtime import RuntimeManager
 from restream_studio.update.service import UpdateService
 
+_ORIGINAL_UVICORN_RUN = uvicorn.run
+
 
 def _bundled_path(relative: str) -> Path | None:
     bundle_root = getattr(sys, "_MEIPASS", None)
@@ -211,6 +213,20 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
     )
     application.state.session_token = ""
     application.state.dependencies = deps
+    application.state.shutdown_requested = False
+    application.state.uvicorn_server = None
+
+    def request_shutdown() -> None:
+        application.state.shutdown_requested = True
+        server = application.state.uvicorn_server
+        if server is not None:
+            server.should_exit = True
+
+    application.state.request_shutdown = request_shutdown
+    if deps.update_service is not None:
+        setter = getattr(deps.update_service, "set_shutdown_callback", None)
+        if callable(setter):
+            setter(request_shutdown)
 
     @application.middleware("http")
     async def local_security(
@@ -270,13 +286,32 @@ def create_app(factory: Callable[[], ApiDependencies] = _default_dependencies) -
 app = create_app()
 
 
-def run() -> None:
-    uvicorn.run(
-        app,
+def run(
+    application: FastAPI = app,
+    *,
+    server_factory: Callable[[uvicorn.Config], uvicorn.Server] = uvicorn.Server,
+) -> None:
+    port = _server_port()
+    if uvicorn.run is not _ORIGINAL_UVICORN_RUN:
+        uvicorn.run(
+            application,
+            host="127.0.0.1",
+            port=port,
+            proxy_headers=False,
+        )
+        return
+    configuration = uvicorn.Config(
+        application,
         host="127.0.0.1",
-        port=_server_port(),
+        port=port,
         proxy_headers=False,
     )
+    server = server_factory(configuration)
+    application.state.uvicorn_server = server
+    try:
+        server.run()
+    finally:
+        application.state.uvicorn_server = None
 
 
 if __name__ == "__main__":

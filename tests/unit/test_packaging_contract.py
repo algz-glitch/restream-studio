@@ -85,7 +85,8 @@ def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation()
     assert "$a.Program" in installer
     assert "$a.Program -ieq $p" in installer
     assert "[IO.Path]::GetFileName($a.Program)" in installer
-    assert "-Program $restoreProgram" in installer
+    assert "&$isFull $a.Program" in installer
+    assert "-Program $old" in installer
     assert "Sort-Object Name -Unique" in installer
     install_command = installer[
         installer.index("function InstalledFirewallCommand") :
@@ -121,12 +122,28 @@ def test_inno_snapshots_firewall_to_memory_and_rolls_back_uncommitted_install() 
     assert "FirewallChanged := True" in configure
     assert "HexDecode" in installer
     assert "IsFullyQualifiedApplicationPath" in installer
+    assert "[IO.Path]::IsPathFullyQualified" not in installer
+    snapshot_command = installer[
+        installer.index("function SnapshotFirewallCommand") :
+        installer.index("function InstalledFirewallCommand")
+    ]
     install_command = installer[
         installer.index("function InstalledFirewallCommand") :
         installer.index("function RemoveInstalledFirewallCommand")
     ]
-    assert "$sh=$args[1]" in install_command
-    assert install_command.index("WriteAllText") < install_command.index("'try{' +")
+    assert "WriteAllText" in snapshot_command
+    assert "$sh=$args[0]" in snapshot_command
+    assert "WriteAllText" not in install_command
+    assert "state path" not in install_command
+    assert "$args[1]" not in install_command
+    assert "RunSnapshotPowerShell" in configure
+    non_elevated = installer[
+        installer.index("function RunSnapshotPowerShell") :
+        installer.index("function RunElevatedPowerShell")
+    ]
+    assert "Exec(" in non_elevated
+    assert "ShellExec" not in non_elevated
+    assert "runas" not in non_elevated
     assert "procedure DeinitializeSetup" in installer
     rollback = installer[installer.index("procedure DeinitializeSetup") :]
     assert "FirewallChanged and (not InstallCommitted)" in rollback

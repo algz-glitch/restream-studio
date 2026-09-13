@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import threading
+import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from pathlib import Path
 from typing import Any, Self
@@ -196,6 +200,33 @@ def test_final_response_url_is_validated_for_manifest_and_installer(tmp_path: Pa
     assert wrong_repository.error_code is UpdateErrorCode.NETWORK
 
 
+def test_signed_release_asset_final_url_is_allowed_for_manifest_and_installer(
+    tmp_path: Path,
+) -> None:
+    asset_url = (
+        "https://release-assets.githubusercontent.com/github-production-release-asset/"
+        "123/latest.json?sp=r&sig=signed"
+    )
+
+    class AssetOpener:
+        def __init__(self, responses: list[bytes]) -> None:
+            self.responses = responses
+
+        def open(self, request: Request, timeout: float) -> Response:
+            del request, timeout
+            return Response(self.responses.pop(0), url=asset_url)
+
+    manifest_result = GitHubUpdateClient(opener=AssetOpener([encoded(payload())])).check_for_update(
+        "1.0.0"
+    )
+    assert manifest_result.update_available
+
+    download_result = GitHubUpdateClient(opener=AssetOpener([b"installer"])).download_installer_result(
+        UpdateManifest.from_dict(payload()), tmp_path / "installer.exe"
+    )
+    assert download_result.status is DownloadStatus.SUCCESS
+
+
 def test_same_or_older_release_is_not_an_available_update() -> None:
     for current_version in ("1.2.3", "2.0.0"):
         result = GitHubUpdateClient(opener=FakeOpener([encoded(payload())])).check_for_update(
@@ -379,6 +410,108 @@ def test_download_stops_as_soon_as_declared_size_is_exceeded(tmp_path: Path) -> 
     assert response.read_count == 1
 
 
+def test_connection_reset_during_response_read_is_network_error(tmp_path: Path) -> None:
+    class ResetResponse(Response):
+        def read(self, size: int | None = -1) -> bytes:
+            del size
+            raise ConnectionResetError("peer reset")
+
+    class ResetOpener:
+        def open(self, request: Request, timeout: float) -> ResetResponse:
+            del timeout
+            return ResetResponse(b"", url=request.full_url)
+
+    result = GitHubUpdateClient(opener=ResetOpener()).download_installer_result(
+        UpdateManifest.from_dict(payload()), tmp_path / "installer.exe"
+    )
+    assert result.error_code is UpdateErrorCode.NETWORK
+
+
+def test_local_write_and_replace_errors_are_filesystem_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manifest = UpdateManifest.from_dict(payload())
+    real_fdopen = os.fdopen
+
+    class BrokenWriter:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            os.close(self.descriptor)
+
+        def write(self, chunk: bytes) -> int:
+            del chunk
+            raise OSError("disk write failed")
+
+        def flush(self) -> None:
+            return None
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+    monkeypatch.setattr(os, "fdopen", lambda descriptor, mode: BrokenWriter(descriptor))
+    write_result = GitHubUpdateClient(opener=FakeOpener([b"installer"])).download_installer_result(
+        manifest, tmp_path / "write.exe"
+    )
+    assert write_result.error_code is UpdateErrorCode.FILESYSTEM
+
+    monkeypatch.setattr(os, "fdopen", real_fdopen)
+    monkeypatch.setattr(
+        os,
+        "replace",
+        lambda source, target: (_ for _ in ()).throw(TimeoutError("local replace timeout")),
+    )
+    replace_result = GitHubUpdateClient(opener=FakeOpener([b"installer"])).download_installer_result(
+        manifest, tmp_path / "replace.exe"
+    )
+    assert replace_result.error_code is UpdateErrorCode.FILESYSTEM
+
+
+def test_same_destination_downloads_are_serialized_across_clients(tmp_path: Path) -> None:
+    content = b"installer"
+    manifest = UpdateManifest.from_dict(payload(content))
+    destination = tmp_path / "installer.exe"
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    class RacingResponse(Response):
+        def read(self, size: int | None = -1) -> bytes:
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                time.sleep(0.05)
+                return super().read(size)
+            finally:
+                with state_lock:
+                    active -= 1
+
+    class RacingOpener:
+        def open(self, request: Request, timeout: float) -> RacingResponse:
+            del timeout
+            return RacingResponse(content, url=request.full_url)
+
+    clients = (GitHubUpdateClient(opener=RacingOpener()), GitHubUpdateClient(opener=RacingOpener()))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda client: client.download_installer_result(manifest, destination),
+                clients,
+            )
+        )
+
+    assert maximum_active == 1
+    assert all(result.status is DownloadStatus.SUCCESS for result in results)
+    assert all(result.path == destination and result.manifest == manifest for result in results)
+    assert destination.read_bytes() == content
+
+
 def test_download_timeout_cleans_unique_partial(tmp_path: Path) -> None:
     class BrokenResponse(ChunkedResponse):
         def read(self, size: int = -1) -> bytes:
@@ -425,7 +558,7 @@ def test_cleanup_failure_does_not_replace_primary_download_error(
     assert result.error_code is UpdateErrorCode.TIMEOUT
 
 
-def test_client_never_executes_downloaded_file(monkeypatch: Any, tmp_path: Path) -> None:
+def test_client_does_not_call_os_startfile(monkeypatch: Any, tmp_path: Path) -> None:
     def forbidden(*args: object, **kwargs: object) -> None:
         raise AssertionError("download client must not execute files")
 

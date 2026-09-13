@@ -6,10 +6,12 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
-from contextlib import closing, suppress
+import threading
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import closing, contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, ClassVar, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -68,6 +70,12 @@ class _DuplicateKeyError(ValueError):
     pass
 
 
+@dataclass(slots=True)
+class _PathLockEntry:
+    lock: threading.Lock
+    users: int = 0
+
+
 class _TrustedRedirectHandler(HTTPRedirectHandler):
     def redirect_request(
         self,
@@ -86,6 +94,9 @@ class _TrustedRedirectHandler(HTTPRedirectHandler):
 
 
 class GitHubUpdateClient:
+    _path_locks_guard: ClassVar[threading.Lock] = threading.Lock()
+    _path_locks: ClassVar[dict[str, _PathLockEntry]] = {}
+
     def __init__(
         self,
         manifest_url: str = DEFAULT_MANIFEST_URL,
@@ -135,7 +146,11 @@ class GitHubUpdateClient:
             body = bytearray()
             with closing(response):
                 while len(body) <= MAX_MANIFEST_BYTES:
-                    chunk = response.read(MAX_MANIFEST_BYTES + 1 - len(body))
+                    chunk = _read_network(
+                        response,
+                        MAX_MANIFEST_BYTES + 1 - len(body),
+                        "manifest request",
+                    )
                     if not chunk:
                         break
                     body.extend(chunk)
@@ -161,6 +176,12 @@ class GitHubUpdateClient:
 
     def download_installer(self, manifest: UpdateManifest, destination: Path) -> Path:
         destination = Path(destination)
+        with self._destination_lock(destination):
+            return self._download_installer_locked(manifest, destination)
+
+    def _download_installer_locked(
+        self, manifest: UpdateManifest, destination: Path
+    ) -> Path:
         parent = destination.parent
         try:
             free = shutil.disk_usage(parent).free
@@ -187,10 +208,10 @@ class GitHubUpdateClient:
             temporary = Path(temporary_name)
             digest = hashlib.sha256()
             received = 0
-            with closing(response), os.fdopen(descriptor, "wb") as output:
+            with os.fdopen(descriptor, "wb") as output:
                 descriptor = -1
                 while True:
-                    chunk = response.read(self.chunk_size)
+                    chunk = _read_network(response, self.chunk_size, "installer download")
                     if not chunk:
                         break
                     if received + len(chunk) > manifest.size:
@@ -215,10 +236,6 @@ class GitHubUpdateClient:
             return destination
         except UpdateClientError:
             raise
-        except TimeoutError as error:
-            raise UpdateClientError(UpdateErrorCode.TIMEOUT, "installer download timed out") from error
-        except URLError as error:
-            raise _url_error(error, "installer download") from error
         except OSError as error:
             raise UpdateClientError(UpdateErrorCode.FILESYSTEM, "installer could not be saved") from error
         finally:
@@ -239,6 +256,29 @@ class GitHubUpdateClient:
         except UpdateClientError as error:
             return DownloadResult.failed(manifest, error.code, str(error))
         return DownloadResult.succeeded(manifest, path)
+
+    @classmethod
+    @contextmanager
+    def _destination_lock(cls, destination: Path) -> Iterator[None]:
+        key = os.path.normcase(str(destination.resolve(strict=False)))
+        with cls._path_locks_guard:
+            entry = cls._path_locks.get(key)
+            if entry is None:
+                entry = _PathLockEntry(threading.Lock())
+                cls._path_locks[key] = entry
+            entry.users += 1
+        acquired = False
+        try:
+            entry.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                entry.lock.release()
+            with cls._path_locks_guard:
+                entry.users -= 1
+                if entry.users == 0 and cls._path_locks.get(key) is entry:
+                    del cls._path_locks[key]
 
     def _open_response(self, request: Request, *, response_kind: str) -> ReadableResponse:
         try:
@@ -297,7 +337,7 @@ def _validate_response(response: ReadableResponse, response_kind: str) -> None:
         raise _http_error(response.status, response_kind)
     final_url = response.geturl()
     if response_kind == "manifest":
-        _validate_manifest_url(final_url)
+        _validate_manifest_response_url(final_url)
     else:
         _validate_installer_response_url(final_url)
 
@@ -314,6 +354,14 @@ def _validate_installer_response_url(url: str) -> None:
         is None
     ):
         raise ValueError("GitHub installer response must remain in the configured repository")
+
+
+def _validate_manifest_response_url(url: str) -> None:
+    parsed = _parse_trusted_url(url, {_GITHUB_HOST, *_ASSET_HOSTS}, allow_query=True)
+    if parsed.hostname == _GITHUB_HOST and (
+        parsed.query or _MANIFEST_PATH_RE.fullmatch(parsed.path) is None
+    ):
+        raise ValueError("GitHub manifest response must remain in the configured repository")
 
 
 def _parse_trusted_url(url: str, hosts: set[str], *, allow_query: bool) -> SplitResult:
@@ -352,6 +400,17 @@ def _url_error(error: URLError, operation: str) -> UpdateClientError:
     if isinstance(error.reason, TimeoutError):
         return UpdateClientError(UpdateErrorCode.TIMEOUT, f"{operation} timed out")
     return UpdateClientError(UpdateErrorCode.NETWORK, f"{operation} failed")
+
+
+def _read_network(response: ReadableResponse, size: int, operation: str) -> bytes:
+    try:
+        return response.read(size)
+    except TimeoutError as error:
+        raise UpdateClientError(UpdateErrorCode.TIMEOUT, f"{operation} timed out") from error
+    except URLError as error:
+        raise _url_error(error, operation) from error
+    except OSError as error:
+        raise UpdateClientError(UpdateErrorCode.NETWORK, f"{operation} failed") from error
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

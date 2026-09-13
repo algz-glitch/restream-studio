@@ -2,7 +2,10 @@
 param(
     [string]$OutputDirectory = '',
     [switch]$Clean,
-    [switch]$ReuseVerifiedOutput
+    [switch]$ReuseVerifiedOutput,
+    [string]$PackageManifest = '',
+    [switch]$ReuseFrontend,
+    [string]$FrontendManifest = ''
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +19,15 @@ $InputDirectory = Join-Path $Root 'build\packaging-input'
 $StaticIndex = Join-Path $Root 'src\restream_studio\static\index.html'
 $Spec = Join-Path $Root 'packaging\restream-studio.spec'
 $LockFile = Join-Path $Root 'package-lock.json'
+$TreeManifestTool = Join-Path $Root 'scripts\write-tree-manifest.py'
+$ProjectVersion = ([IO.File]::ReadAllText((Join-Path $Root 'package.json')) | ConvertFrom-Json).version
+$CurrentCommit = ''
+if ($ReuseVerifiedOutput -or $ReuseFrontend) {
+    $CurrentCommit = (& git -C $Root rev-parse --verify HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $CurrentCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'verified reuse requires a valid current git commit identity'
+    }
+}
 
 function Resolve-Tool {
     param(
@@ -66,21 +78,23 @@ if (-not (Test-Path -LiteralPath $LockFile -PathType Leaf)) {
 
 if ($ReuseVerifiedOutput) {
     $verifiedCommit = [Environment]::GetEnvironmentVariable('RESTREAM_STUDIO_VERIFIED_COMMIT')
-    $currentCommit = (& git -C $Root rev-parse --verify HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or $verifiedCommit -notmatch '^[0-9a-f]{40}$' -or
-        $currentCommit -cne $verifiedCommit) {
+        $CurrentCommit -cne $verifiedCommit) {
         throw 'verified package reuse requires the exact current git commit identity'
     }
-    $trackedChanges = @(& git -C $Root status --porcelain --untracked-files=no)
-    if ($LASTEXITCODE -ne 0 -or $trackedChanges.Count -ne 0) {
-        throw 'verified package reuse requires a clean tracked worktree'
+    if (-not $PackageManifest -or -not (Test-Path -LiteralPath $PackageManifest -PathType Leaf)) {
+        throw 'verified package reuse requires PackageManifest'
     }
     $verifiedDistribution = Join-Path $OutputDirectory 'RestreamStudio'
-    foreach ($required in ('RestreamStudio.exe', 'RestreamStudioUpdateHelper.exe')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $verifiedDistribution $required) -PathType Leaf)) {
-            throw "verified package reuse output is missing: $required"
-        }
+    $manifestPython = Join-Path $Root '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $manifestPython -PathType Leaf)) {
+        throw 'verified package reuse requires the repository Python environment'
     }
+    Invoke-External $manifestPython @(
+        $TreeManifestTool, '--root', $verifiedDistribution, '--kind', 'package',
+        '--commit', $CurrentCommit, '--version', $ProjectVersion,
+        '--output', $PackageManifest, '--verify-existing'
+    )
     Write-Output "REUSED_VERIFIED_PACKAGE=$verifiedDistribution"
     exit 0
 }
@@ -90,14 +104,26 @@ $Npm = Resolve-Tool -Name 'npm.cmd' -EnvironmentName 'NPM_PATH' `
 $Python = Resolve-Tool -Name 'python.exe' -EnvironmentName 'PYTHON_PATH' `
     -RepositoryCandidates @('.venv\Scripts\python.exe')
 
-Push-Location $Root
-try {
-    Write-Output 'RUN=npm ci'
-    Invoke-External $Npm @('ci', '--ignore-scripts', '--no-audit', '--no-fund')
-    Write-Output 'RUN=npm run frontend:build'
-    Invoke-External $Npm @('run', 'frontend:build')
+if ($ReuseFrontend) {
+    if (-not $FrontendManifest -or -not (Test-Path -LiteralPath $FrontendManifest -PathType Leaf)) {
+        throw 'ReuseFrontend requires FrontendManifest'
+    }
+    Invoke-External $Python @(
+        $TreeManifestTool, '--root', (Split-Path -Parent $StaticIndex), '--kind', 'frontend',
+        '--commit', $CurrentCommit, '--version', $ProjectVersion,
+        '--output', $FrontendManifest, '--verify-existing'
+    )
 }
-finally { Pop-Location }
+else {
+    Push-Location $Root
+    try {
+        Write-Output 'RUN=npm ci'
+        Invoke-External $Npm @('ci', '--ignore-scripts', '--no-audit', '--no-fund')
+        Write-Output 'RUN=npm run frontend:build'
+        Invoke-External $Npm @('run', 'frontend:build')
+    }
+    finally { Pop-Location }
+}
 if (-not (Test-Path -LiteralPath $StaticIndex -PathType Leaf)) {
     throw 'frontend build output is missing after npm run frontend:build'
 }

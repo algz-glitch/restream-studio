@@ -240,6 +240,10 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
     assert "ReuseVerifiedPackage" in build
     assert "ReuseVerifiedOutput" in package
     assert "RESTREAM_STUDIO_VERIFIED_COMMIT" in package
+    assert "if ($ReuseVerifiedOutput -or $ReuseFrontend)" in package
+    assert "PackageManifest" in build
+    assert "write-tree-manifest.py" in package
+    assert "--verify-existing" in package
     assert "function Get-ReleaseVersion" in build
     assert "RestreamStudio-Setup-$Version.exe" in build
     assert "RestreamStudio-Setup-0.1.0.exe" not in build
@@ -331,11 +335,11 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
     labels = (
         "PYTHON_LINT",
         "PYTHON_TYPES",
-        "PYTHON_TESTS",
         "FRONTEND_TYPES",
         "FRONTEND_LINT",
         "FRONTEND_TESTS",
         "FRONTEND_BUILD",
+        "PYTHON_TESTS",
         "LOCAL_RTMP_E2E",
         "PACKAGE_SMOKE",
     )
@@ -353,6 +357,14 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
     assert package_smoke < script.index("& $Package -Clean")
     assert package_smoke < script.index("Assert-Distribution", package_smoke)
     assert package_smoke < script.index("Test-PackageHealth", package_smoke)
+    assert "-ReuseFrontend" in script
+    assert "FRONTEND_MANIFEST_PATH=" in script
+    assert "PACKAGE_MANIFEST_PATH=" in script
+    assert script.count("@('ci', '--ignore-scripts', '--no-audit', '--no-fund')") == 1
+    assert "RESTREAM_STUDIO_FRONTEND_ALREADY_BUILT" in script
+    assert script.index("Invoke-Gate -Name 'FRONTEND_BUILD'") < script.index(
+        "Invoke-Gate -Name 'PYTHON_TESTS'"
+    )
     assert "TcpListener" in script
     assert "Invoke-RestMethod" in script
     assert "/health" in script

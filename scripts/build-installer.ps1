@@ -3,7 +3,8 @@ param(
     [switch]$Clean,
     [string]$SourceRoot = '',
     [switch]$ResolveVersionOnly,
-    [switch]$ReuseVerifiedPackage
+    [switch]$ReuseVerifiedPackage,
+    [string]$PackageManifest = ''
 )
 
 Set-StrictMode -Version Latest
@@ -158,7 +159,11 @@ if ($Clean -and (Test-Path -LiteralPath $InstallerDirectory)) {
     Remove-Item -LiteralPath $resolvedInstallerDirectory -Recurse -Force
 }
 
-& $PackageScript -Clean:$Clean -ReuseVerifiedOutput:$ReuseVerifiedPackage
+if ($ReuseVerifiedPackage -and -not $PackageManifest) {
+    throw 'ReuseVerifiedPackage requires PackageManifest'
+}
+& $PackageScript -Clean:$Clean -ReuseVerifiedOutput:$ReuseVerifiedPackage `
+    -PackageManifest $PackageManifest
 if ($LASTEXITCODE -ne 0) { throw "package.ps1 failed with exit code $LASTEXITCODE" }
 
 $distribution = Join-Path $Root 'dist\RestreamStudio'

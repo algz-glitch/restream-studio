@@ -13,6 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+REQUEST_WORKFLOW = ROOT / ".github" / "workflows" / "release-request.yml"
 WRITER = ROOT / "scripts" / "write-update-manifest.py"
 PROVISIONER = ROOT / "scripts" / "provision-release-tools.ps1"
 
@@ -44,10 +45,14 @@ def _valid_arguments(installer: Path, output: Path) -> list[str]:
 
 def test_release_workflow_is_tag_only_windows_and_least_privilege() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    assert re.search(r"(?m)^on:\s*$", workflow)
-    assert re.search(r"(?ms)^on:\s*\n\s+push:\s*\n\s+tags:\s*\n\s+- ['\"]v\*['\"]", workflow)
+    request = REQUEST_WORKFLOW.read_text(encoding="utf-8")
+    assert re.search(r"(?ms)^on:\s*\n\s+push:\s*\n\s+tags:\s*\n\s+- ['\"]v\*['\"]", request)
+    assert re.search(r"(?ms)^on:\s*\n\s+workflow_run:", workflow)
+    assert "Release request" in workflow
+    assert "types: [completed]" in workflow
     assert "workflow_dispatch:" not in workflow
-    assert "branches:" not in workflow
+    assert "actions: read" in workflow
+    assert "actions: write" in request
     assert re.search(r"(?ms)^permissions:\s*\n\s+contents:\s+read\s*$", workflow)
     assert re.search(r"(?ms)^  build:.*?permissions:\s*\n\s+contents:\s+read", workflow)
     assert re.search(
@@ -56,6 +61,17 @@ def test_release_workflow_is_tag_only_windows_and_least_privilege() -> None:
     )
     assert "environment: release" in workflow
     assert workflow.count("runs-on: windows-2022") == 2
+
+
+def test_release_request_never_checks_out_or_executes_repository_code() -> None:
+    request = REQUEST_WORKFLOW.read_text(encoding="utf-8")
+    assert "actions/checkout" not in request
+    assert "scripts/" not in request
+    assert "tag-identity.json" in request
+    assert request.count("actions/upload-artifact@") == 1
+    assert "name: release-request-identity" in request
+    assert "RELEASE_TAG: ${{ github.ref_name }}" in request
+    assert "REQUEST_HEAD_SHA: ${{ github.sha }}" in request
 
 
 def test_release_workflow_pins_runtime_actions_and_locked_node_install() -> None:
@@ -72,32 +88,37 @@ def test_release_workflow_pins_runtime_actions_and_locked_node_install() -> None
     assert "node-version: '22.14.0'" in workflow
     assert "cache: npm" in workflow
     assert "cache-dependency-path: package-lock.json" in workflow
-    assert "npm ci --ignore-scripts --no-audit --no-fund" in workflow
+    assert "npm ci --ignore-scripts --no-audit --no-fund" not in workflow
     assert "--requirement requirements-release.lock" in workflow
     assert "--require-hashes --requirement requirements-release.lock" in workflow
     assert "--no-build-isolation --no-deps ." in workflow
 
 
 def test_release_workflow_never_interpolates_context_inside_powershell() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    lines = workflow.splitlines()
+    workflows = [
+        WORKFLOW.read_text(encoding="utf-8"),
+        REQUEST_WORKFLOW.read_text(encoding="utf-8"),
+    ]
     run_blocks: list[str] = []
-    for index, line in enumerate(lines):
-        if not line.startswith("        run:"):
-            continue
-        value = line.partition("run:")[2].strip()
-        if value != "|":
-            run_blocks.append(value)
-            continue
-        block: list[str] = []
-        for candidate in lines[index + 1 :]:
-            if candidate and not candidate.startswith("          "):
-                break
-            block.append(candidate)
-        run_blocks.append("\n".join(block))
+    for workflow in workflows:
+        lines = workflow.splitlines()
+        for index, line in enumerate(lines):
+            if not line.startswith("        run:"):
+                continue
+            value = line.partition("run:")[2].strip()
+            if value != "|":
+                run_blocks.append(value)
+                continue
+            block: list[str] = []
+            for candidate in lines[index + 1 :]:
+                if candidate and not candidate.startswith("          "):
+                    break
+                block.append(candidate)
+            run_blocks.append("\n".join(block))
     assert run_blocks
     assert all("${{" not in block for block in run_blocks)
-    assert "RELEASE_TAG: ${{ github.ref_name }}" in workflow
+    workflow = workflows[0]
+    assert "RELEASE_TAG: ${{ needs.build.outputs.tag }}" in workflow
     assert "GH_REPOSITORY: ${{ github.repository }}" in workflow
     assert "$env:RELEASE_TAG" in workflow
     assert "^v(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$" in workflow
@@ -106,12 +127,14 @@ def test_release_workflow_never_interpolates_context_inside_powershell() -> None
 def test_release_workflow_runs_all_gates_and_publishes_only_verified_assets() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     ordered = (
+        "actions/download-artifact@",
+        "merge-base --is-ancestor",
+        "actions/checkout@",
         "scripts/provision-release-tools.ps1",
         "scripts/verify.ps1",
         "scripts/build-installer.ps1 -Clean",
         "scripts/write-update-manifest.py",
         "actions/upload-artifact@",
-        "actions/download-artifact@",
         "ConvertFrom-Json",
         "gh release create",
     )
@@ -125,6 +148,10 @@ def test_release_workflow_runs_all_gates_and_publishes_only_verified_assets() ->
     assert "dist/latest.json" in workflow
     assert "if-no-files-found: error" in workflow
     assert workflow.count("name: release-assets") == 2
+    assert "dist/release-assets" in workflow
+    assert "path: dist/release-assets/*" in workflow
+    assert "Copy-Item -LiteralPath $installer" in workflow
+    assert "Copy-Item -LiteralPath 'dist/latest.json'" in workflow
     assert "--verify-tag" in workflow
     assert "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in workflow
     assert "persist-credentials: false" in workflow
@@ -132,15 +159,35 @@ def test_release_workflow_runs_all_gates_and_publishes_only_verified_assets() ->
 
 def test_release_workflow_derives_and_checks_exact_semver_tag() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    assert "github.ref_name" in workflow
+    assert "workflow_run.head_sha" in workflow
     assert "^v(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$" in workflow
     assert "$version = $tag.Substring(1)" in workflow
     assert "pyproject.toml" in workflow
     assert "package.json" in workflow
     assert "packaging/restream-studio.iss" in workflow
-    assert "git fetch --no-tags origin" in workflow
-    assert "git merge-base --is-ancestor" in workflow
+    assert "fetch --no-tags origin" in workflow
+    assert "merge-base --is-ancestor" in workflow
     assert "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in workflow
+    assert "refs/tags/$tag^{}" in workflow
+    assert "tag identity does not match workflow_run.head_sha" in workflow
+    assert "remote tag commit changed before publish" in workflow
+
+
+def test_existing_release_metadata_and_exact_asset_set_are_enforced() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    for marker in (
+        "isDraft,isPrerelease,tagName,targetCommitish,assets",
+        "$Release.isDraft",
+        "$Release.isPrerelease",
+        "$Release.tagName -cne $tag",
+        "$Release.targetCommitish -cne $commit",
+        "unexpected release asset set",
+        "--target $commit",
+    ):
+        assert marker in workflow
+    assert workflow.index("remote tag commit changed before publish") < workflow.index(
+        "gh release view"
+    )
 
 
 def test_release_lock_contains_only_exact_transitive_pins() -> None:

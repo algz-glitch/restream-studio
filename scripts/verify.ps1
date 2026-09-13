@@ -8,6 +8,15 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $Package = Join-Path $PSScriptRoot 'package.ps1'
 $Distribution = Join-Path $Root 'dist\RestreamStudio'
+$TreeManifestTool = Join-Path $Root 'scripts\write-tree-manifest.py'
+$ManifestDirectory = Join-Path $Root 'artifacts\release-verification'
+$FrontendManifest = Join-Path $ManifestDirectory 'frontend-build-manifest.json'
+$PackageManifest = Join-Path $ManifestDirectory 'package-manifest.json'
+$CurrentCommit = (& git -C $Root rev-parse --verify HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $CurrentCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'current git commit identity is invalid'
+}
+New-Item -ItemType Directory -Force -Path $ManifestDirectory | Out-Null
 
 function Get-ProjectVersion {
     $semver = '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
@@ -185,9 +194,6 @@ try {
     Invoke-Gate -Name 'PYTHON_TYPES' -Action {
         Invoke-External $Python @('-m', 'mypy', 'src', 'tests')
     }
-    Invoke-Gate -Name 'PYTHON_TESTS' -Action {
-        Invoke-External $Python @('-m', 'pytest', 'tests')
-    }
     Invoke-Gate -Name 'FRONTEND_TYPES' -Action {
         try {
             $NpmCommand = Get-Command npm.cmd -CommandType Application -ErrorAction Stop |
@@ -206,7 +212,29 @@ try {
     }
     Invoke-Gate -Name 'FRONTEND_LINT' -Action { Invoke-External $Npm @('run', 'lint') }
     Invoke-Gate -Name 'FRONTEND_TESTS' -Action { Invoke-External $Npm @('test') }
-    Invoke-Gate -Name 'FRONTEND_BUILD' -Action { Invoke-External $Npm @('run', 'frontend:build') }
+    Invoke-Gate -Name 'FRONTEND_BUILD' -Action {
+        Invoke-External $Npm @('run', 'frontend:build')
+        Invoke-External $Python @(
+            $TreeManifestTool, '--root', (Join-Path $Root 'src\restream_studio\static'),
+            '--kind', 'frontend', '--commit', $CurrentCommit, '--version', $ProjectVersion,
+            '--output', $FrontendManifest
+        )
+        Write-Output "FRONTEND_MANIFEST_PATH=$FrontendManifest"
+    }
+    Invoke-Gate -Name 'PYTHON_TESTS' -Action {
+        $oldFrontendBuilt = [Environment]::GetEnvironmentVariable(
+            'RESTREAM_STUDIO_FRONTEND_ALREADY_BUILT'
+        )
+        try {
+            [Environment]::SetEnvironmentVariable('RESTREAM_STUDIO_FRONTEND_ALREADY_BUILT', '1')
+            Invoke-External $Python @('-m', 'pytest', 'tests')
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                'RESTREAM_STUDIO_FRONTEND_ALREADY_BUILT', $oldFrontendBuilt
+            )
+        }
+    }
     Invoke-Gate -Name 'LOCAL_RTMP_E2E' -Action {
         $PowerShell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
         Invoke-External $PowerShell @(
@@ -215,10 +243,17 @@ try {
         )
     }
     Invoke-Gate -Name 'PACKAGE_SMOKE' -Action {
-        & $Package -Clean | ForEach-Object { [Console]::Error.WriteLine([string]$_) }
+        & $Package -Clean -ReuseFrontend -FrontendManifest $FrontendManifest |
+            ForEach-Object { [Console]::Error.WriteLine([string]$_) }
         if ($LASTEXITCODE -ne 0) { throw "package script exited with code $LASTEXITCODE" }
         Assert-Distribution
         Test-PackageHealth
+        Invoke-External $Python @(
+            $TreeManifestTool, '--root', $Distribution, '--kind', 'package',
+            '--commit', $CurrentCommit, '--version', $ProjectVersion,
+            '--output', $PackageManifest
+        )
+        Write-Output "PACKAGE_MANIFEST_PATH=$PackageManifest"
     }
 }
 finally { Pop-Location }

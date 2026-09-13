@@ -490,19 +490,20 @@ def test_frontend_build_is_served_with_referenced_assets(harness: Harness) -> No
     assets_dir = root / "src" / "restream_studio" / "static"
     npm = shutil.which("npm")
     assert npm is not None
-    subprocess.run(
-        [
-            npm,
-            "run",
-            "frontend:build",
-        ],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    if os.environ.get("RESTREAM_STUDIO_FRONTEND_ALREADY_BUILT") != "1":
+        subprocess.run(
+            [
+                npm,
+                "run",
+                "frontend:build",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     application = create_app(
         lambda: ApiDependencies(harness.db, harness.controller, assets_dir=assets_dir)
     )

@@ -1,0 +1,50 @@
+name: Release request
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  request:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      REQUEST_HEAD_SHA: ${{ github.sha }}
+      REQUEST_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Write inert tag identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $headSha = $env:REQUEST_HEAD_SHA
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw 'release request tag is not canonical SemVer'
+          }
+          if ($headSha -notmatch '^[0-9a-f]{40}$') {
+            throw 'release request head SHA is invalid'
+          }
+          if ($env:REQUEST_REPOSITORY -cne 'algz-glitch/restream-studio') {
+            throw 'release request repository is invalid'
+          }
+          New-Item -ItemType Directory -Path request-identity | Out-Null
+          [ordered]@{
+            schema_version = 1
+            repository = $env:REQUEST_REPOSITORY
+            tag = $tag
+            head_sha = $headSha
+          } | ConvertTo-Json | Set-Content -LiteralPath request-identity/tag-identity.json -Encoding utf8
+
+      - name: Upload one release request identity artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-request-identity
+          path: request-identity/tag-identity.json
+          if-no-files-found: error
+          retention-days: 1

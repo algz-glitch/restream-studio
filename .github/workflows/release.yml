@@ -1,45 +1,65 @@
 name: Verified Windows release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_run:
+    workflows: ['Release request']
+    types: [completed]
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: windows-2022
     timeout-minutes: 90
     permissions:
       contents: read
+      actions: read
     outputs:
-      version: ${{ steps.release.outputs.version }}
-      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      commit: ${{ steps.identity.outputs.commit }}
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      REQUEST_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      REQUEST_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
       GH_REPOSITORY: ${{ github.repository }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
-      - name: Check out the tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download inert release request identity
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          fetch-depth: 0
-          persist-credentials: false
+          name: release-request-identity
+          path: tag-identity
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate trusted tag ancestry and source versions
-        id: release
+      - name: Validate request, remote tag, and default branch ancestry
+        id: identity
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
-          $tag = $env:RELEASE_TAG
-          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
-            throw "release tag is not exact canonical SemVer: $tag"
+          if ($env:GH_REPOSITORY -cne 'algz-glitch/restream-studio' -or
+              $env:REQUEST_REPOSITORY -cne $env:GH_REPOSITORY) {
+            throw 'release request repository identity is invalid'
           }
-          if ($env:GH_REPOSITORY -cne 'algz-glitch/restream-studio') {
-            throw 'release repository identity is invalid'
+          if ($env:REQUEST_HEAD_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'workflow_run.head_sha is invalid'
+          }
+          $identityPath = 'tag-identity/tag-identity.json'
+          $identity = Get-Content -LiteralPath $identityPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $keys = @($identity.PSObject.Properties.Name)
+          $expectedKeys = @('schema_version','repository','tag','head_sha')
+          if ((($keys | Sort-Object) -join ',') -cne (($expectedKeys | Sort-Object) -join ',')) {
+            throw 'tag identity schema is invalid'
+          }
+          $tag = $identity.tag
+          if ($identity.schema_version -ne 1 -or $identity.repository -cne $env:GH_REPOSITORY -or
+              $tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
+              $identity.head_sha -cne $env:REQUEST_HEAD_SHA) {
+            throw 'tag identity does not match workflow_run.head_sha'
           }
           $defaultBranch = $env:DEFAULT_BRANCH
           if ($defaultBranch -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?$' -or
@@ -48,17 +68,51 @@ jobs:
           }
           git check-ref-format --branch $defaultBranch *> $null
           if ($LASTEXITCODE -ne 0) { throw 'default branch name is not a valid git ref' }
-          git fetch --no-tags origin "+refs/heads/$defaultBranch`:refs/remotes/origin/$defaultBranch"
-          if ($LASTEXITCODE -ne 0) { throw 'failed to fetch repository default branch' }
-          git merge-base --is-ancestor HEAD "refs/remotes/origin/$defaultBranch"
+          $trustRoot = Join-Path $env:RUNNER_TEMP "release-trust-$([Guid]::NewGuid().ToString('N'))"
+          git init $trustRoot *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'failed to initialize trust repository' }
+          git -C $trustRoot remote add origin 'https://github.com/algz-glitch/restream-studio.git'
+          if ($LASTEXITCODE -ne 0) { throw 'failed to configure trust repository' }
+          git -C $trustRoot fetch --no-tags origin `
+            "+refs/tags/$tag`:refs/tags/$tag" `
+            "+refs/heads/$defaultBranch`:refs/remotes/origin/$defaultBranch"
+          if ($LASTEXITCODE -ne 0) { throw 'failed to fetch trusted release refs' }
+          $tagCommit = (git -C $trustRoot rev-parse "refs/tags/$tag^{}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -notmatch '^[0-9a-f]{40}$' -or
+              $tagCommit -cne $env:REQUEST_HEAD_SHA) {
+            throw 'remote peeled tag SHA does not match the release request'
+          }
+          git -C $trustRoot merge-base --is-ancestor $tagCommit "refs/remotes/origin/$defaultBranch"
           if ($LASTEXITCODE -ne 0) {
             throw 'tag commit is not an ancestor of the repository default branch'
           }
-          $commit = (git rev-parse --verify HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
-            throw 'tag commit identity is invalid'
-          }
           $version = $tag.Substring(1)
+          "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE_COMMIT=$tagCommit" >> $env:GITHUB_ENV
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "commit=$tagCommit" >> $env:GITHUB_OUTPUT
+
+      - name: Check out only the validated release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.identity.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Revalidate checked-out source versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $version = $env:RELEASE_VERSION
+          $commit = (git rev-parse --verify HEAD).Trim()
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
+              $version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
+              $tag -cne "v$version" -or $commit -cne $env:RELEASE_COMMIT) {
+            throw 'validated release identity was not preserved by checkout'
+          }
           $escaped = [Regex]::Escape($version)
           if ((Get-Content pyproject.toml -Raw) -notmatch "(?m)^version = `"$escaped`"$") {
             throw 'pyproject.toml version does not match the release tag'
@@ -69,9 +123,6 @@ jobs:
           if ((Get-Content packaging/restream-studio.iss -Raw) -notmatch "(?m)^#define MyAppVersion `"$escaped`"$") {
             throw 'Inno Setup version does not match the release tag'
           }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "commit=$commit" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python 3.12
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -97,49 +148,55 @@ jobs:
           .venv\Scripts\python.exe -m pip install --disable-pip-version-check --no-build-isolation --no-deps .
           if ($LASTEXITCODE -ne 0) { throw 'project installation failed' }
 
-      - name: Verify locked Node dependency closure
-        shell: pwsh
-        run: npm ci --ignore-scripts --no-audit --no-fund
-
       - name: Provision pinned release tools
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/provision-release-tools.ps1
 
-      - name: Run the complete release gate
+      - name: Run the complete release gate once
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1
 
-      - name: Build the fixed Windows installer
+      - name: Build installer from the verified package manifest
         shell: pwsh
         env:
-          RESTREAM_STUDIO_VERIFIED_COMMIT: ${{ steps.release.outputs.commit }}
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Clean -ReuseVerifiedPackage
+          RESTREAM_STUDIO_VERIFIED_COMMIT: ${{ steps.identity.outputs.commit }}
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Clean -ReuseVerifiedPackage -PackageManifest artifacts/release-verification/package-manifest.json
 
       - name: Write verified update manifest
         shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           $tag = $env:RELEASE_TAG
           $version = $env:RELEASE_VERSION
           if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
               $tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
-              $tag -cne "v$version") {
-            throw 'validated release identity was not preserved'
-          }
+              $tag -cne "v$version") { throw 'release identity was not preserved' }
           $installer = "dist/installer/RestreamStudio-Setup-$version.exe"
           .venv\Scripts\python.exe scripts/write-update-manifest.py `
             --version $version --installer $installer `
             --repository algz-glitch/restream-studio --tag $tag `
             --output dist/latest.json
 
+      - name: Stage exactly two release assets at one artifact root
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_VERSION
+          if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw 'release version is invalid before staging'
+          }
+          $installer = "dist/installer/RestreamStudio-Setup-$version.exe"
+          $staging = 'dist/release-assets'
+          if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item -LiteralPath $installer -Destination $staging
+          Copy-Item -LiteralPath 'dist/latest.json' -Destination $staging
+          $assets = @(Get-ChildItem -LiteralPath $staging -File)
+          if ($assets.Count -ne 2) { throw 'release-assets staging must contain exactly two files' }
+
       - name: Upload one verified release-assets artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-assets
-          path: |
-            dist/installer/RestreamStudio-Setup-${{ steps.release.outputs.version }}.exe
-            dist/latest.json
+          path: dist/release-assets/*
           if-no-files-found: error
           retention-days: 14
 
@@ -150,9 +207,11 @@ jobs:
     environment: release
     permissions:
       contents: write
+      actions: read
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
       RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
       GH_REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -169,14 +228,24 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           $tag = $env:RELEASE_TAG
           $version = $env:RELEASE_VERSION
+          $commit = $env:RELEASE_COMMIT
           if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
               $tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or
-              $tag -cne "v$version") {
+              $tag -cne "v$version" -or $commit -notmatch '^[0-9a-f]{40}$') {
             throw 'validated release identity was not preserved'
           }
           if ($env:GH_REPOSITORY -cne 'algz-glitch/restream-studio') {
             throw 'release repository identity is invalid'
           }
+          $remoteRefs = @(git ls-remote 'https://github.com/algz-glitch/restream-studio.git' "refs/tags/$tag" "refs/tags/$tag^{}")
+          if ($LASTEXITCODE -ne 0 -or $remoteRefs.Count -lt 1 -or $remoteRefs.Count -gt 2) {
+            throw 'remote release tag resolution failed'
+          }
+          $peeled = @($remoteRefs | Where-Object { $_ -match "\trefs/tags/$([Regex]::Escape($tag))\^\{\}$" })
+          $direct = @($remoteRefs | Where-Object { $_ -match "\trefs/tags/$([Regex]::Escape($tag))$" })
+          $remoteCommit = if ($peeled.Count -eq 1) { ($peeled[0] -split "\t")[0] } elseif ($direct.Count -eq 1) { ($direct[0] -split "\t")[0] } else { '' }
+          if ($remoteCommit -cne $commit) { throw 'remote tag commit changed before publish' }
+
           $ghVersion = (& gh --version | Select-Object -First 1)
           if ($LASTEXITCODE -ne 0 -or $ghVersion -notmatch '^gh version \d+\.\d+\.\d+') {
             throw 'GitHub CLI version probe failed'
@@ -202,14 +271,11 @@ jobs:
             $data = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $keys = @($data.PSObject.Properties.Name)
             $expectedKeys = @('schema_version','version','installer_url','sha256','size','published_at','release_url')
-            if ((($keys | Sort-Object) -join ',') -cne
-                (($expectedKeys | Sort-Object) -join ',')) {
+            if ((($keys | Sort-Object) -join ',') -cne (($expectedKeys | Sort-Object) -join ',')) {
               throw 'latest.json does not have the exact schema 1 fields'
             }
             $file = Get-Item -LiteralPath $InstallerPath
-            if ($file.Length -le 0 -or $file.Length -gt 512MB) {
-              throw 'installer size is outside the release contract'
-            }
+            if ($file.Length -le 0 -or $file.Length -gt 512MB) { throw 'installer size is outside the release contract' }
             $hash = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash
             $expectedDownload = "https://github.com/$($env:GH_REPOSITORY)/releases/download/$tag/$installerName"
             $expectedRelease = "https://github.com/$($env:GH_REPOSITORY)/releases/tag/$tag"
@@ -222,15 +288,31 @@ jobs:
             }
           }
 
+          function Assert-ReleaseMetadata {
+            param($Release)
+            if ($Release.isDraft -ne $false -or $Release.isPrerelease -ne $false -or
+                $Release.tagName -cne $tag -or $Release.targetCommitish -cne $commit) {
+              throw 'existing release metadata does not match the verified release identity'
+            }
+            $assetNames = @($Release.assets | ForEach-Object { $_.name } | Sort-Object)
+            $expectedNames = @('latest.json', $installerName) | Sort-Object
+            if (($assetNames -join ',') -cne ($expectedNames -join ',')) {
+              throw 'unexpected release asset set'
+            }
+          }
+
           Assert-Manifest -ManifestPath $manifest -InstallerPath $installer
-          & gh release view $tag --repo $env:GH_REPOSITORY *> $null
+          $releaseJson = (& gh release view $tag --repo $env:GH_REPOSITORY --json isDraft,isPrerelease,tagName,targetCommitish,assets 2>$null)
           $releaseExists = $LASTEXITCODE -eq 0
           if (-not $releaseExists) {
-            gh release create $tag $installer $manifest `
-              --repo $env:GH_REPOSITORY --verify-tag --generate-notes `
-              --title "Restream Studio $version"
+            gh release create $tag $installer $manifest --repo $env:GH_REPOSITORY `
+              --verify-tag --target $commit --generate-notes --title "Restream Studio $version"
             if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
+            $releaseJson = (& gh release view $tag --repo $env:GH_REPOSITORY --json isDraft,isPrerelease,tagName,targetCommitish,assets)
+            if ($LASTEXITCODE -ne 0) { throw 'created GitHub Release could not be verified' }
           }
+          $release = $releaseJson | ConvertFrom-Json
+          Assert-ReleaseMetadata $release
 
           $remote = Join-Path $env:RUNNER_TEMP "release-check-$([Guid]::NewGuid().ToString('N'))"
           New-Item -ItemType Directory -Path $remote | Out-Null

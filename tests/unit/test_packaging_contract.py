@@ -60,10 +60,10 @@ def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation()
     assert "function PrepareToInstall" not in installer
     assert 'Source: "..\\dist\\RestreamStudio\\RestreamStudio.exe"' in installer
     files = installer[installer.index("[Files]") : installer.index("[Icons]")]
-    assert "AfterInstall" not in files
-    assert "procedure CurStepChanged(CurStep: TSetupStep)" in installer
-    assert "CurStep = ssPostInstall" in installer
-    assert "procedure ConfigureInstalledFirewall" in installer
+    assert "AfterInstall: ConfigureFirewall" in files
+    assert "procedure CurStepChanged(CurStep: TSetupStep)" not in installer
+    assert "ssPostInstall" not in installer
+    assert "procedure ConfigureFirewall" in installer
     assert "ShellExec('runas'" in installer
     assert "ResultCode" in installer
     assert "ResultCode <> 0" in installer
@@ -95,17 +95,18 @@ def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation()
 
 def test_inno_firewall_runs_after_every_file_and_before_only_optional_launch() -> None:
     installer = _read("packaging/restream-studio.iss")
-    last_file = installer.index('Source: "firewall-remove.ps1"')
-    post_install = installer.index("CurStep = ssPostInstall")
-    launch = installer.index("CurPageID = wpFinished")
-    assert last_file < post_install < launch
+    files = installer[installer.index("[Files]") : installer.index("[Icons]")]
+    entries = [line for line in files.splitlines() if line.startswith("Source:")]
+    assert entries[-1].startswith('Source: "firewall-remove.ps1"')
+    assert entries[-1].endswith("AfterInstall: ConfigureFirewall")
+    assert sum("AfterInstall:" in entry for entry in entries) == 1
 
 
 def test_old_uninstaller_filters_canonical_and_legacy_rules_by_current_program() -> None:
     installer = _read("packaging/restream-studio.iss")
     removal = installer[
         installer.index("function RemoveInstalledFirewallCommand") :
-        installer.index("procedure ConfigureInstalledFirewall")
+        installer.index("procedure ConfigureFirewall")
     ]
     assert "foreach($r in $candidates)" in removal
     assert "$a.Program -ieq $p" in removal

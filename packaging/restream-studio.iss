@@ -29,7 +29,7 @@ Source: "..\dist\RestreamStudio\RestreamStudio.exe"; DestDir: "{app}"; Flags: ig
 Source: "..\dist\RestreamStudio\*"; DestDir: "{app}"; Excludes: "RestreamStudio.exe,RestreamStudioUpdateHelper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\dist\RestreamStudio\RestreamStudioUpdateHelper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "firewall-install.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion
-Source: "firewall-remove.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion
+Source: "firewall-remove.ps1"; DestDir: "{app}\packaging"; Flags: ignoreversion; AfterInstall: ConfigureFirewall
 
 [Icons]
 Name: "{autodesktop}\Restream Studio"; Filename: "{app}\RestreamStudio.exe"
@@ -176,7 +176,7 @@ begin
       'if($a.Program -ieq $p){throw ''firewall removal verification failed''}}';
 end;
 
-procedure ConfigureInstalledFirewall;
+procedure ConfigureFirewall;
 var
   ResultCode: Integer;
   ApplicationPath: String;
@@ -186,12 +186,6 @@ begin
   if (not RunElevatedPowerShell(InstalledFirewallCommand(), ApplicationPath,
     ResultCode)) or (ResultCode <> 0) then
     RaiseException('Firewall configuration failed; installation was rolled back.');
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-    ConfigureInstalledFirewall;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

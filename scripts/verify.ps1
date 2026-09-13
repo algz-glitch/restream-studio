@@ -192,7 +192,7 @@ try {
         Invoke-External $Python @('-m', 'ruff', 'check', 'src', 'tests', 'scripts')
     }
     Invoke-Gate -Name 'PYTHON_TYPES' -Action {
-        Invoke-External $Python @('-m', 'mypy', 'src', 'tests')
+        Invoke-External $Python @('-m', 'mypy', 'src', 'tests', 'scripts')
     }
     Invoke-Gate -Name 'FRONTEND_TYPES' -Action {
         try {

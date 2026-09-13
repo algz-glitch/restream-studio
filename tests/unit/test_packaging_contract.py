@@ -362,6 +362,7 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
     assert "PACKAGE_MANIFEST_PATH=" in script
     assert script.count("@('ci', '--ignore-scripts', '--no-audit', '--no-fund')") == 1
     assert "RESTREAM_STUDIO_FRONTEND_ALREADY_BUILT" in script
+    assert "@('-m', 'mypy', 'src', 'tests', 'scripts')" in script
     assert script.index("Invoke-Gate -Name 'FRONTEND_BUILD'") < script.index(
         "Invoke-Gate -Name 'PYTHON_TESTS'"
     )

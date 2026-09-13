@@ -237,13 +237,22 @@ jobs:
           if ($env:GH_REPOSITORY -cne 'algz-glitch/restream-studio') {
             throw 'release repository identity is invalid'
           }
-          $remoteRefs = @(git ls-remote 'https://github.com/algz-glitch/restream-studio.git' "refs/tags/$tag" "refs/tags/$tag^{}")
-          if ($LASTEXITCODE -ne 0 -or $remoteRefs.Count -lt 1 -or $remoteRefs.Count -gt 2) {
-            throw 'remote release tag resolution failed'
+
+          function Resolve-RemoteTagCommit {
+            param([string]$Tag)
+            $remoteRefs = @(git ls-remote 'https://github.com/algz-glitch/restream-studio.git' "refs/tags/$Tag" "refs/tags/$Tag^{}")
+            if ($LASTEXITCODE -ne 0 -or $remoteRefs.Count -lt 1 -or $remoteRefs.Count -gt 2) {
+              throw 'remote release tag resolution failed'
+            }
+            $escapedTag = [Regex]::Escape($Tag)
+            $peeled = @($remoteRefs | Where-Object { $_ -match "\trefs/tags/$escapedTag\^\{\}$" })
+            $direct = @($remoteRefs | Where-Object { $_ -match "\trefs/tags/$escapedTag$" })
+            if ($peeled.Count -eq 1) { return ($peeled[0] -split "\t")[0] }
+            if ($direct.Count -eq 1) { return ($direct[0] -split "\t")[0] }
+            throw 'remote release tag did not resolve to exactly one commit'
           }
-          $peeled = @($remoteRefs | Where-Object { $_ -match "\trefs/tags/$([Regex]::Escape($tag))\^\{\}$" })
-          $direct = @($remoteRefs | Where-Object { $_ -match "\trefs/tags/$([Regex]::Escape($tag))$" })
-          $remoteCommit = if ($peeled.Count -eq 1) { ($peeled[0] -split "\t")[0] } elseif ($direct.Count -eq 1) { ($direct[0] -split "\t")[0] } else { '' }
+
+          $remoteCommit = Resolve-RemoteTagCommit $tag
           if ($remoteCommit -cne $commit) { throw 'remote tag commit changed before publish' }
 
           $ghVersion = (& gh --version | Select-Object -First 1)
@@ -291,7 +300,7 @@ jobs:
           function Assert-ReleaseMetadata {
             param($Release)
             if ($Release.isDraft -ne $false -or $Release.isPrerelease -ne $false -or
-                $Release.tagName -cne $tag -or $Release.targetCommitish -cne $commit) {
+                $Release.tagName -cne $tag) {
               throw 'existing release metadata does not match the verified release identity'
             }
             $assetNames = @($Release.assets | ForEach-Object { $_.name } | Sort-Object)
@@ -302,13 +311,13 @@ jobs:
           }
 
           Assert-Manifest -ManifestPath $manifest -InstallerPath $installer
-          $releaseJson = (& gh release view $tag --repo $env:GH_REPOSITORY --json isDraft,isPrerelease,tagName,targetCommitish,assets 2>$null)
+          $releaseJson = (& gh release view $tag --repo $env:GH_REPOSITORY --json isDraft,isPrerelease,tagName,assets 2>$null)
           $releaseExists = $LASTEXITCODE -eq 0
           if (-not $releaseExists) {
             gh release create $tag $installer $manifest --repo $env:GH_REPOSITORY `
               --verify-tag --target $commit --generate-notes --title "Restream Studio $version"
             if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
-            $releaseJson = (& gh release view $tag --repo $env:GH_REPOSITORY --json isDraft,isPrerelease,tagName,targetCommitish,assets)
+            $releaseJson = (& gh release view $tag --repo $env:GH_REPOSITORY --json isDraft,isPrerelease,tagName,assets)
             if ($LASTEXITCODE -ne 0) { throw 'created GitHub Release could not be verified' }
           }
           $release = $releaseJson | ConvertFrom-Json
@@ -326,3 +335,7 @@ jobs:
             throw 'remote assets differ from verified build outputs'
           }
           Assert-Manifest -ManifestPath $remoteManifest -InstallerPath $remoteInstaller
+          $finalRemoteCommit = Resolve-RemoteTagCommit $tag
+          if ($finalRemoteCommit -cne $commit) {
+            throw 'remote tag changed after release publication; this Release requires manual disposition and will not be overwritten'
+          }

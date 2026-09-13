@@ -8,7 +8,9 @@ import re
 import stat
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -16,7 +18,17 @@ MANIFEST_FIELDS = {"schema_version", "kind", "commit", "version", "files"}
 FILE_FIELDS = {"path", "size", "sha256"}
 
 
-def parse_arguments() -> argparse.Namespace:
+@dataclass(frozen=True, slots=True)
+class Arguments:
+    root: Path
+    kind: Literal["frontend", "package"]
+    commit: str
+    version: str
+    output: Path
+    verify_existing: bool
+
+
+def parse_arguments() -> Arguments:
     parser = argparse.ArgumentParser(description="Write or verify a complete tree manifest")
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--kind", choices=("frontend", "package"), required=True)
@@ -24,7 +36,18 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--verify-existing", action="store_true")
-    return parser.parse_args()
+    namespace = parser.parse_args()
+    kind = str(namespace.kind)
+    if kind not in ("frontend", "package"):
+        parser.error("kind must be frontend or package")
+    return Arguments(
+        root=Path(namespace.root),
+        kind=cast(Literal["frontend", "package"], kind),
+        commit=str(namespace.commit),
+        version=str(namespace.version),
+        output=Path(namespace.output),
+        verify_existing=bool(namespace.verify_existing),
+    )
 
 
 def is_link(path: Path) -> bool:
@@ -51,7 +74,7 @@ def inspect_file(path: Path) -> tuple[int, str]:
     return before.st_size, digest.hexdigest().upper()
 
 
-def build_manifest(arguments: argparse.Namespace) -> dict[str, object]:
+def build_manifest(arguments: Arguments) -> dict[str, object]:
     if COMMIT.fullmatch(arguments.commit) is None:
         raise ValueError("commit must be exactly 40 lowercase hexadecimal characters")
     if SEMVER.fullmatch(arguments.version) is None:
@@ -122,7 +145,7 @@ def validate_schema(payload: object) -> None:
         raise ValueError("tree manifest paths must be unique and sorted")
 
 
-def execute(arguments: argparse.Namespace) -> Path:
+def execute(arguments: Arguments) -> Path:
     expected = build_manifest(arguments)
     validate_schema(expected)
     output_parent = arguments.output.parent.resolve(strict=True)

@@ -52,7 +52,8 @@ def test_release_workflow_is_tag_only_windows_and_least_privilege() -> None:
     assert "types: [completed]" in workflow
     assert "workflow_dispatch:" not in workflow
     assert "actions: read" in workflow
-    assert "actions: write" in request
+    assert "actions: write" not in request
+    assert re.search(r"(?ms)^permissions:\s*\n\s+contents:\s+read\s*$", request)
     assert re.search(r"(?ms)^permissions:\s*\n\s+contents:\s+read\s*$", workflow)
     assert re.search(r"(?ms)^  build:.*?permissions:\s*\n\s+contents:\s+read", workflow)
     assert re.search(
@@ -176,18 +177,29 @@ def test_release_workflow_derives_and_checks_exact_semver_tag() -> None:
 def test_existing_release_metadata_and_exact_asset_set_are_enforced() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     for marker in (
-        "isDraft,isPrerelease,tagName,targetCommitish,assets",
+        "isDraft,isPrerelease,tagName,assets",
         "$Release.isDraft",
         "$Release.isPrerelease",
         "$Release.tagName -cne $tag",
-        "$Release.targetCommitish -cne $commit",
         "unexpected release asset set",
         "--target $commit",
     ):
         assert marker in workflow
+    assert "$Release.targetCommitish" not in workflow
     assert workflow.index("remote tag commit changed before publish") < workflow.index(
         "gh release view"
     )
+
+
+def test_remote_tag_is_rechecked_after_download_without_automatic_overwrite() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert "function Resolve-RemoteTagCommit" in workflow
+    assert workflow.count("Resolve-RemoteTagCommit") >= 3
+    download_check = workflow.index("Assert-Manifest -ManifestPath $remoteManifest")
+    post_tag_check = workflow.index("$finalRemoteCommit = Resolve-RemoteTagCommit", download_check)
+    assert download_check < post_tag_check
+    assert "this Release requires manual disposition" in workflow
+    assert "will not be overwritten" in workflow
 
 
 def test_release_lock_contains_only_exact_transitive_pins() -> None:

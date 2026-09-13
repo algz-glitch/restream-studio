@@ -61,7 +61,9 @@ def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation()
     assert 'Source: "..\\dist\\RestreamStudio\\RestreamStudio.exe"' in installer
     files = installer[installer.index("[Files]") : installer.index("[Icons]")]
     assert "AfterInstall: ConfigureFirewall" in files
-    assert "procedure CurStepChanged(CurStep: TSetupStep)" not in installer
+    assert "procedure CurStepChanged(CurStep: TSetupStep)" in installer
+    assert "CurStep = ssDone" in installer
+    assert "InstallCommitted := True" in installer
     assert "ssPostInstall" not in installer
     assert "procedure ConfigureFirewall" in installer
     assert "ShellExec('runas'" in installer
@@ -100,6 +102,37 @@ def test_inno_firewall_runs_after_every_file_and_before_only_optional_launch() -
     assert entries[-1].startswith('Source: "firewall-remove.ps1"')
     assert entries[-1].endswith("AfterInstall: ConfigureFirewall")
     assert sum("AfterInstall:" in entry for entry in entries) == 1
+
+
+def test_inno_snapshots_firewall_to_memory_and_rolls_back_uncommitted_install() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    configure = installer[
+        installer.index("procedure ConfigureFirewall") :
+        installer.index("procedure CurStepChanged")
+    ]
+    assert "NewFirewallStatePath" in configure
+    assert "Random(1000000000)" in installer
+    assert "ExpandConstant('{tmp}')" in installer
+    assert "LoadStringFromFile" in configure
+    assert "PreviousFirewallProgram" in configure
+    assert "DeleteFile" in configure
+    loaded = configure.index("LoadStringFromFile")
+    assert loaded < configure.index("DeleteFile", loaded)
+    assert "FirewallChanged := True" in configure
+    assert "HexDecode" in installer
+    assert "IsFullyQualifiedApplicationPath" in installer
+    install_command = installer[
+        installer.index("function InstalledFirewallCommand") :
+        installer.index("function RemoveInstalledFirewallCommand")
+    ]
+    assert "$sh=$args[1]" in install_command
+    assert install_command.index("WriteAllText") < install_command.index("'try{' +")
+    assert "procedure DeinitializeSetup" in installer
+    rollback = installer[installer.index("procedure DeinitializeSetup") :]
+    assert "FirewallChanged and (not InstallCommitted)" in rollback
+    assert "RollbackFirewallCommand" in rollback
+    assert "PreviousFirewallProgram" in rollback
+    assert "Log(" in rollback
 
 
 def test_old_uninstaller_filters_canonical_and_legacy_rules_by_current_program() -> None:

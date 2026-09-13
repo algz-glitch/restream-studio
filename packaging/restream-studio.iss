@@ -43,6 +43,9 @@ var
   DeleteDataDecisionMade: Boolean;
   DeleteUserData: Boolean;
   LaunchAfterInstallCheck: TNewCheckBox;
+  FirewallChanged: Boolean;
+  InstallCommitted: Boolean;
+  PreviousFirewallProgram: String;
 
 function HasCommandLineArgument(const Expected: String): Boolean;
 var
@@ -82,13 +85,86 @@ begin
   end;
 end;
 
-function RunElevatedPowerShell(const Command, ApplicationPath: String;
+function HexValue(const Value: Char): Integer;
+begin
+  if (Value >= '0') and (Value <= '9') then
+    Result := Ord(Value) - Ord('0')
+  else if (Value >= 'a') and (Value <= 'f') then
+    Result := Ord(Value) - Ord('a') + 10
+  else if (Value >= 'A') and (Value <= 'F') then
+    Result := Ord(Value) - Ord('A') + 10
+  else
+    Result := -1;
+end;
+
+function HexDecode(const Value: String; var Decoded: String): Boolean;
+var
+  Index: Integer;
+  A, B, C, D: Integer;
+begin
+  Result := False;
+  Decoded := '';
+  if (Length(Value) mod 4) <> 0 then
+    Exit;
+  Index := 1;
+  while Index <= Length(Value) do
+  begin
+    A := HexValue(Value[Index]);
+    B := HexValue(Value[Index + 1]);
+    C := HexValue(Value[Index + 2]);
+    D := HexValue(Value[Index + 3]);
+    if (A < 0) or (B < 0) or (C < 0) or (D < 0) then
+      Exit;
+    Decoded := Decoded + Chr((A shl 12) or (B shl 8) or (C shl 4) or D);
+    Index := Index + 4;
+  end;
+  Result := True;
+end;
+
+function IsFullyQualifiedApplicationPath(const Value: String): Boolean;
+var
+  Index: Integer;
+  SeparatorCount: Integer;
+  DrivePath: Boolean;
+  UncPath: Boolean;
+begin
+  SeparatorCount := 0;
+  for Index := 1 to Length(Value) do
+    if (Value[Index] = '\') or (Value[Index] = '/') then
+      SeparatorCount := SeparatorCount + 1;
+  DrivePath := (Length(Value) >= 3) and
+    (((Value[1] >= 'A') and (Value[1] <= 'Z')) or
+     ((Value[1] >= 'a') and (Value[1] <= 'z'))) and
+    (Value[2] = ':') and ((Value[3] = '\') or (Value[3] = '/'));
+  UncPath := (Length(Value) >= 5) and
+    ((Value[1] = '\') or (Value[1] = '/')) and
+    ((Value[2] = '\') or (Value[2] = '/')) and (SeparatorCount >= 4);
+  Result := (DrivePath or UncPath) and
+    (CompareText(ExtractFileName(Value), 'RestreamStudio.exe') = 0);
+end;
+
+function NewFirewallStatePath(): String;
+var
+  Attempt: Integer;
+begin
+  for Attempt := 1 to 32 do
+  begin
+    Result := AddBackslash(ExpandConstant('{tmp}')) +
+      'RestreamStudio-firewall-' + IntToStr(Random(1000000000)) + '-' +
+      IntToStr(Random(1000000000)) + '.state';
+    if (not FileExists(Result)) and (not DirExists(Result)) then
+      Exit;
+  end;
+  RaiseException('Unable to allocate a unique firewall state path.');
+end;
+
+function RunElevatedPowerShell(const Command, EncodedArguments: String;
   var ResultCode: Integer): Boolean;
 var
   Parameters: String;
 begin
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& { ' +
-    Command + ' }" ' + HexEncode(ApplicationPath);
+    Command + ' }" ' + EncodedArguments;
   Result := ShellExec('runas',
     ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -103,6 +179,10 @@ begin
       '$p+=[char][Convert]::ToUInt16($h.Substring($i,4),16)};' +
     'if((-not [IO.Path]::IsPathFullyQualified($p))-or' +
       '([IO.Path]::GetFileName($p)-ine ''RestreamStudio.exe'')){throw ''bad path''};' +
+    '$sh=$args[1];if(($sh.Length%4)-ne 0){throw ''bad state path''};' +
+    '$s='''';for($i=0;$i-lt $sh.Length;$i+=4){' +
+      '$s+=[char][Convert]::ToUInt16($sh.Substring($i,4),16)};' +
+    'if(-not [IO.Path]::IsPathFullyQualified($s)){throw ''bad state path''};' +
     '$n=''RestreamStudio-Installed-Localhost'';' +
     '$legacy=''Restream Studio (Loopback TCP)'';' +
     '$restoreProgram=$null;' +
@@ -122,6 +202,9 @@ begin
       '(@($d.RemoteAddress).Count-eq 1)-and' +
       '(@($d.RemoteAddress)[0]-eq ''127.0.0.1'')){' +
         '$restoreProgram=$a.Program;break}}catch{}};' +
+    '$snapshot='''';if($null-ne $restoreProgram){' +
+      'foreach($c in [char[]]$restoreProgram){$snapshot+=([int]$c).ToString(''x4'')}};' +
+    '[IO.File]::WriteAllText($s,$snapshot,[Text.Encoding]::ASCII);' +
     'try{' +
       'Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue|' +
         'Where-Object{$_.Name-ne $n}|Remove-NetFirewallRule -EA Stop;' +
@@ -176,16 +259,114 @@ begin
       'if($a.Program -ieq $p){throw ''firewall removal verification failed''}}';
 end;
 
+function RollbackFirewallCommand(): String;
+begin
+  Result :=
+    '$ErrorActionPreference=''Stop'';' +
+    '$h=$args[0];$oh=$args[1];' +
+    'if((($h.Length%4)-ne 0)-or(($oh.Length%4)-ne 0)){throw ''bad path''};' +
+    '$p='''';for($i=0;$i-lt $h.Length;$i+=4){' +
+      '$p+=[char][Convert]::ToUInt16($h.Substring($i,4),16)};' +
+    '$old='''';for($i=0;$i-lt $oh.Length;$i+=4){' +
+      '$old+=[char][Convert]::ToUInt16($oh.Substring($i,4),16)};' +
+    'if((-not [IO.Path]::IsPathFullyQualified($p))-or' +
+      '([IO.Path]::GetFileName($p)-ine ''RestreamStudio.exe'')){throw ''bad path''};' +
+    'if(($old-ne '''')-and((-not [IO.Path]::IsPathFullyQualified($old))-or' +
+      '([IO.Path]::GetFileName($old)-ine ''RestreamStudio.exe''))){throw ''bad old path''};' +
+    '$n=''RestreamStudio-Installed-Localhost'';' +
+    '$legacy=''Restream Studio (Loopback TCP)'';' +
+    '$candidates=@(@(Get-NetFirewallRule -Name $n -EA SilentlyContinue)+' +
+      '@(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue))|' +
+      'Sort-Object Name -Unique;' +
+    'foreach($r in $candidates){try{' +
+      '$a=$r|Get-NetFirewallApplicationFilter -EA Stop;' +
+      'if($a.Program -ieq $p){$r|Remove-NetFirewallRule -EA Stop}}catch{continue}};' +
+    'if($old-ne ''''){' +
+      '$valid=$false;foreach($r in @(Get-NetFirewallRule -Name $n -EA SilentlyContinue)){' +
+        'try{$a=$r|Get-NetFirewallApplicationFilter -EA Stop;' +
+        '$q=$r|Get-NetFirewallPortFilter -EA Stop;' +
+        '$d=$r|Get-NetFirewallAddressFilter -EA Stop;' +
+        'if(($r.Direction-eq ''Inbound'')-and($r.Action-eq ''Allow'')-and' +
+        '($r.Enabled-eq ''True'')-and($a.Program-ieq $old)-and' +
+        '($q.Protocol-eq ''TCP'')-and(@($d.LocalAddress).Count-eq 1)-and' +
+        '(@($d.LocalAddress)[0]-eq ''127.0.0.1'')-and' +
+        '(@($d.RemoteAddress).Count-eq 1)-and' +
+        '(@($d.RemoteAddress)[0]-eq ''127.0.0.1'')){$valid=$true;break}}catch{}};' +
+      'if(-not $valid){New-NetFirewallRule -Name $n' +
+        ' -DisplayName ''Restream Studio Installed localhost''' +
+        ' -Direction Inbound -Action Allow -Enabled True -Program $old' +
+        ' -Protocol TCP -LocalAddress ''127.0.0.1''' +
+        ' -RemoteAddress ''127.0.0.1'' -Profile Any' +
+        ' -EdgeTraversalPolicy Block|Out-Null}};' +
+    '$remaining=@(@(Get-NetFirewallRule -Name $n -EA SilentlyContinue)+' +
+      '@(Get-NetFirewallRule -DisplayName $legacy -EA SilentlyContinue))|' +
+      'Sort-Object Name -Unique;' +
+    'foreach($r in $remaining){try{' +
+      '$a=$r|Get-NetFirewallApplicationFilter -EA Stop;' +
+      'if($a.Program-ieq $p){throw ''current firewall rule remains''}}catch{' +
+      'if($_.Exception.Message-eq ''current firewall rule remains''){throw}}}';
+end;
+
 procedure ConfigureFirewall;
 var
   ResultCode: Integer;
   ApplicationPath: String;
+  StatePath: String;
+  SnapshotHex: AnsiString;
+  SnapshotProgram: String;
+  Started: Boolean;
+  SnapshotValid: Boolean;
 begin
   ResultCode := -1;
   ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
-  if (not RunElevatedPowerShell(InstalledFirewallCommand(), ApplicationPath,
-    ResultCode)) or (ResultCode <> 0) then
+  StatePath := NewFirewallStatePath();
+  SnapshotValid := False;
+  try
+    Started := RunElevatedPowerShell(InstalledFirewallCommand(),
+      HexEncode(ApplicationPath) + ' ' + HexEncode(StatePath), ResultCode);
+    if FileExists(StatePath) then
+    begin
+      FirewallChanged := True;
+      if not LoadStringFromFile(StatePath, SnapshotHex) then
+        RaiseException('Unable to read the firewall state file.');
+      if (not HexDecode(String(SnapshotHex), SnapshotProgram)) or
+        ((SnapshotProgram <> '') and
+         (not IsFullyQualifiedApplicationPath(SnapshotProgram))) then
+        RaiseException('The firewall state file is invalid.');
+      PreviousFirewallProgram := SnapshotProgram;
+      SnapshotValid := True;
+      if not DeleteFile(StatePath) then
+        RaiseException('Unable to delete the firewall state file.');
+      StatePath := '';
+    end;
+  finally
+    if (StatePath <> '') and FileExists(StatePath) then
+      DeleteFile(StatePath);
+  end;
+  if (not Started) or (ResultCode <> 0) or (not SnapshotValid) then
     RaiseException('Firewall configuration failed; installation was rolled back.');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssDone then
+    InstallCommitted := True;
+end;
+
+procedure DeinitializeSetup;
+var
+  ResultCode: Integer;
+  ApplicationPath: String;
+begin
+  if FirewallChanged and (not InstallCommitted) then
+  begin
+    ResultCode := -1;
+    ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
+    if (not RunElevatedPowerShell(RollbackFirewallCommand(),
+      HexEncode(ApplicationPath) + ' ' + HexEncode(PreviousFirewallProgram),
+      ResultCode)) or (ResultCode <> 0) then
+      Log(Format('Firewall rollback failed with result code %d.', [ResultCode]));
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -198,7 +379,7 @@ begin
     ResultCode := -1;
     ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
     if (not RunElevatedPowerShell(RemoveInstalledFirewallCommand(),
-      ApplicationPath, ResultCode)) or (ResultCode <> 0) then
+      HexEncode(ApplicationPath), ResultCode)) or (ResultCode <> 0) then
     begin
       SuppressibleMsgBox(
         'Firewall cleanup failed. Uninstall was stopped before deleting files.',

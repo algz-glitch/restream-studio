@@ -36,7 +36,7 @@ Name: "{autodesktop}\Restream Studio"; Filename: "{app}\RestreamStudio.exe"
 Name: "{group}\Restream Studio"; Filename: "{app}\RestreamStudio.exe"
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{localappdata}\RestreamStudio"; Check: ShouldDeleteUserData
+Type: filesandordirs; Name: "{code:GetUserDataDir}"; Check: ShouldDeleteUserData
 
 [Code]
 var
@@ -46,6 +46,134 @@ var
   FirewallChanged: Boolean;
   InstallCommitted: Boolean;
   PreviousFirewallProgram: String;
+  UserDataDir: String;
+  DefaultUserDataDir: String;
+
+function GetCommandLineValue(const Prefix: String; var Value: String): Boolean;
+var
+  Index: Integer;
+  Argument: String;
+begin
+  Result := False;
+  Value := '';
+  for Index := 1 to ParamCount do
+  begin
+    Argument := ParamStr(Index);
+    if CompareText(Copy(Argument, 1, Length(Prefix)), Prefix) = 0 then
+    begin
+      Value := Copy(Argument, Length(Prefix) + 1, MaxInt);
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function IsAbsoluteDrivePath(const Value: String): Boolean;
+begin
+  Result := (Length(Value) >= 3) and
+    (((Value[1] >= 'A') and (Value[1] <= 'Z')) or
+     ((Value[1] >= 'a') and (Value[1] <= 'z'))) and
+    (Value[2] = ':') and ((Value[3] = '\') or (Value[3] = '/'));
+end;
+
+function IsPathInside(const Value, Root: String): Boolean;
+var
+  FullValue: String;
+  FullRoot: String;
+begin
+  FullValue := RemoveBackslashUnlessRoot(ExpandFileName(Value));
+  FullRoot := RemoveBackslashUnlessRoot(ExpandFileName(Root));
+  Result := (Length(FullValue) > Length(FullRoot)) and
+    (CompareText(Copy(FullValue, 1, Length(FullRoot)), FullRoot) = 0) and
+    (FullValue[Length(FullRoot) + 1] = '\');
+end;
+
+function IsTempSmokePath(const Value: String): Boolean;
+var
+  TempRoot: String;
+  RelativeValue: String;
+  Separator: Integer;
+  FirstDirectory: String;
+begin
+  Result := False;
+  TempRoot := RemoveBackslashUnlessRoot(ExpandConstant('{%TEMP}'));
+  if not IsPathInside(Value, TempRoot) then
+    Exit;
+  RelativeValue := Copy(ExpandFileName(Value), Length(TempRoot) + 2, MaxInt);
+  Separator := Pos('\', RelativeValue);
+  if Separator = 0 then
+    FirstDirectory := RelativeValue
+  else
+    FirstDirectory := Copy(RelativeValue, 1, Separator - 1);
+  Result := Pos('RestreamStudioInstallerSmoke-', FirstDirectory) = 1;
+end;
+
+function IsWorkspaceSmokePath(const Value: String): Boolean;
+var
+  CandidateRoot: String;
+  WorkspaceRoot: String;
+  ParentRoot: String;
+  Attempt: Integer;
+begin
+  Result := False;
+  WorkspaceRoot := ExtractFileDir(ExpandConstant('{srcexe}'));
+  for Attempt := 1 to 8 do
+  begin
+    CandidateRoot := AddBackslash(WorkspaceRoot) + 'artifacts\smoke';
+    if (FileExists(AddBackslash(WorkspaceRoot) + '.git') or
+        DirExists(AddBackslash(WorkspaceRoot) + '.git')) and
+       IsPathInside(Value, CandidateRoot) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    ParentRoot := ExtractFileDir(WorkspaceRoot);
+    if CompareText(ParentRoot, WorkspaceRoot) = 0 then
+      Exit;
+    WorkspaceRoot := ParentRoot;
+  end;
+end;
+
+function IsSafeSmokeUserDataDir(const Value: String): Boolean;
+begin
+  Result := (Value <> '') and IsAbsoluteDrivePath(Value) and
+    (IsTempSmokePath(Value) or IsWorkspaceSmokePath(Value));
+end;
+
+function InitializeUserDataDir(): Boolean;
+var
+  OverridePath: String;
+begin
+  DefaultUserDataDir := ExpandConstant('{localappdata}\RestreamStudio');
+  UserDataDir := DefaultUserDataDir;
+  if GetCommandLineValue('/USERDATADIR=', OverridePath) then
+  begin
+    if not IsSafeSmokeUserDataDir(OverridePath) then
+    begin
+      SuppressibleMsgBox('Refusing unsafe /USERDATADIR override.',
+        mbError, MB_OK, IDOK);
+      Result := False;
+      Exit;
+    end;
+    UserDataDir := RemoveBackslashUnlessRoot(ExpandFileName(OverridePath));
+  end;
+  Result := True;
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  Result := InitializeUserDataDir();
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := InitializeUserDataDir();
+end;
+
+function GetUserDataDir(Param: String): String;
+begin
+  Result := UserDataDir;
+end;
 
 function HasCommandLineArgument(const Expected: String): Boolean;
 var
@@ -445,7 +573,7 @@ begin
   end;
   if not DeleteDataDecisionMade then
   begin
-    DataPath := ExpandConstant('{localappdata}\RestreamStudio');
+    DataPath := UserDataDir;
     DeleteUserData := MsgBox(
       'Delete Restream Studio settings, logs, and downloaded updates from ' +
       DataPath + '?' + #13#10 +

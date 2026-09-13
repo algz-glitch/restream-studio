@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$SkipInstallerLifecycle)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $Package = Join-Path $PSScriptRoot 'package.ps1'
+$BuildInstaller = Join-Path $PSScriptRoot 'build-installer.ps1'
+$SmokeInstaller = Join-Path $PSScriptRoot 'smoke-installer.ps1'
 $Distribution = Join-Path $Root 'dist\RestreamStudio'
 $TreeManifestTool = Join-Path $Root 'scripts\write-tree-manifest.py'
 $ManifestDirectory = Join-Path $Root 'artifacts\release-verification'
@@ -35,6 +37,7 @@ function Get-ProjectVersion {
 }
 
 $ProjectVersion = Get-ProjectVersion
+$Installer = Join-Path $Root "dist\installer\RestreamStudio-Setup-$ProjectVersion.exe"
 
 function Invoke-External {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
@@ -254,6 +257,45 @@ try {
             '--output', $PackageManifest
         )
         Write-Output "PACKAGE_MANIFEST_PATH=$PackageManifest"
+    }
+    Invoke-Gate -Name 'INSTALLER_BUILD' -Action {
+        $oldVerifiedCommit = [Environment]::GetEnvironmentVariable(
+            'RESTREAM_STUDIO_VERIFIED_COMMIT'
+        )
+        try {
+            [Environment]::SetEnvironmentVariable(
+                'RESTREAM_STUDIO_VERIFIED_COMMIT', $CurrentCommit
+            )
+            & $BuildInstaller -Clean -ReuseVerifiedPackage -PackageManifest $PackageManifest |
+                ForEach-Object { [Console]::Error.WriteLine([string]$_) }
+            if ($LASTEXITCODE -ne 0) {
+                throw "build-installer.ps1 exited with code $LASTEXITCODE"
+            }
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                'RESTREAM_STUDIO_VERIFIED_COMMIT', $oldVerifiedCommit
+            )
+        }
+        if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
+            throw "installer output is missing: $Installer"
+        }
+        Write-Output "INSTALLER_PATH=$Installer"
+    }
+    if ($SkipInstallerLifecycle) {
+        Write-Output 'INSTALLER_LIFECYCLE=SKIP'
+        [Console]::Error.WriteLine(
+            'INSTALLER_LIFECYCLE skipped by explicit developer diagnostic override'
+        )
+    }
+    else {
+        Invoke-Gate -Name 'INSTALLER_LIFECYCLE' -Action {
+            $PowerShell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+            Invoke-External $PowerShell @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SmokeInstaller,
+                '-Installer', $Installer, '-WorkspaceRoot', $Root
+            )
+        }
     }
 }
 finally { Pop-Location }

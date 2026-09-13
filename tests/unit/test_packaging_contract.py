@@ -25,6 +25,7 @@ def test_windows_packaging_files_exist() -> None:
         "scripts/verify.ps1",
         "scripts/package.ps1",
         "scripts/build-installer.ps1",
+        "scripts/smoke-installer.ps1",
         "README.md",
     )
     assert all((ROOT / item).is_file() for item in required)
@@ -53,6 +54,76 @@ def test_inno_installer_has_stable_per_user_lifecycle_contract() -> None:
     assert "MB_DEFBUTTON2" in installer
     assert "[Run]" not in installer
     assert "[UninstallRun]" not in installer
+
+
+def test_installer_smoke_userdata_override_is_bounded_and_default_is_unchanged() -> None:
+    installer = _read("packaging/restream-studio.iss")
+
+    assert 'DefaultUserDataDir := ExpandConstant(\'{localappdata}\\RestreamStudio\')' in installer
+    assert "/USERDATADIR=" in installer
+    assert "function InitializeSetup(): Boolean" in installer
+    assert "function InitializeUninstall(): Boolean" in installer
+    assert "RestreamStudioInstallerSmoke-" in installer
+    assert "artifacts\\smoke" in installer
+    assert "IsSafeSmokeUserDataDir" in installer
+    assert "Refusing unsafe /USERDATADIR override." in installer
+    assert "GetUserDataDir" in installer
+    uninstall_delete = installer[
+        installer.index("[UninstallDelete]") : installer.index("[Code]")
+    ]
+    assert 'Name: "{code:GetUserDataDir}"' in uninstall_delete
+    assert 'Name: "{localappdata}\\RestreamStudio"' not in uninstall_delete
+
+
+def test_installer_lifecycle_smoke_has_real_isolated_cleanup_contract() -> None:
+    smoke = _read("scripts/smoke-installer.ps1")
+
+    for marker in (
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/DIR=",
+        "/USERDATADIR=",
+        "/DELETEUSERDATA=1",
+        "RestreamStudioInstallerSmoke-",
+        "artifacts\\smoke",
+        "RestreamStudio-Installed-Localhost",
+        "Get-NetFirewallApplicationFilter",
+        "Get-NetFirewallPortFilter",
+        "Get-NetFirewallAddressFilter",
+        "127.0.0.1",
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "WScript.Shell",
+        "Invoke-RestMethod",
+        "Invoke-WebRequest",
+        "marker",
+        "Wait-LocalPortReleased",
+        "finally",
+    ):
+        assert marker in smoke
+
+    assert "Get-FileHash" in smoke
+    assert "Assert-SafeLifecyclePath" in smoke
+    assert "Remove-Item -LiteralPath" in smoke
+    assert "Move-Item" not in smoke
+    assert "LOCALAPPDATA\\RestreamStudio" not in smoke.upper()
+    assert "Stop-Process -Name" not in smoke
+    assert "-Recurse -Force" in smoke
+
+
+def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> None:
+    verify = _read("scripts/verify.ps1")
+    release = _read(".github/workflows/release.yml")
+
+    assert "[switch]$SkipInstallerLifecycle" in verify
+    assert "INSTALLER_BUILD" in verify
+    assert "INSTALLER_LIFECYCLE" in verify
+    assert "build-installer.ps1" in verify
+    assert "smoke-installer.ps1" in verify
+    assert "-ReuseVerifiedPackage" in verify
+    assert "-PackageManifest" in verify
+    assert "INSTALLER_LIFECYCLE=SKIP" in verify
+    assert "-SkipInstallerLifecycle" not in release
 
 
 def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation() -> None:
@@ -235,6 +306,11 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
     assert "$output = @(& $Path $probe" in build
     assert "Compiler engine version: Inno Setup 6.7.3" in build
     assert "ISCC_PATH must point to Inno Setup 6.7.3" in build
+    assert "function Find-RegisteredIscc" in build
+    assert "DisplayVersion" in build
+    assert "InstallLocation" in build
+    assert "RegistryView]::Registry64" in build
+    assert "RegistryView]::Registry32" in build
     assert "Get-AuthenticodeSignature" in build
     assert "Pyrsys B.V." in build
     assert "ReuseVerifiedPackage" in build
@@ -342,6 +418,8 @@ def test_verify_gate_is_fail_fast_complete_and_checks_dynamic_health() -> None:
         "PYTHON_TESTS",
         "LOCAL_RTMP_E2E",
         "PACKAGE_SMOKE",
+        "INSTALLER_BUILD",
+        "INSTALLER_LIFECYCLE",
     )
     invoked_labels = tuple(
         re.findall(r"Invoke-Gate\s+-Name\s+['\"]([A-Z0-9_]+)['\"]", script)

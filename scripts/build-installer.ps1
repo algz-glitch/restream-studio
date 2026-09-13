@@ -116,6 +116,50 @@ OutputBaseFilename=version-probe
     }
 }
 
+function Find-RegisteredIscc {
+    $hives = @(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryHive]::LocalMachine
+    )
+    $views = @(
+        [Microsoft.Win32.RegistryView]::Registry64,
+        [Microsoft.Win32.RegistryView]::Registry32
+    )
+    foreach ($hive in $hives) {
+        foreach ($view in $views) {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+            try {
+                $uninstall = $base.OpenSubKey(
+                    'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+                )
+                if ($null -eq $uninstall) { continue }
+                try {
+                    foreach ($subKeyName in $uninstall.GetSubKeyNames()) {
+                        $entry = $uninstall.OpenSubKey($subKeyName)
+                        if ($null -eq $entry) { continue }
+                        try {
+                            if ($entry.GetValue('DisplayVersion') -cne '6.7.3' -or
+                                $entry.GetValue('Publisher') -cne 'jrsoftware.org') {
+                                continue
+                            }
+                            $location = [string]$entry.GetValue('InstallLocation')
+                            if (-not $location) { continue }
+                            $candidate = Join-Path $location 'ISCC.exe'
+                            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                                return $candidate
+                            }
+                        }
+                        finally { $entry.Dispose() }
+                    }
+                }
+                finally { $uninstall.Dispose() }
+            }
+            finally { $base.Dispose() }
+        }
+    }
+    return $null
+}
+
 function Resolve-Iscc {
     $configured = [Environment]::GetEnvironmentVariable('ISCC_PATH')
     if ($configured) {
@@ -128,12 +172,21 @@ function Resolve-Iscc {
         catch { throw 'ISCC_PATH must point to Inno Setup 6.7.3 with a valid trusted Pyrsys B.V. signature' }
     }
 
+    $registered = Find-RegisteredIscc
+    if ($registered) {
+        return Assert-IsccVersion -Path $registered -SourceLabel 'registered ISCC.exe'
+    }
+
     $winget = (Get-Command 'winget.exe' -CommandType Application -ErrorAction Stop).Source
     Invoke-External $winget @(
         'install', '--id', 'JRSoftware.InnoSetup', '--version', '6.7.3', '--exact',
         '--scope', 'user', '--silent', '--accept-package-agreements',
         '--accept-source-agreements', '--disable-interactivity'
     )
+    $registered = Find-RegisteredIscc
+    if ($registered) {
+        return Assert-IsccVersion -Path $registered -SourceLabel 'winget registered ISCC.exe'
+    }
     $installedCandidates = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),

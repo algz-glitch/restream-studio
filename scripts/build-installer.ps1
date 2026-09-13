@@ -4,7 +4,8 @@ param(
     [string]$SourceRoot = '',
     [switch]$ResolveVersionOnly,
     [switch]$ReuseVerifiedPackage,
-    [string]$PackageManifest = ''
+    [string]$PackageManifest = '',
+    [switch]$BuildSmokeFixtures
 )
 
 Set-StrictMode -Version Latest
@@ -62,6 +63,9 @@ function Get-ReleaseVersion {
 
 $Version = Get-ReleaseVersion -RootPath $Root
 $Installer = Join-Path $InstallerDirectory "RestreamStudio-Setup-$Version.exe"
+$SmokeUpgradeVersion = '0.1.1'
+$SmokeUpgradeInstaller = Join-Path $InstallerDirectory `
+    "RestreamStudio-Setup-$SmokeUpgradeVersion.exe"
 if ($ResolveVersionOnly) {
     Write-Output "RELEASE_VERSION=$Version"
     Write-Output "INSTALLER_PATH=$Installer"
@@ -264,3 +268,17 @@ if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
 $hash = (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Output "INSTALLER_PATH=$Installer"
 Write-Output "SHA256=$hash"
+if ($BuildSmokeFixtures) {
+    if ($Version -cne '0.1.0') {
+        throw 'smoke upgrade fixture is defined only for the 0.1.0 release baseline'
+    }
+    Invoke-External $iscc @(
+        '/DMyAppVersion=0.1.1', '/DSmokeTestBuild=1', $InstallerScript
+    )
+    if (-not (Test-Path -LiteralPath $SmokeUpgradeInstaller -PathType Leaf)) {
+        throw "smoke upgrade installer is missing: $SmokeUpgradeInstaller"
+    }
+    $smokeHash = (Get-FileHash -LiteralPath $SmokeUpgradeInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Output "SMOKE_UPGRADE_INSTALLER_PATH=$SmokeUpgradeInstaller"
+    Write-Output "SMOKE_UPGRADE_SHA256=$smokeHash"
+}

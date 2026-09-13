@@ -38,6 +38,7 @@ function Get-ProjectVersion {
 
 $ProjectVersion = Get-ProjectVersion
 $Installer = Join-Path $Root "dist\installer\RestreamStudio-Setup-$ProjectVersion.exe"
+$SmokeUpgradeInstaller = Join-Path $Root 'dist\installer\RestreamStudio-Setup-0.1.1.exe'
 
 function Invoke-External {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
@@ -266,7 +267,8 @@ try {
             [Environment]::SetEnvironmentVariable(
                 'RESTREAM_STUDIO_VERIFIED_COMMIT', $CurrentCommit
             )
-            & $BuildInstaller -Clean -ReuseVerifiedPackage -PackageManifest $PackageManifest |
+            & $BuildInstaller -Clean -ReuseVerifiedPackage -PackageManifest $PackageManifest `
+                -BuildSmokeFixtures |
                 ForEach-Object { [Console]::Error.WriteLine([string]$_) }
             if ($LASTEXITCODE -ne 0) {
                 throw "build-installer.ps1 exited with code $LASTEXITCODE"
@@ -293,7 +295,8 @@ try {
             $PowerShell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
             Invoke-External $PowerShell @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SmokeInstaller,
-                '-Installer', $Installer, '-WorkspaceRoot', $Root
+                '-Installer', $Installer, '-UpgradeInstaller', $SmokeUpgradeInstaller,
+                '-WorkspaceRoot', $Root
             )
         }
     }

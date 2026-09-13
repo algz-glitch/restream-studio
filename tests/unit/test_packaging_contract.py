@@ -111,6 +111,89 @@ def test_installer_lifecycle_smoke_has_real_isolated_cleanup_contract() -> None:
     assert "-Recurse -Force" in smoke
 
 
+def test_installer_smoke_restores_only_complete_exact_snapshots() -> None:
+    smoke = _read("scripts/smoke-installer.ps1")
+
+    assert "$SnapshotCaptured = $false" in smoke
+    assert "$FirewallMutationPossible = $false" in smoke
+    assert "$SnapshotCaptured = $true" in smoke
+    assert "Assert-KnownFirewallSchema" in smoke
+    assert "Get-NetFirewallInterfaceFilter" in smoke
+    assert "Get-NetFirewallInterfaceTypeFilter" in smoke
+    assert "Get-NetFirewallServiceFilter" in smoke
+    assert "if ($SnapshotCaptured -and $FirewallMutationPossible)" in smoke
+    assert "non-standard pre-existing Restream Studio firewall rule" in smoke
+
+
+def test_installer_smoke_shortcut_backups_are_independent_and_hash_verified() -> None:
+    smoke = _read("scripts/smoke-installer.ps1")
+
+    assert "$DesktopBackupSucceeded = $false" in smoke
+    assert "$StartMenuBackupSucceeded = $false" in smoke
+    assert "$DesktopBackupHash" in smoke
+    assert "$StartMenuBackupHash" in smoke
+    assert "Backup-Shortcut" in smoke
+    assert "Restore-ShortcutAtomically" in smoke
+    assert "File]::Replace" in smoke
+    assert "backup hash verification failed" in smoke
+
+
+def test_smoke_paths_reject_reparse_ancestors_and_cleanup_fixed_appid_only() -> None:
+    smoke = _read("scripts/smoke-installer.ps1")
+    installer = _read("packaging/restream-studio.iss")
+
+    assert "Assert-NoReparsePointAncestors" in smoke
+    assert "FileAttributes]::ReparsePoint" in smoke
+    assert smoke.count("Assert-NoReparsePointAncestors -Path $Path") >= 2
+    assert "$UninstallSubKey = '{6D5EE4A8-17C8-4DA0-84F8-28710EAB90F4}_is1'" in smoke
+    assert "DeleteSubKeyTree($UninstallSubKey" in smoke
+    assert "Remove-IsolatedUninstallRegistration" in smoke
+    assert "HasReparsePointAncestor" in installer
+    assert "[IO.FileAttributes]::ReparsePoint" in installer
+
+
+def test_installer_processes_are_bounded_and_smoke_self_elevates_once() -> None:
+    smoke = _read("scripts/smoke-installer.ps1")
+
+    assert "Invoke-BoundedProcess" in smoke
+    assert "WaitForExit($TimeoutSeconds * 1000)" in smoke
+    assert "taskkill.exe" in smoke
+    assert "'RunAs'" in smoke
+    assert "$ElevatedChild" in smoke
+    assert "$ElevatedPayload" in smoke
+    assert "ConvertTo-Json -Compress" in smoke
+    assert "ToBase64String" in smoke
+    assert "elevation broker timed out" in smoke
+    assert "Invoke-NativeChecked" not in smoke
+
+
+def test_smoke_build_uses_real_upgrade_version_and_failure_injection_fixture() -> None:
+    installer = _read("packaging/restream-studio.iss")
+    build = _read("scripts/build-installer.ps1")
+    smoke = _read("scripts/smoke-installer.ps1")
+    verify = _read("scripts/verify.ps1")
+    release = _read(".github/workflows/release.yml")
+
+    assert "#ifndef MyAppVersion" in installer
+    assert "#ifndef SmokeTestBuild" in installer
+    assert "/SMOKEFIREWALLFAIL=" in installer
+    assert "cancel" in installer
+    assert "command" in installer
+    assert "[switch]$BuildSmokeFixtures" in build
+    assert "/DMyAppVersion=0.1.1" in build
+    assert "/DSmokeTestBuild=1" in build
+    assert "SMOKE_UPGRADE_INSTALLER_PATH=" in build
+    assert "UpgradeInstaller" in smoke
+    assert "DisplayVersion" in smoke
+    assert "0.1.0" in smoke and "0.1.1" in smoke
+    assert "tamperedProgramHash" in smoke
+    assert "@('cancel','command')" in smoke
+    assert '"/SMOKEFIREWALLFAIL=$mode"' in smoke
+    assert "-BuildSmokeFixtures" in verify
+    assert "-BuildSmokeFixtures" not in release
+    assert "/DSmokeTestBuild" not in release
+
+
 def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> None:
     verify = _read("scripts/verify.ps1")
     release = _read(".github/workflows/release.yml")

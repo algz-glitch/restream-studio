@@ -1,5 +1,10 @@
 #define MyAppName "Restream Studio"
+#ifndef MyAppVersion
 #define MyAppVersion "0.1.0"
+#endif
+#ifndef SmokeTestBuild
+#define SmokeTestBuild 0
+#endif
 #define MyAppPublisher "Restream Studio"
 #define MyAppExeName "RestreamStudio.exe"
 
@@ -88,6 +93,26 @@ begin
     (FullValue[Length(FullRoot) + 1] = '\');
 end;
 
+function HasReparsePointAncestor(const Value: String): Boolean;
+var
+  EscapedPath: String;
+  Parameters: String;
+  ResultCode: Integer;
+  Started: Boolean;
+begin
+  EscapedPath := ExpandFileName(Value);
+  StringChangeEx(EscapedPath, '''', '''''', True);
+  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& {' +
+    '$p=''' + EscapedPath + ''';while($p){if(Test-Path -LiteralPath $p){' +
+    '$i=Get-Item -LiteralPath $p -Force -EA Stop;' +
+    'if(($i.Attributes-band [IO.FileAttributes]::ReparsePoint)-ne 0){exit 10}};' +
+    '$n=[IO.Path]::GetDirectoryName($p);if((-not $n)-or($n-eq $p)){break};$p=$n};exit 0}"';
+  ResultCode := -1;
+  Started := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := (not Started) or (ResultCode <> 0);
+end;
+
 function IsTempSmokePath(const Value: String): Boolean;
 var
   TempRoot: String;
@@ -155,10 +180,33 @@ begin
       Result := False;
       Exit;
     end;
+    if HasReparsePointAncestor(OverridePath) then
+    begin
+      SuppressibleMsgBox('Refusing /USERDATADIR with a reparse-point ancestor.',
+        mbError, MB_OK, IDOK);
+      Result := False;
+      Exit;
+    end;
     UserDataDir := RemoveBackslashUnlessRoot(ExpandFileName(OverridePath));
   end;
   Result := True;
 end;
+
+#if SmokeTestBuild
+function SmokeFirewallFailureMode(): String;
+var
+  Value: String;
+begin
+  Result := '';
+  if GetCommandLineValue('/SMOKEFIREWALLFAIL=', Value) then
+  begin
+    if (CompareText(Value, 'cancel') <> 0) and
+       (CompareText(Value, 'command') <> 0) then
+      RaiseException('Invalid /SMOKEFIREWALLFAIL test mode.');
+    Result := Lowercase(Value);
+  end;
+end;
+#endif
 
 function InitializeSetup(): Boolean;
 begin
@@ -470,6 +518,9 @@ var
   SnapshotProgram: String;
   Started: Boolean;
   SnapshotValid: Boolean;
+#if SmokeTestBuild
+  FailureMode: String;
+#endif
 begin
   ResultCode := -1;
   ApplicationPath := ExpandConstant('{app}\RestreamStudio.exe');
@@ -500,8 +551,22 @@ begin
     RaiseException('Firewall state capture failed; installation was rolled back.');
 
   ResultCode := -1;
+#if SmokeTestBuild
+  FailureMode := SmokeFirewallFailureMode();
+  if CompareText(FailureMode, 'cancel') = 0 then
+  begin
+    Started := False;
+    ResultCode := 1223;
+  end
+  else
+#endif
   Started := RunElevatedPowerShell(InstalledFirewallCommand(),
     HexEncode(ApplicationPath), ResultCode);
+#if SmokeTestBuild
+  if (CompareText(FailureMode, 'command') = 0) and Started and
+     (ResultCode = 0) then
+    ResultCode := 91;
+#endif
   if Started then
     FirewallChanged := True;
   if (not Started) or (ResultCode <> 0) then

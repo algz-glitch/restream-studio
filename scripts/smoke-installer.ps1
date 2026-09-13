@@ -1,11 +1,71 @@
 [CmdletBinding()]
-param(
-    [Parameter(Mandatory)][string]$Installer,
-    [string]$WorkspaceRoot = ''
-)
+param([string]$Installer = '', [string]$UpgradeInstaller = '', [string]$WorkspaceRoot = '',
+    [switch]$ElevatedChild, [string]$ElevatedPayload = '')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Stop-KnownProcessTree {
+    param([int]$ProcessId)
+    $killer = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
+        -ArgumentList @('/PID', [string]$ProcessId, '/T', '/F') -PassThru -WindowStyle Hidden
+    try { if (-not $killer.WaitForExit(15000)) { Stop-Process -Id $killer.Id -Force } }
+    finally { $killer.Dispose() }
+}
+
+function Invoke-BoundedProcess {
+    param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds = 300,
+        [string]$Verb = '', [string]$TimeoutMessage = 'process timed out', [switch]$AllowNonZero)
+    $p = @{ FilePath = $FilePath; ArgumentList = $Arguments; PassThru = $true }
+    if ($Verb) { $p['Verb'] = $Verb } else { $p['WindowStyle'] = 'Hidden' }
+    $child = Start-Process @p
+    try {
+        if (-not $child.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-KnownProcessTree $child.Id
+            throw $TimeoutMessage
+        }
+        if (-not $AllowNonZero -and $child.ExitCode -ne 0) {
+            throw "$FilePath exited with code $($child.ExitCode)"
+        }
+        return $child.ExitCode
+    }
+    finally { $child.Dispose() }
+}
+
+function Invoke-ElevatedSelf {
+    param([string]$Payload)
+    $powershell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+    $scriptPath = (Resolve-Path -LiteralPath $PSCommandPath).Path
+    $args = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',
+        "`"$scriptPath`"",'-ElevatedChild','-ElevatedPayload',$Payload)
+    return Invoke-BoundedProcess $powershell $args 900 'RunAs' 'elevation broker timed out'
+}
+
+if ($ElevatedChild) {
+    if (-not (Test-IsAdministrator)) { throw 'elevated child is not administrator' }
+    try { $payload = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String($ElevatedPayload)) | ConvertFrom-Json }
+    catch { throw 'invalid elevated payload' }
+    if ((@($payload.PSObject.Properties.Name | Sort-Object) -join ',') -cne
+        'installer,upgrade_installer,workspace_root') { throw 'invalid elevated payload schema' }
+    $Installer = $payload.installer; $UpgradeInstaller = $payload.upgrade_installer
+    $WorkspaceRoot = $payload.workspace_root
+}
+elseif (-not (Test-IsAdministrator)) {
+    foreach ($value in ($Installer,$UpgradeInstaller,$WorkspaceRoot)) {
+        if (-not [IO.Path]::IsPathFullyQualified($value)) { throw 'elevation paths must be absolute' }
+    }
+    $json = [ordered]@{installer=$Installer;upgrade_installer=$UpgradeInstaller;
+        workspace_root=$WorkspaceRoot} | ConvertTo-Json -Compress
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+    exit (Invoke-ElevatedSelf $encoded)
+}
 
 $Root = if ($WorkspaceRoot) {
     [IO.Path]::GetFullPath($WorkspaceRoot)
@@ -14,6 +74,7 @@ else {
     Split-Path -Parent $PSScriptRoot
 }
 $Installer = (Resolve-Path -LiteralPath $Installer -ErrorAction Stop).Path
+$UpgradeInstaller = (Resolve-Path -LiteralPath $UpgradeInstaller -ErrorAction Stop).Path
 $SmokeParent = Join-Path $Root 'artifacts\smoke'
 $SmokeRoot = Join-Path $SmokeParent "RestreamStudioInstallerSmoke-$([Guid]::NewGuid().ToString('N'))"
 $InstallDir = Join-Path $SmokeRoot 'app'
@@ -23,6 +84,7 @@ $Distribution = Join-Path $Root 'dist\RestreamStudio'
 $RuleName = 'RestreamStudio-Installed-Localhost'
 $LegacyRuleDisplayName = 'Restream Studio (Loopback TCP)'
 $UninstallRegistryPath = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+$UninstallSubKey = '{6D5EE4A8-17C8-4DA0-84F8-28710EAB90F4}_is1'
 $DesktopShortcut = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Restream Studio.lnk'
 $StartMenuGroup = Join-Path ([Environment]::GetFolderPath('Programs')) 'Restream Studio'
 $StartMenuShortcut = Join-Path $StartMenuGroup 'Restream Studio.lnk'
@@ -30,17 +92,18 @@ $Process = $null
 $Port = 0
 $InitialFirewall = @()
 $InitialFirewallFingerprint = ''
+$SnapshotCaptured = $false
+$FirewallMutationPossible = $false
+$UserStateMutationPossible = $false
 $DesktopBackup = Join-Path $BackupDir 'desktop.lnk'
 $StartMenuBackup = Join-Path $BackupDir 'start-menu.lnk'
 $DesktopExisted = Test-Path -LiteralPath $DesktopShortcut -PathType Leaf
 $StartMenuExisted = Test-Path -LiteralPath $StartMenuShortcut -PathType Leaf
 $StartMenuGroupExisted = Test-Path -LiteralPath $StartMenuGroup -PathType Container
-
-function Test-IsAdministrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
+$DesktopBackupSucceeded = $false
+$StartMenuBackupSucceeded = $false
+$DesktopBackupHash = ''
+$StartMenuBackupHash = ''
 
 function Test-PathInside {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Parent)
@@ -48,6 +111,22 @@ function Test-PathInside {
     $fullParent = [IO.Path]::GetFullPath($Parent).TrimEnd('\')
     return $fullPath.Length -gt $fullParent.Length -and
         $fullPath.StartsWith("$fullParent\", [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-NoReparsePointAncestors {
+    param([string]$Path)
+    $current = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "reparse point ancestor rejected: $current"
+            }
+        }
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if (-not $parent -or $parent -ceq $current) { break }
+        $current = $parent.TrimEnd('\')
+    }
 }
 
 function Assert-SafeLifecyclePath {
@@ -63,20 +142,16 @@ function Assert-SafeLifecyclePath {
             'RestreamStudioInstallerSmoke-*' -or
           [IO.Path]::GetFileName($Path) -like 'RestreamStudioInstallerSmoke-*'))
     if (-not $allowed) { throw "refusing lifecycle path outside workspace/temp smoke roots: $Path" }
+    Assert-NoReparsePointAncestors -Path $Path
 }
 
 function Remove-SafeTree {
     param([Parameter(Mandatory)][string]$Path)
     Assert-SafeLifecyclePath -Path $Path
+    Assert-NoReparsePointAncestors -Path $Path
     if (Test-Path -LiteralPath $Path) {
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
-}
-
-function Invoke-NativeChecked {
-    param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "$FilePath exited with code $LASTEXITCODE" }
 }
 
 function Get-DynamicPort {
@@ -114,30 +189,39 @@ function Get-UninstallEntry {
             [Microsoft.Win32.RegistryHive]::CurrentUser, $view
         )
         try {
-            $uninstall = $base.OpenSubKey($UninstallRegistryPath)
+            $uninstall = $base.OpenSubKey("$UninstallRegistryPath\$UninstallSubKey")
             if ($null -eq $uninstall) { continue }
             try {
-                foreach ($name in $uninstall.GetSubKeyNames()) {
-                    $key = $uninstall.OpenSubKey($name)
-                    if ($null -eq $key) { continue }
-                    try {
-                        if ($key.GetValue('DisplayName') -ceq 'Restream Studio') {
-                            return [pscustomobject]@{
-                                View = $view
-                                Name = $name
-                                InstallLocation = [string]$key.GetValue('InstallLocation')
-                                UninstallString = [string]$key.GetValue('UninstallString')
-                            }
-                        }
-                    }
-                    finally { $key.Dispose() }
-                }
+                return [pscustomobject]@{ View=$view; Name=$UninstallSubKey
+                    DisplayName=[string]$uninstall.GetValue('DisplayName')
+                    DisplayVersion=[string]$uninstall.GetValue('DisplayVersion')
+                    InstallLocation=[string]$uninstall.GetValue('InstallLocation')
+                    UninstallString=[string]$uninstall.GetValue('UninstallString') }
             }
             finally { $uninstall.Dispose() }
         }
         finally { $base.Dispose() }
     }
     return $null
+}
+
+function Remove-IsolatedUninstallRegistration {
+    $entry = Get-UninstallEntry
+    if ($null -eq $entry) { return }
+    if (-not $entry.InstallLocation -or
+        -not (Test-PathInside $entry.InstallLocation $SmokeParent)) {
+        throw 'refusing fixed AppId cleanup outside smoke root'
+    }
+    Assert-SafeLifecyclePath $entry.InstallLocation
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser, $entry.View)
+    try {
+        $parent = $base.OpenSubKey($UninstallRegistryPath, $true)
+        try { $parent.DeleteSubKeyTree($UninstallSubKey, $false) }
+        finally { if ($null -ne $parent) { $parent.Dispose() } }
+    }
+    finally { $base.Dispose() }
+    if ($null -ne (Get-UninstallEntry)) { throw 'fixed AppId cleanup verification failed' }
 }
 
 function Get-ShortcutTarget {
@@ -147,24 +231,37 @@ function Get-ShortcutTarget {
     finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null }
 }
 
+function Assert-KnownFirewallSchema {
+    param($Rule)
+    $application = $Rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
+    $portFilter = $Rule | Get-NetFirewallPortFilter -ErrorAction Stop
+    $address = $Rule | Get-NetFirewallAddressFilter -ErrorAction Stop
+    $interface = $Rule | Get-NetFirewallInterfaceFilter -ErrorAction Stop
+    $interfaceType = $Rule | Get-NetFirewallInterfaceTypeFilter -ErrorAction Stop
+    $service = $Rule | Get-NetFirewallServiceFilter -ErrorAction Stop
+    $one = { param($v,$e) @($v).Count -eq 1 -and [string]@($v)[0] -ceq $e }
+    $program = [string]$application.Program
+    if (-not (($Rule.Name -ceq $RuleName -or $Rule.DisplayName -ceq $LegacyRuleDisplayName) -and
+        [IO.Path]::IsPathFullyQualified($program) -and [IO.Path]::GetFileName($program) -ieq 'RestreamStudio.exe' -and
+        [string]$Rule.Direction -ceq 'Inbound' -and [string]$Rule.Action -ceq 'Allow' -and
+        [string]$Rule.Enabled -ceq 'True' -and [string]$Rule.Profile -ceq 'Any' -and
+        [string]$Rule.EdgeTraversalPolicy -ceq 'Block' -and [string]$portFilter.Protocol -ceq 'TCP' -and
+        (&$one $portFilter.LocalPort 'Any') -and (&$one $portFilter.RemotePort 'Any') -and
+        (&$one $address.LocalAddress '127.0.0.1') -and (&$one $address.RemoteAddress '127.0.0.1') -and
+        (&$one $interface.InterfaceAlias 'Any') -and (&$one $interfaceType.InterfaceType 'Any') -and
+        [string]$service.Service -ceq 'Any')) {
+        throw 'non-standard pre-existing Restream Studio firewall rule'
+    }
+    return [pscustomobject]@{ Name=[string]$Rule.Name; DisplayName=[string]$Rule.DisplayName
+        Description=[string]$Rule.Description; Group=[string]$Rule.Group; Program=$program }
+}
+
 function Get-FirewallSnapshot {
     $rules = @(@(Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) +
         @(Get-NetFirewallRule -DisplayName $LegacyRuleDisplayName -ErrorAction SilentlyContinue) |
         Sort-Object Name -Unique)
     return @($rules | ForEach-Object {
-        $application = $_ | Get-NetFirewallApplicationFilter -ErrorAction Stop
-        $portFilter = $_ | Get-NetFirewallPortFilter -ErrorAction Stop
-        $address = $_ | Get-NetFirewallAddressFilter -ErrorAction Stop
-        [pscustomobject]@{
-            Name = [string]$_.Name; DisplayName = [string]$_.DisplayName
-            Description = [string]$_.Description; Group = [string]$_.Group
-            Enabled = [string]$_.Enabled; Profile = [string]$_.Profile
-            Direction = [string]$_.Direction; Action = [string]$_.Action
-            EdgeTraversalPolicy = [string]$_.EdgeTraversalPolicy
-            Program = [string]$application.Program; Protocol = [string]$portFilter.Protocol
-            LocalPort = @($portFilter.LocalPort); RemotePort = @($portFilter.RemotePort)
-            LocalAddress = @($address.LocalAddress); RemoteAddress = @($address.RemoteAddress)
-        }
+        Assert-KnownFirewallSchema $_
     })
 }
 
@@ -179,11 +276,11 @@ function Restore-FirewallSnapshot {
     Remove-SmokeFirewallRules
     foreach ($rule in $InitialFirewall) {
         $arguments = @{
-            Name = $rule.Name; DisplayName = $rule.DisplayName; Enabled = $rule.Enabled
-            Profile = $rule.Profile; Direction = $rule.Direction; Action = $rule.Action
-            EdgeTraversalPolicy = $rule.EdgeTraversalPolicy; Program = $rule.Program
-            Protocol = $rule.Protocol; LocalPort = $rule.LocalPort; RemotePort = $rule.RemotePort
-            LocalAddress = $rule.LocalAddress; RemoteAddress = $rule.RemoteAddress
+            Name=$rule.Name; DisplayName=$rule.DisplayName; Enabled='True'; Profile='Any'
+            Direction='Inbound'; Action='Allow'; EdgeTraversalPolicy='Block'; Program=$rule.Program
+            Protocol='TCP'; LocalPort='Any'; RemotePort='Any'
+            LocalAddress='127.0.0.1'; RemoteAddress='127.0.0.1'
+            InterfaceAlias='Any'; InterfaceType='Any'; Service='Any'
         }
         if ($rule.Description) { $arguments.Description = $rule.Description }
         if ($rule.Group) { $arguments.Group = $rule.Group }
@@ -229,8 +326,9 @@ function Assert-Shortcuts {
 }
 
 function Assert-UninstallRegistration {
+    param([string]$ExpectedVersion)
     $entry = Get-UninstallEntry
-    if ($null -eq $entry) { throw 'HKCU uninstall registration is missing' }
+    if ($null -eq $entry -or $entry.DisplayVersion -cne $ExpectedVersion) { throw 'HKCU uninstall registration is missing or wrong version' }
     if ([IO.Path]::GetFullPath($entry.InstallLocation).TrimEnd('\') -cne
         [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')) {
         throw 'HKCU uninstall registration points outside the isolated install'
@@ -307,10 +405,15 @@ function Stop-InstalledApplication {
 }
 
 function Invoke-Install {
-    Invoke-NativeChecked -FilePath $Installer -Arguments @(
+    param([string]$Setup=$Installer,[string[]]$ExtraArguments=@(),[switch]$ExpectFailure)
+    Assert-NoReparsePointAncestors -Path $InstallDir
+    Assert-NoReparsePointAncestors -Path $UserDataDir
+    $script:FirewallMutationPossible=$true; $script:UserStateMutationPossible=$true
+    $code=Invoke-BoundedProcess -FilePath $Setup -Arguments (@(
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
         "/DIR=$InstallDir", "/USERDATADIR=$UserDataDir"
-    )
+    ) + $ExtraArguments) -TimeoutSeconds 300 -TimeoutMessage 'installer timed out' -AllowNonZero:$ExpectFailure
+    if($ExpectFailure -and $code -eq 0){throw 'failure fixture unexpectedly succeeded'}
 }
 
 function Invoke-Uninstall {
@@ -322,19 +425,43 @@ function Invoke-Uninstall {
     $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
         '/CLOSEAPPLICATIONS', '/FORCECLOSEAPPLICATIONS', "/USERDATADIR=$UserDataDir")
     if ($DeleteUserData) { $arguments += '/DELETEUSERDATA=1' }
-    Invoke-NativeChecked -FilePath $uninstaller -Arguments $arguments
+    $script:FirewallMutationPossible=$true
+    Invoke-BoundedProcess -FilePath $uninstaller -Arguments $arguments `
+        -TimeoutSeconds 300 -TimeoutMessage 'uninstaller timed out' | Out-Null
 }
 
-function Restore-Shortcut {
-    param([string]$Path, [bool]$Existed, [string]$Backup)
-    if (Test-Path -LiteralPath $Path -PathType Leaf) { Remove-Item -LiteralPath $Path -Force }
-    if ($Existed) { Copy-Item -LiteralPath $Backup -Destination $Path -Force }
+function Backup-Shortcut {
+    param([string]$Path,[string]$Backup,[ref]$Succeeded,[ref]$Hash)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $sourceHash=(Get-FileHash $Path -Algorithm SHA256).Hash
+    Copy-Item -LiteralPath $Path -Destination $Backup
+    $backupHash=(Get-FileHash $Backup -Algorithm SHA256).Hash
+    if ($sourceHash -cne $backupHash) { throw 'shortcut backup hash verification failed' }
+    $Hash.Value=$backupHash; $Succeeded.Value=$true
+}
+
+function Restore-ShortcutAtomically {
+    param([string]$Path,[bool]$Existed,[bool]$BackupSucceeded,[string]$Backup,[string]$BackupHash)
+    if (-not $UserStateMutationPossible) { return }
+    if (-not $Existed) {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { Remove-Item -LiteralPath $Path -Force }
+        return
+    }
+    if (-not $BackupSucceeded -or -not (Test-Path -LiteralPath $Backup -PathType Leaf) -or
+        (Get-FileHash $Backup -Algorithm SHA256).Hash -cne $BackupHash) {
+        throw 'shortcut backup hash verification failed; preserving current shortcut'
+    }
+    $replacement=Join-Path (Split-Path -Parent $Path) ".restore-$([guid]::NewGuid().ToString('N')).lnk"
+    try {
+        Copy-Item -LiteralPath $Backup -Destination $replacement
+        if ((Get-FileHash $replacement -Algorithm SHA256).Hash -cne $BackupHash) { throw 'backup hash verification failed' }
+        if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($replacement,$Path,$null) }
+        else { [IO.File]::Move($replacement,$Path) }
+    }
+    finally { if(Test-Path -LiteralPath $replacement){Remove-Item -LiteralPath $replacement -Force} }
 }
 
 Assert-SafeLifecyclePath -Path $SmokeRoot
-if (-not (Test-IsAdministrator)) {
-    throw 'installer lifecycle smoke requires an elevated PowerShell session for real firewall checks'
-}
 if (-not (Test-Path -LiteralPath $Distribution -PathType Container)) {
     throw 'packaged distribution is missing; build the installer first'
 }
@@ -344,15 +471,23 @@ if ($null -ne (Get-UninstallEntry)) {
 
 try {
     New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
-    if ($DesktopExisted) { Copy-Item -LiteralPath $DesktopShortcut -Destination $DesktopBackup }
-    if ($StartMenuExisted) { Copy-Item -LiteralPath $StartMenuShortcut -Destination $StartMenuBackup }
+    Backup-Shortcut $DesktopShortcut $DesktopBackup ([ref]$DesktopBackupSucceeded) ([ref]$DesktopBackupHash)
+    Backup-Shortcut $StartMenuShortcut $StartMenuBackup ([ref]$StartMenuBackupSucceeded) ([ref]$StartMenuBackupHash)
     $InitialFirewall = @(Get-FirewallSnapshot)
-    $InitialFirewallFingerprint = $InitialFirewall | ConvertTo-Json -Depth 5 -Compress
+    $InitialFirewallFingerprint = ConvertTo-Json -InputObject @($InitialFirewall) -Depth 5 -Compress
+    $SnapshotCaptured = $true
+
+    foreach($mode in @('cancel','command')) {
+        Invoke-Install -Setup $UpgradeInstaller -ExpectFailure -ExtraArguments @("/SMOKEFIREWALLFAIL=$mode")
+        if((Test-Path -LiteralPath $InstallDir) -or $null -ne (Get-UninstallEntry)){throw 'failure fixture file rollback failed'}
+        $now=ConvertTo-Json -InputObject @(Get-FirewallSnapshot) -Depth 5 -Compress
+        if($now -cne $InitialFirewallFingerprint){throw 'failure fixture firewall rollback failed'}
+    }
 
     Invoke-Install
     Assert-InstalledFiles
     Assert-Shortcuts
-    Assert-UninstallRegistration | Out-Null
+    Assert-UninstallRegistration '0.1.0' | Out-Null
     Assert-FirewallRule
     Start-And-TestInstalledApplication
     Stop-InstalledApplication
@@ -363,15 +498,21 @@ try {
         ConvertTo-Json | Set-Content -LiteralPath $marker -Encoding utf8
     $markerHash = (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash
 
-    Invoke-Install
+    $program=Join-Path $InstallDir 'RestreamStudio.exe'
+    $expectedProgramHash=(Get-FileHash (Join-Path $Distribution 'RestreamStudio.exe') -Algorithm SHA256).Hash
+    $bytes=[IO.File]::ReadAllBytes($program); $bytes[0]=$bytes[0] -bxor 1; [IO.File]::WriteAllBytes($program,$bytes)
+    $tamperedProgramHash=(Get-FileHash $program -Algorithm SHA256).Hash
+    Invoke-Install -Setup $UpgradeInstaller
     Assert-InstalledFiles
     Assert-Shortcuts
-    Assert-UninstallRegistration | Out-Null
+    Assert-UninstallRegistration '0.1.1' | Out-Null
     Assert-FirewallRule
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
         (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash -cne $markerHash) {
-        throw 'isolated configuration marker was not preserved by the same-version upgrade'
+        throw 'isolated configuration marker was not preserved by version upgrade'
     }
+    $upgradedProgramHash=(Get-FileHash $program -Algorithm SHA256).Hash
+    if($upgradedProgramHash -cne $expectedProgramHash -or $upgradedProgramHash -ceq $tamperedProgramHash){throw 'program file was not replaced by upgrade'}
 
     Start-And-TestInstalledApplication
     Invoke-Uninstall
@@ -390,7 +531,7 @@ try {
 
     Invoke-Install
     Assert-InstalledFiles
-    Assert-UninstallRegistration | Out-Null
+    Assert-UninstallRegistration '0.1.0' | Out-Null
     Invoke-Uninstall -DeleteUserData
     if ((Test-Path -LiteralPath $UserDataDir) -or (Test-Path -LiteralPath $InstallDir) -or
         $null -ne (Get-UninstallEntry) -or
@@ -409,18 +550,21 @@ finally {
         $uninstaller = Join-Path $testEntry.InstallLocation 'unins000.exe'
         if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
             try {
-                Invoke-NativeChecked -FilePath $uninstaller -Arguments @(
+                Invoke-BoundedProcess -FilePath $uninstaller -Arguments @(
                     '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
                     "/USERDATADIR=$UserDataDir", '/DELETEUSERDATA=1'
-                )
+                ) -TimeoutSeconds 300 -TimeoutMessage 'cleanup uninstaller timed out' | Out-Null
             }
             catch { $cleanupErrors.Add($_.Exception.Message) }
         }
+        if($null -ne (Get-UninstallEntry)){Remove-IsolatedUninstallRegistration}
     }
-    try { Restore-FirewallSnapshot } catch { $cleanupErrors.Add("firewall restore failed: $($_.Exception.Message)") }
+    if ($SnapshotCaptured -and $FirewallMutationPossible) {
+        try { Restore-FirewallSnapshot } catch { $cleanupErrors.Add("firewall restore failed: $($_.Exception.Message)") }
+    }
     try {
-        Restore-Shortcut -Path $DesktopShortcut -Existed $DesktopExisted -Backup $DesktopBackup
-        Restore-Shortcut -Path $StartMenuShortcut -Existed $StartMenuExisted -Backup $StartMenuBackup
+        Restore-ShortcutAtomically $DesktopShortcut $DesktopExisted $DesktopBackupSucceeded $DesktopBackup $DesktopBackupHash
+        Restore-ShortcutAtomically $StartMenuShortcut $StartMenuExisted $StartMenuBackupSucceeded $StartMenuBackup $StartMenuBackupHash
         if (-not $StartMenuGroupExisted -and (Test-Path -LiteralPath $StartMenuGroup -PathType Container) -and
             @(Get-ChildItem -LiteralPath $StartMenuGroup -Force).Count -eq 0) {
             Remove-Item -LiteralPath $StartMenuGroup -Force

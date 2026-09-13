@@ -246,6 +246,24 @@ def test_release_tools_are_versioned_downloaded_and_sha256_verified() -> None:
         assert marker in script
 
 
+def test_release_tool_probes_and_transaction_do_not_destroy_verified_tools() -> None:
+    script = PROVISIONER.read_text(encoding="utf-8")
+    assert "& $ffmpeg -version |" not in script
+    assert "& $ffprobe -version |" not in script
+    assert "$ffmpegOutput = @(& $ffmpeg -version 2>&1" in script
+    assert "$ffprobeOutput = @(& $ffprobe -version 2>&1" in script
+    assert "$mediaMtxOutput = @(& $mediaMtx --version 2>&1" in script
+    assert "$response.EnsureSuccessStatusCode() | Out-Null" in script
+    assert "Write-Output $ffmpegOutput[0]" in script
+    assert "Write-Output $ffprobeOutput[0]" in script
+    assert "release-tools-staging-" in script
+    assert "release-tools-backup-" in script
+    assert "function Commit-VerifiedTools" in script
+    assert "restored the previous verified tools" in script
+    assert "finally" in script
+    assert "Remove-ReleaseToolDirectory -Path $StagingRoot" in script
+
+
 def test_manifest_writer_calculates_strict_schema_and_atomic_output(tmp_path: Path) -> None:
     installer = tmp_path / "RestreamStudio-Setup-1.2.3.exe"
     installer.write_bytes(b"installer-fixture\x00\xff")

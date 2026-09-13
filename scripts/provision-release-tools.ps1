@@ -8,7 +8,10 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $Root = Split-Path -Parent $PSScriptRoot
-$ToolsRoot = Join-Path $Root 'build\release-tools'
+$FinalToolsRoot = Join-Path $Root 'build\release-tools'
+$StagingRoot = Join-Path $Root "build\release-tools-staging-$([Guid]::NewGuid().ToString('N'))"
+$BackupRoot = Join-Path $Root "build\release-tools-backup-$([Guid]::NewGuid().ToString('N'))"
+$ToolsRoot = $StagingRoot
 $DownloadRoot = Join-Path $ToolsRoot 'downloads'
 $FfmpegUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-12-13-12/ffmpeg-n8.1.2-52-g5a03dfa0f6-win64-gpl-8.1.zip'
 $FfmpegSha256 = '8EBD7E82791B8F753ADE7FD6F2EACF8CE02127DFB1F25102D85154D1779CD2DE'
@@ -45,7 +48,7 @@ function Get-VerifiedArchive {
             $request,
             [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
         ).GetAwaiter().GetResult()
-        $response.EnsureSuccessStatusCode()
+        $response.EnsureSuccessStatusCode() | Out-Null
         # Reject an excessive Content-Length before reading, then enforce the same cap while streaming.
         $contentLength = $response.Content.Headers.ContentLength
         if ($null -ne $contentLength -and $contentLength -gt $MaxDownloadBytes) {
@@ -143,8 +146,33 @@ function Resolve-SingleFile {
     return $matches[0]
 }
 
-Remove-ReleaseToolDirectory -Path $ToolsRoot
-New-Item -ItemType Directory -Force -Path $DownloadRoot | Out-Null
+function Commit-VerifiedTools {
+    param(
+        [Parameter(Mandatory)][string]$Staging,
+        [Parameter(Mandatory)][string]$Final,
+        [Parameter(Mandatory)][string]$Backup
+    )
+    $hadPrevious = Test-Path -LiteralPath $Final -PathType Container
+    try {
+        if ($hadPrevious) { [IO.Directory]::Move($Final, $Backup) }
+        [IO.Directory]::Move($Staging, $Final)
+    }
+    catch {
+        $commitError = $_
+        if (-not (Test-Path -LiteralPath $Final) -and (Test-Path -LiteralPath $Backup)) {
+            [IO.Directory]::Move($Backup, $Final)
+            Write-Warning 'release tool commit failed and restored the previous verified tools'
+        }
+        throw $commitError
+    }
+    if (Test-Path -LiteralPath $Backup) {
+        Remove-ReleaseToolDirectory -Path $Backup
+    }
+}
+
+$ProvisionSucceeded = $false
+try {
+New-Item -ItemType Directory -Path $DownloadRoot | Out-Null
 
 $ffmpegArchive = Join-Path $DownloadRoot 'ffmpeg.zip'
 $ffmpegExtract = Join-Path $ToolsRoot 'ffmpeg-extract'
@@ -174,12 +202,45 @@ Copy-Item -LiteralPath $mediaMtxSource.FullName -Destination (Join-Path $mediaMt
 $ffmpeg = Join-Path $ffmpegBin 'ffmpeg.exe'
 $ffprobe = Join-Path $ffmpegBin 'ffprobe.exe'
 $mediaMtx = Join-Path $mediaMtxRoot 'mediamtx.exe'
-& $ffmpeg -version | Select-Object -First 1
-if ($LASTEXITCODE -ne 0) { throw 'provisioned ffmpeg failed its version probe' }
-& $ffprobe -version | Select-Object -First 1
-if ($LASTEXITCODE -ne 0) { throw 'provisioned ffprobe failed its version probe' }
-& $mediaMtx --version
-if ($LASTEXITCODE -ne 0) { throw 'provisioned MediaMTX failed its version probe' }
-Write-EnvironmentPath 'FFMPEG_PATH' $ffmpeg
-Write-EnvironmentPath 'FFPROBE_PATH' $ffprobe
-Write-EnvironmentPath 'MEDIAMTX_PATH' $mediaMtx
+$ffmpegOutput = @(& $ffmpeg -version 2>&1 | ForEach-Object { [string]$_ })
+$ffmpegExitCode = $LASTEXITCODE
+if ($ffmpegExitCode -ne 0 -or $ffmpegOutput.Count -eq 0) {
+    throw "provisioned ffmpeg failed its version probe with exit code $ffmpegExitCode"
+}
+Write-Output $ffmpegOutput[0]
+$ffprobeOutput = @(& $ffprobe -version 2>&1 | ForEach-Object { [string]$_ })
+$ffprobeExitCode = $LASTEXITCODE
+if ($ffprobeExitCode -ne 0 -or $ffprobeOutput.Count -eq 0) {
+    throw "provisioned ffprobe failed its version probe with exit code $ffprobeExitCode"
+}
+Write-Output $ffprobeOutput[0]
+$mediaMtxOutput = @(& $mediaMtx --version 2>&1 | ForEach-Object { [string]$_ })
+$mediaMtxExitCode = $LASTEXITCODE
+if ($mediaMtxExitCode -ne 0 -or $mediaMtxOutput.Count -eq 0) {
+    throw "provisioned MediaMTX failed its version probe with exit code $mediaMtxExitCode"
+}
+Write-Output $mediaMtxOutput[0]
+
+Commit-VerifiedTools -Staging $StagingRoot -Final $FinalToolsRoot -Backup $BackupRoot
+$ProvisionSucceeded = $true
+$finalFfmpeg = Join-Path $FinalToolsRoot 'ffmpeg\bin\ffmpeg.exe'
+$finalFfprobe = Join-Path $FinalToolsRoot 'ffmpeg\bin\ffprobe.exe'
+$finalMediaMtx = Join-Path $FinalToolsRoot 'mediamtx\mediamtx.exe'
+Write-EnvironmentPath 'FFMPEG_PATH' $finalFfmpeg
+Write-EnvironmentPath 'FFPROBE_PATH' $finalFfprobe
+Write-EnvironmentPath 'MEDIAMTX_PATH' $finalMediaMtx
+}
+finally {
+    if (Test-Path -LiteralPath $StagingRoot) {
+        Remove-ReleaseToolDirectory -Path $StagingRoot
+    }
+    if (-not $ProvisionSucceeded -and (Test-Path -LiteralPath $BackupRoot)) {
+        if (-not (Test-Path -LiteralPath $FinalToolsRoot)) {
+            [IO.Directory]::Move($BackupRoot, $FinalToolsRoot)
+            Write-Warning 'provision failed and restored the previous verified tools'
+        }
+        else {
+            Remove-ReleaseToolDirectory -Path $BackupRoot
+        }
+    }
+}

@@ -444,6 +444,16 @@ def test_release_publish_is_clean_idempotent_and_reverifies_remote_assets() -> N
     assert "remote assets differ from verified build outputs" in publish
 
 
+def test_release_version_validation_accepts_windows_crlf_checkout() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    revalidation = workflow[
+        workflow.index("      - name: Revalidate checked-out source versions") :
+        workflow.index("      - name: Set up Python 3.12")
+    ]
+    assert 'version = `"$escaped`"\\r?$' in revalidation
+    assert '#define MyAppVersion `"$escaped`"\\r?$' in revalidation
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support unavailable")
 def test_manifest_writer_refuses_symlink_output(tmp_path: Path) -> None:
     installer = tmp_path / "RestreamStudio-Setup-1.2.3.exe"

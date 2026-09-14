@@ -114,13 +114,15 @@ jobs:
             throw 'validated release identity was not preserved by checkout'
           }
           $escaped = [Regex]::Escape($version)
-          if ((Get-Content pyproject.toml -Raw) -notmatch "(?m)^version = `"$escaped`"$") {
+          # Windows checkout can materialize CRLF. Match the optional carriage
+          # return explicitly instead of treating LF-only files as canonical.
+          if ((Get-Content pyproject.toml -Raw) -notmatch "(?m)^version = `"$escaped`"\r?$") {
             throw 'pyproject.toml version does not match the release tag'
           }
           if ((Get-Content package.json -Raw | ConvertFrom-Json).version -cne $version) {
             throw 'package.json version does not match the release tag'
           }
-          if ((Get-Content packaging/restream-studio.iss -Raw) -notmatch "(?m)^#define MyAppVersion `"$escaped`"$") {
+          if ((Get-Content packaging/restream-studio.iss -Raw) -notmatch "(?m)^#define MyAppVersion `"$escaped`"\r?$") {
             throw 'Inno Setup version does not match the release tag'
           }
 

@@ -15,7 +15,7 @@ def test_package_exposes_version() -> None:
     with (root / "package.json").open(encoding="utf-8") as package_file:
         package_version = json.load(package_file)["version"]
 
-    assert restream_studio.__version__ == pyproject_version == package_version == "0.1.0"
+    assert restream_studio.__version__ == pyproject_version == package_version == "0.1.1"
 
 
 def test_runtime_version_uses_valid_bundled_metadata(

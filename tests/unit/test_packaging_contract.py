@@ -424,9 +424,11 @@ def test_installer_build_contract_bundles_helper_and_uses_pinned_iscc_discovery(
     )
     assert pinned not in build
     assert "Get-Command 'ISCC.exe'" not in build
-    assert "JRSoftware.InnoSetup" in build
+    assert "github.com/jrsoftware/issrc/releases/download/is-6_7_3" in build
     assert "6.7.3" in build
-    assert "--exact" in build
+    assert "9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732" in build
+    assert "'/PORTABLE=1'" in build
+    assert "winget.exe" not in build
     assert "function Assert-IsccVersion" in build
     assert "$output = @(& $Path $probe" in build
     assert "Compiler engine version: Inno Setup 6.7.3" in build

@@ -1,6 +1,6 @@
 #define MyAppName "Restream Studio"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.2"
+#define MyAppVersion "0.1.3"
 #endif
 #ifndef SmokeTestBuild
 #define SmokeTestBuild 0

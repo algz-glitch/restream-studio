@@ -194,27 +194,58 @@ function Resolve-Iscc {
         return Assert-IsccVersion -Path $registered -SourceLabel 'registered ISCC.exe'
     }
 
-    $winget = (Get-Command 'winget.exe' -CommandType Application -ErrorAction Stop).Source
-    Invoke-External $winget @(
-        'install', '--id', 'JRSoftware.InnoSetup', '--version', '6.7.3', '--exact',
-        '--scope', 'user', '--silent', '--accept-package-agreements',
-        '--accept-source-agreements', '--disable-interactivity'
-    )
-    $registered = Find-RegisteredIscc
-    if ($registered) {
-        return Assert-IsccVersion -Path $registered -SourceLabel 'winget registered ISCC.exe'
+    $portableRoot = Join-Path $Root 'build\inno-setup-6.7.3'
+    $portableIscc = Join-Path $portableRoot 'ISCC.exe'
+    if (Test-Path -LiteralPath $portableIscc -PathType Leaf) {
+        return Assert-IsccVersion -Path $portableIscc -SourceLabel 'portable ISCC.exe'
     }
-    $installedCandidates = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-    )
-    foreach ($candidate in $installedCandidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return Assert-IsccVersion -Path $candidate -SourceLabel 'winget ISCC.exe'
+
+    $downloadUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+    $expectedSha256 = '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732'
+    $downloadRoot = Join-Path $Root 'build\downloads'
+    $download = Join-Path $downloadRoot 'innosetup-6.7.3.exe'
+    $staging = Join-Path $Root "build\inno-setup-staging-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $download -MaximumRedirection 5
+        $downloadFile = Get-Item -LiteralPath $download
+        if ($downloadFile.Length -le 0 -or $downloadFile.Length -gt 32MB) {
+            throw 'pinned Inno Setup installer size is outside the allowed range'
+        }
+        $actualSha256 = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+        if ($actualSha256 -cne $expectedSha256) {
+            throw 'pinned Inno Setup installer SHA-256 mismatch'
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $download
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $signature.SignerCertificate -or
+            $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Pyrsys B\.V\.(,|$)') {
+            throw 'pinned Inno Setup installer signature is invalid'
+        }
+        $installerProcess = Start-Process -FilePath $download -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/PORTABLE=1',
+            "/DIR=$staging"
+        ) -Wait -PassThru
+        try {
+            if ($installerProcess.ExitCode -ne 0) {
+                throw "pinned Inno Setup installer exited with code $($installerProcess.ExitCode)"
+            }
+        }
+        finally { $installerProcess.Dispose() }
+        $stagedIscc = Join-Path $staging 'ISCC.exe'
+        Assert-IsccVersion -Path $stagedIscc -SourceLabel 'downloaded portable ISCC.exe' | Out-Null
+        if (Test-Path -LiteralPath $portableRoot) {
+            Remove-Item -LiteralPath $portableRoot -Recurse -Force
+        }
+        [IO.Directory]::Move($staging, $portableRoot)
+        return Assert-IsccVersion -Path $portableIscc -SourceLabel 'portable ISCC.exe'
+    }
+    finally {
+        if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force }
+        if (Test-Path -LiteralPath $staging) {
+            Remove-Item -LiteralPath $staging -Recurse -Force
         }
     }
-    throw 'winget completed but Inno Setup 6.7.3 ISCC.exe was not found'
 }
 
 if ($Clean -and (Test-Path -LiteralPath $InstallerDirectory)) {

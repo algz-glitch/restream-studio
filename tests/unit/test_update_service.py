@@ -59,7 +59,7 @@ class FakeClient:
         self.download_calls = 0
 
     def check_for_update(self, current_version: str) -> UpdateCheckResult:
-        assert current_version == "0.1.2"
+        assert current_version == "0.1.3"
         self.check_calls += 1
         return self.result
 
@@ -89,7 +89,7 @@ async def test_check_transitions_are_consistent_and_persist_only_safe_metadata(
     persisted = json.loads((tmp_path / "data" / "update" / "state.json").read_text("utf-8"))
     assert persisted == {
         "available_version": "0.2.0",
-        "current_version": "0.1.2",
+        "current_version": "0.1.3",
         "error_code": None,
         "last_checked_at": "2026-09-13T12:00:00+00:00",
         "status": "available",
@@ -200,7 +200,7 @@ async def test_future_persisted_timestamp_is_discarded_and_does_not_throttle(
         client=client,
         clock=lambda: now - timedelta(minutes=1),
     )
-    assert restarted.snapshot() == UpdateSnapshot(UpdateStatus.IDLE, "0.1.2")
+    assert restarted.snapshot() == UpdateSnapshot(UpdateStatus.IDLE, "0.1.3")
     assert not (tmp_path / "update" / "state.json").exists()
     await restarted.automatic_check()
     assert client.check_calls == 1

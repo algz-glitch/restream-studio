@@ -282,7 +282,13 @@ jobs:
 
           function Assert-Manifest {
             param([string]$ManifestPath, [string]$InstallerPath)
-            $data = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $manifestJson = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
+            $data = $manifestJson | ConvertFrom-Json
+            $jsonDocument = [Text.Json.JsonDocument]::Parse($manifestJson)
+            try {
+              $publishedAt = $jsonDocument.RootElement.GetProperty('published_at').GetString()
+            }
+            finally { $jsonDocument.Dispose() }
             $keys = @($data.PSObject.Properties.Name)
             $expectedKeys = @('schema_version','version','installer_url','sha256','size','published_at','release_url')
             if ((($keys | Sort-Object) -join ',') -cne (($expectedKeys | Sort-Object) -join ',')) {
@@ -296,7 +302,7 @@ jobs:
             if ($data.schema_version -ne 1 -or $data.version -cne $version -or
                 $data.installer_url -cne $expectedDownload -or $data.sha256 -cne $hash -or
                 $data.size -ne $file.Length -or
-                $data.published_at -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$' -or
+                $publishedAt -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$' -or
                 $data.release_url -cne $expectedRelease) {
               throw 'latest.json does not match the independently hashed installer'
             }

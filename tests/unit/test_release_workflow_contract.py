@@ -442,6 +442,9 @@ def test_release_publish_is_clean_idempotent_and_reverifies_remote_assets() -> N
     assert "Compare-VerifiedFile" in publish
     assert "--clobber" not in publish
     assert "remote assets differ from verified build outputs" in publish
+    assert "[Text.Json.JsonDocument]::Parse($manifestJson)" in publish
+    assert "$publishedAt -notmatch" in publish
+    assert "$data.published_at -notmatch" not in publish
 
 
 def test_release_version_validation_accepts_windows_crlf_checkout() -> None:

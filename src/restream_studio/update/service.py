@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ _PERSISTED_ERROR_CODES = {item.value for item in UpdateErrorCode} | {
     "check_failed",
     "download_failed",
 }
+_STATE_WRITE_LOCK = threading.Lock()
 
 
 class UpdateStatus(StrEnum):
@@ -517,6 +519,12 @@ class UpdateService:
         self._state = candidate
 
     def _persist_state(self, candidate: UpdateSnapshot) -> None:
+        # Windows can reject simultaneous os.replace calls targeting the same
+        # state file even when each writer owns a distinct temporary file.
+        with _STATE_WRITE_LOCK:
+            self._persist_state_locked(candidate)
+
+    def _persist_state_locked(self, candidate: UpdateSnapshot) -> None:
         self._update_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "available_version": candidate.available_version,

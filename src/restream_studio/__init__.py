@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-_SOURCE_VERSION = "0.1.4"
+_SOURCE_VERSION = "0.1.5"
 _BUNDLED_VERSION = Path(__file__).with_name("version.txt")
 
 

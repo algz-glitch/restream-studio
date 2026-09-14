@@ -233,7 +233,7 @@ def test_smoke_build_uses_real_upgrade_version_and_failure_injection_fixture() -
     assert '$health.version -eq $ExpectedVersion' in smoke
 
 
-def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> None:
+def test_verify_keeps_local_lifecycle_gate_and_release_uses_hosted_ci_override() -> None:
     verify = _read("scripts/verify.ps1")
     release = _read(".github/workflows/release.yml")
 
@@ -247,7 +247,8 @@ def test_verify_builds_and_runs_installer_lifecycle_without_release_skip() -> No
     assert "-ReuseVerifiedPackage" in verify
     assert "-PackageManifest" in verify
     assert "INSTALLER_LIFECYCLE=SKIP" in verify
-    assert "-SkipInstallerLifecycle" not in release
+    assert "GitHub-hosted Windows runners have no interactive UAC desktop" in release
+    assert "scripts/verify.ps1 -SkipInstallerLifecycle" in release
 
 
 def test_inno_checks_firewall_exit_codes_before_install_and_uninstall_mutation() -> None:

@@ -261,7 +261,7 @@ def test_health_is_minimal_and_status_is_safe(client: TestClient) -> None:
     assert client.get("/health").json() == {
         "status": "ok",
         "app": "restream-studio",
-        "version": "0.1.1",
+        "version": "0.1.2",
     }
     response = client.get("/api/status")
     assert response.status_code == 200
@@ -479,7 +479,7 @@ def test_frontend_mount_is_optional_and_does_not_shadow_api(tmp_path: Path, harn
         assert client.get("/health").json() == {
             "status": "ok",
             "app": "restream-studio",
-            "version": "0.1.1",
+            "version": "0.1.2",
         }
         assert client.get("/api/missing").status_code == 404
         assert "error" in client.get("/api/missing").json()
@@ -1024,7 +1024,7 @@ def test_update_api_is_strict_protected_and_secret_safe(harness: Harness) -> Non
 
     class FakeUpdateService:
         def __init__(self) -> None:
-            self.value = UpdateSnapshot(UpdateStatus.IDLE, "0.1.1")
+            self.value = UpdateSnapshot(UpdateStatus.IDLE, "0.1.2")
             self.calls: list[str] = []
 
         def snapshot(self) -> UpdateSnapshot:
@@ -1032,7 +1032,7 @@ def test_update_api_is_strict_protected_and_secret_safe(harness: Harness) -> Non
 
         async def check(self) -> UpdateSnapshot:
             self.calls.append("check")
-            self.value = UpdateSnapshot(UpdateStatus.CURRENT, "0.1.1")
+            self.value = UpdateSnapshot(UpdateStatus.CURRENT, "0.1.2")
             return self.value
 
         async def download(self) -> UpdateSnapshot:
@@ -1061,7 +1061,7 @@ def test_update_api_is_strict_protected_and_secret_safe(harness: Harness) -> Non
         }
         assert update_client.get("/api/update").json() == {
             "status": "idle",
-            "current_version": "0.1.1",
+            "current_version": "0.1.2",
             "available_version": None,
             "release_url": None,
             "last_checked_at": None,
@@ -1089,7 +1089,7 @@ def test_update_install_requires_stopped_relay_before_service_call(harness: Harn
             self.installs = 0
 
         def snapshot(self) -> UpdateSnapshot:
-            return UpdateSnapshot(UpdateStatus.READY, "0.1.1", available_version="0.2.0")
+            return UpdateSnapshot(UpdateStatus.READY, "0.1.2", available_version="0.2.0")
 
         async def check(self) -> UpdateSnapshot:
             return self.snapshot()
@@ -1137,7 +1137,7 @@ async def test_update_install_and_start_share_atomic_write_boundary(harness: Har
         installation_pending = False
 
         def snapshot(self) -> UpdateSnapshot:
-            return UpdateSnapshot(UpdateStatus.READY, "0.1.1", available_version="0.2.0")
+            return UpdateSnapshot(UpdateStatus.READY, "0.1.2", available_version="0.2.0")
 
         async def check(self) -> UpdateSnapshot:
             return self.snapshot()
@@ -1203,7 +1203,7 @@ def test_installed_update_gate_blocks_check_download_and_start(harness: Harness)
         installation_pending = True
 
         def snapshot(self) -> UpdateSnapshot:
-            return UpdateSnapshot(UpdateStatus.READY, "0.1.1", available_version="0.2.0")
+            return UpdateSnapshot(UpdateStatus.READY, "0.1.2", available_version="0.2.0")
 
         async def check(self) -> UpdateSnapshot:
             raise UpdateOperationError("update_installing", "Update installation is pending")
@@ -1266,7 +1266,7 @@ def test_application_shutdown_callback_only_requests_uvicorn_exit(
             self.callback = callback
 
         def snapshot(self) -> UpdateSnapshot:
-            return UpdateSnapshot(UpdateStatus.IDLE, "0.1.1")
+            return UpdateSnapshot(UpdateStatus.IDLE, "0.1.2")
 
         async def check(self) -> UpdateSnapshot:
             return self.snapshot()

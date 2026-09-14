@@ -156,7 +156,10 @@ jobs:
 
       - name: Run the complete release gate once
         shell: pwsh
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1
+        # GitHub-hosted Windows runners have no interactive UAC desktop. The
+        # installer lifecycle remains a required local pre-release gate; CI
+        # runs every non-interactive gate and rebuilds the verified installer.
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -SkipInstallerLifecycle
 
       - name: Build installer from the verified package manifest
         shell: pwsh
